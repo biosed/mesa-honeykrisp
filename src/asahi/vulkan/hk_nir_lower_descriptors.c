@@ -96,7 +96,11 @@ static nir_def *
 load_root(nir_builder *b, unsigned num_components, unsigned bit_size,
           nir_def *offset, unsigned align)
 {
-   nir_def *addr = nir_iadd(b, nir_load_root_agx(b), nir_u2u64(b, offset));
+   nir_def *root = nir_load_root_agx(b);
+   nir_def *addr = nir_def_is_const(offset)
+      ? nir_iadd_imm(b, root,
+                     nir_src_as_uint(nir_src_for_ssa(offset)))
+      : nir_iadd(b, root, nir_u2u64(b, offset));
 
    return load_speculatable(b, num_components, bit_size, addr, align);
 }

@@ -24,6 +24,8 @@ static unsigned wide_producer_binary_size;
 static unsigned wide_pull_vs_binary_size;
 static unsigned limit_producer_binary_size;
 static unsigned limit_pull_vs_binary_size;
+static unsigned task_producer_binary_size;
+static unsigned task_mesh_binary_size;
 
 static bool
 lower_driver_sysvals(nir_builder *b, nir_intrinsic_instr *intr, void *data)
@@ -163,12 +165,23 @@ test_triangle(void)
    assert(offsetof(struct hk_mesh_emulation_params, group_records) == 32);
    assert(offsetof(struct hk_mesh_emulation_params, task_records) == 40);
    assert(offsetof(struct hk_mesh_emulation_params, draw_params) == 48);
-   assert(offsetof(struct hk_mesh_emulation_params, mesh_grid) == 56);
-   assert(offsetof(struct hk_mesh_emulation_params, abi_version) == 68);
-   assert(offsetof(struct hk_mesh_emulation_params, flags) == 72);
-   assert(offsetof(struct hk_mesh_emulation_params, reserved) == 76);
-   assert(sizeof(struct hk_mesh_emulation_params) == 80);
+   assert(offsetof(struct hk_mesh_emulation_params, group_to_task) == 56);
+   assert(offsetof(struct hk_mesh_emulation_params, mesh_grid) == 64);
+   assert(offsetof(struct hk_mesh_emulation_params, task_grid) == 76);
+   assert(offsetof(struct hk_mesh_emulation_params, task_record_stride_B) ==
+          88);
+   assert(offsetof(struct hk_mesh_emulation_params, task_payload_size_B) ==
+          92);
+   assert(offsetof(struct hk_mesh_emulation_params, abi_version) == 96);
+   assert(offsetof(struct hk_mesh_emulation_params, flags) == 100);
+   assert(offsetof(struct hk_mesh_emulation_params, task_emitted_groups) ==
+          104);
+   assert(offsetof(struct hk_mesh_emulation_params, task_overflow) == 108);
+   assert(offsetof(struct hk_mesh_emulation_params, reserved) == 112);
+   assert(sizeof(struct hk_mesh_emulation_params) == 128);
    assert(sizeof(struct hk_mesh_emulation_group_record) == 32);
+   assert(sizeof(struct hk_mesh_emulation_task_record) == 16);
+   assert(sizeof(struct hk_mesh_emulation_group_task) == 8);
 
    unsigned geometry_params = 0;
    unsigned global_constants = 0;
@@ -223,7 +236,11 @@ test_triangle(void)
             nir_metadata_control_flow, NULL);
    agx_preprocess_nir(b.shader);
    struct agx_shader_key key = {
-      .dev.encoding = AGX_ISA_ENCODING_AGX2,
+      .dev = {
+         .chip = AGX_CHIP_G13G,
+         .encoding = AGX_ISA_ENCODING_AGX2,
+         .needs_g13x_coherency = U_TRISTATE_NO,
+      },
       .no_preamble = true,
    };
    struct agx_shader_part part = {0};
@@ -268,7 +285,8 @@ test_fail_closed(void)
    ralloc_free(oversized_z.shader);
 
    nir_builder task_payload = triangle_builder(0, 0);
-   task_payload.shader->info.task_payload_size = 256;
+   task_payload.shader->info.task_payload_size =
+      HK_MESH_EMULATION_MAX_TASK_PAYLOAD + 1;
    assert(!hk_nir_lower_mesh_emulation(task_payload.shader, NULL));
    assert(task_payload.shader->info.stage == MESA_SHADER_MESH);
    ralloc_free(task_payload.shader);
@@ -407,7 +425,11 @@ compile_producer(nir_shader *producer)
             nir_metadata_control_flow, NULL);
    agx_preprocess_nir(producer);
    struct agx_shader_key key = {
-      .dev.encoding = AGX_ISA_ENCODING_AGX2,
+      .dev = {
+         .chip = AGX_CHIP_G13G,
+         .encoding = AGX_ISA_ENCODING_AGX2,
+         .needs_g13x_coherency = U_TRISTATE_NO,
+      },
       .no_preamble = true,
    };
    struct agx_shader_part part = {0};
@@ -585,6 +607,126 @@ test_admission_identity_lifetime(void)
    ralloc_free(unsupported.shader);
 }
 
+static nir_builder
+task_builder(uint32_t x, uint32_t y, uint32_t z)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_TASK, &agx_nir_options, "G13 software task producer");
+   b.shader->info.io_lowered = true;
+   b.shader->info.workgroup_size[0] = 32;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.task_payload_size = 256;
+   nir_def *lane = nir_load_local_invocation_index(&b);
+   nir_store_task_payload(&b, lane, nir_imul_imm(&b, lane, 4),
+                          .align_mul = 4);
+   nir_launch_mesh_workgroups(&b, nir_imm_ivec3(&b, x, y, z));
+   return b;
+}
+
+static void
+test_task_producer(void)
+{
+   nir_builder b = task_builder(2, 1, 1);
+   struct hk_task_emulation_layout layout;
+   assert(hk_nir_lower_task_emulation(b.shader, &layout));
+   nir_validate_shader(b.shader, "G13 software task producer lowered");
+   assert(b.shader->info.stage == MESA_SHADER_COMPUTE);
+   assert(b.shader->info.task_payload_size == 0);
+   assert(layout.payload_size_B == 256);
+   assert(layout.task_record_stride_B == 272);
+   assert(layout.local_size[0] == 32 && layout.local_size[1] == 1 &&
+          layout.local_size[2] == 1);
+
+   unsigned launches = 0;
+   unsigned payload_ops = 0;
+   unsigned atomics = 0;
+   unsigned barriers = 0;
+   unsigned lane_ids = 0;
+   nir_foreach_function_impl(impl, b.shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            launches += intr->intrinsic ==
+                        nir_intrinsic_launch_mesh_workgroups;
+            payload_ops += intr->intrinsic == nir_intrinsic_load_task_payload ||
+                           intr->intrinsic == nir_intrinsic_store_task_payload;
+            atomics += intr->intrinsic == nir_intrinsic_global_atomic;
+            barriers += intr->intrinsic == nir_intrinsic_barrier;
+            lane_ids += intr->intrinsic ==
+                        nir_intrinsic_load_local_invocation_index;
+         }
+      }
+   }
+   /* One static reservation/update sequence, guarded by lane zero, serves
+    * the 32-invocation task workgroup. */
+   assert(launches == 0 && payload_ops == 0);
+   assert(atomics == 3);
+   assert(barriers >= 1);
+   assert(lane_ids >= 1);
+   task_producer_binary_size = compile_producer(b.shader);
+
+   /* A huge child grid takes the cap+1 failure sentinel.  Its generated map
+    * loop has zero iterations on that arm and remains bounded at 4096 for
+    * every admitted launch; lowering and AGX2 compile must terminate. */
+   nir_builder first_overflow = task_builder(4097, 1, 1);
+   assert(hk_nir_lower_task_emulation(first_overflow.shader, NULL));
+   assert(compile_producer(first_overflow.shader) > 0);
+
+   /* Two task workgroups emitting 3000 children each exercise the aggregate
+    * overflow arm at execution time.  Lowering is independent of the parent
+    * grid and must keep the same bounded sentinel/map loop; the command test
+    * records its post-task overflow sanitizer before the indirect mesh kick. */
+   nir_builder aggregate_overflow = task_builder(3000, 1, 1);
+   assert(hk_nir_lower_task_emulation(aggregate_overflow.shader, NULL));
+   assert(compile_producer(aggregate_overflow.shader) > 0);
+
+   /* One static EmitMeshTasksEXT is the complete admitted contract.  Vulkan
+    * validation supplies uniform control flow; reject NIR that could reserve
+    * twice even when both launches are individually small. */
+   nir_builder duplicate = task_builder(1, 1, 1);
+   nir_launch_mesh_workgroups(&duplicate, nir_imm_ivec3(&duplicate, 1, 1, 1));
+   assert(!hk_nir_lower_task_emulation(duplicate.shader, NULL));
+   ralloc_free(duplicate.shader);
+}
+
+static void
+test_task_mesh_interface(void)
+{
+   nir_builder b = triangle_builder(0, 0);
+   b.shader->info.task_payload_size = 256;
+   b.shader->info.outputs_written |= VARYING_BIT_VAR(0);
+   nir_def *word = nir_load_task_payload(
+      &b, 1, 32, nir_imm_int(&b, 0), .align_mul = 4);
+   nir_def *value = nir_replicate(&b, word, 4);
+   nir_store_per_vertex_output(
+      &b, value, nir_load_local_invocation_index(&b), nir_imm_int(&b, 0),
+      .write_mask = 0xf, .src_type = nir_type_float32,
+      .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
+
+   struct hk_mesh_emulation_layout layout;
+   assert(hk_nir_lower_mesh_emulation(b.shader, &layout));
+   assert(layout.task_payload_size_B == 256);
+   unsigned payload_ops = 0;
+   unsigned global_loads = 0;
+   nir_foreach_function_impl(impl, b.shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            payload_ops += intr->intrinsic == nir_intrinsic_load_task_payload;
+            global_loads += intr->intrinsic == nir_intrinsic_load_global;
+         }
+      }
+   }
+   assert(payload_ops == 0);
+   assert(global_loads >= 4);
+   task_mesh_binary_size = compile_producer(b.shader);
+}
+
 int
 main(void)
 {
@@ -595,13 +737,16 @@ main(void)
    test_title_inventory_width();
    test_contract_boundaries();
    test_admission_identity_lifetime();
+   test_task_producer();
+   test_task_mesh_interface();
    printf("G13 mesh NIR: producer PASS (%u B), pull VS PASS (%u B), "
           "56-component PASS (%u/%u B), limits PASS (%u/%u B), "
-          "admission/cache PASS (%u/%u B), "
+          "admission/cache PASS (%u/%u B), task PASS (%u/%u B), "
           "unsupported PASS\n",
           producer_binary_size, pull_vs_binary_size,
           wide_producer_binary_size, wide_pull_vs_binary_size,
           limit_producer_binary_size, limit_pull_vs_binary_size,
-          admitted_producer_binary_size, admitted_pull_vs_binary_size);
+          admitted_producer_binary_size, admitted_pull_vs_binary_size,
+          task_producer_binary_size, task_mesh_binary_size);
    return 0;
 }

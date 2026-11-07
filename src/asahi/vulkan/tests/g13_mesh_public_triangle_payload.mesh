@@ -1,0 +1,35 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+
+layout(local_size_x = 4, local_size_y = 1, local_size_z = 1) in;
+layout(triangles, max_vertices = 4, max_primitives = 2) out;
+
+taskPayloadSharedEXT struct TaskPayload {
+   uint words[64];
+} payload;
+
+layout(location = 0) out vec4 vertex_colour[];
+perprimitiveEXT layout(location = 1) out vec4 primitive_colour[];
+
+void
+main()
+{
+   const uint lane = gl_LocalInvocationIndex;
+   const vec2 positions[4] = vec2[4](
+      vec2(-0.75, -0.75),
+      vec2( 0.75, -0.75),
+      vec2( 0.75,  0.75),
+      vec2(-0.75,  0.75)
+   );
+   const float payload_value = float(payload.words[lane] & 3u) / 3.0;
+
+   SetMeshOutputsEXT(4, 2);
+   gl_MeshVerticesEXT[lane].gl_Position = vec4(positions[lane], 0.0, 1.0);
+   vertex_colour[lane] = vec4(payload_value, 0.25, 0.75, 1.0);
+   if (lane < 2) {
+      gl_PrimitiveTriangleIndicesEXT[lane] = lane == 0
+         ? uvec3(0, 1, 2) : uvec3(0, 2, 3);
+      primitive_colour[lane] = lane == 0
+         ? vec4(1.0, 0.0, 0.0, 1.0) : vec4(0.0, 1.0, 0.0, 1.0);
+   }
+}

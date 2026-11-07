@@ -29,6 +29,42 @@ libagx_predicate_indirect(global uint32_t *out, constant uint32_t *in,
    }
 }
 
+/* Experimental G13 software task admission.  Copy a Vulkan indirect task
+ * grid only when its complete product fits the command-owned task-record
+ * budget.  Overflow fails the whole draw through the shared overflow word;
+ * no dimension is silently clamped and an unsafe task dispatch is never
+ * launched. */
+KERNEL(1)
+libagx_g13_task_dispatch(global uint32_t *out,
+                         global uint32_t *overflow,
+                         constant uint32_t *in, uint32_t max_tasks)
+{
+   ulong total = (ulong)in[0] * (ulong)in[1] * (ulong)in[2];
+   bool zero = in[0] == 0 || in[1] == 0 || in[2] == 0;
+   bool valid = !zero && total <= max_tasks;
+
+   out[0] = valid ? in[0] : 0;
+   out[1] = valid ? in[1] : 0;
+   out[2] = valid ? in[2] : 0;
+   if (!zero && !valid)
+      *overflow = 1;
+}
+
+/* Run after every task workgroup has retired and before the indirect mesh
+ * dispatch.  Any per-task or aggregate overflow invalidates the complete
+ * experimental draw, so do not launch mesh invocations against missing map
+ * entries (which could otherwise retain application-visible side effects). */
+KERNEL(1)
+libagx_g13_task_finalize(global uint32_t *mesh_grid,
+                         global uint32_t *overflow)
+{
+   if (*overflow) {
+      mesh_grid[0] = 0;
+      mesh_grid[1] = 0;
+      mesh_grid[2] = 0;
+   }
+}
+
 /* VK_EXT_transform_feedback exposes the byte count written by streamout as a
  * draw source.  Generate the complete VkDrawIndirectCommand on the GPU so a
  * producer earlier in this command buffer never needs CPU readback. */

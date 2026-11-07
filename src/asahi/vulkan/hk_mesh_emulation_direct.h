@@ -15,10 +15,12 @@
 struct hk_api_shader;
 struct hk_shader;
 
-/* Experimental G13 software-mesh profile.  It is intentionally narrower
+/* Experimental G13 software task/mesh profile.  It is intentionally narrower
  * than VK_EXT_mesh_shader Required_Limits and is exposed only by the explicit
- * bring-up option until every wider dimension has submitted-pixel proof. */
-#define HK_G13_MESH_MAX_GROUP_TOTAL        4096u
+ * bring-up option.  The varying path has submitted-pixel proof; task payload,
+ * indirect producer and overflow sanitization are offline-qualified only. */
+#define HK_G13_MESH_MAX_GROUP_TOTAL \
+   HK_MESH_EMULATION_MAX_EMITTED_GROUPS
 #define HK_G13_MESH_MAX_GROUP_COUNT        65535u
 #define HK_G13_MESH_MAX_INVOCATIONS \
    HK_MESH_EMULATION_MAX_WORKGROUP_INVOCATIONS
@@ -55,11 +57,14 @@ hk_g13_software_mesh_supported(enum agx_chip chip)
  * substituting an uncompiled NIR helper or a non-U32 draw.
  */
 struct hk_mesh_emulation_direct_plan {
+   const struct hk_shader *task_producer;
    const struct hk_shader *producer;
    const struct hk_shader *raster;
    struct hk_mesh_emulation_params params;
    struct agx_grid producer_grid;
    struct agx_workgroup producer_local_size;
+   struct agx_grid task_grid;
+   struct agx_workgroup task_local_size;
    enum agx_barrier barrier;
    struct agx_draw draw;
    uint64_t vertex_records_size_B;
@@ -68,9 +73,13 @@ struct hk_mesh_emulation_direct_plan {
    uint64_t index_buffer_size_B;
    uint64_t group_records_size_B;
    uint64_t draw_params_size_B;
+   uint64_t patched_draw_params_size_B;
+   uint64_t task_records_size_B;
+   uint64_t group_to_task_size_B;
    uint64_t scratch_size_B;
    uint32_t draw_count;
    uint32_t draw_stride_B;
+   bool task;
 };
 
 bool hk_mesh_emulation_direct_requirements(
@@ -87,4 +96,24 @@ bool hk_mesh_emulation_direct_plan_init(
    uint64_t index_buffer_size_B, uint64_t group_records,
    uint64_t group_records_size_B, uint64_t draw_params,
    uint64_t draw_params_size_B,
+   struct hk_mesh_emulation_direct_plan *plan);
+
+bool hk_mesh_emulation_task_requirements(
+   enum agx_chip chip, const struct hk_api_shader *task,
+   const struct hk_api_shader *mesh, const uint32_t task_group_count[3],
+   struct hk_mesh_emulation_direct_plan *plan);
+
+bool hk_mesh_emulation_task_plan_init(
+   enum agx_chip chip, const struct hk_api_shader *task,
+   const struct hk_api_shader *mesh, const uint32_t task_group_count[3],
+   uint64_t vertex_records, uint64_t vertex_records_size_B,
+   uint64_t primitive_records, uint64_t primitive_records_size_B,
+   uint64_t expanded_records, uint64_t expanded_records_size_B,
+   uint64_t index_buffer, uint64_t index_buffer_size_B,
+   uint64_t group_records, uint64_t group_records_size_B,
+   uint64_t task_records, uint64_t task_records_size_B,
+   uint64_t group_to_task, uint64_t group_to_task_size_B,
+   uint64_t draw_params, uint64_t draw_params_size_B,
+   uint64_t patched_draw_params, uint64_t patched_draw_params_size_B,
+   uint64_t params,
    struct hk_mesh_emulation_direct_plan *plan);

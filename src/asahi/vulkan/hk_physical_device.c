@@ -337,9 +337,10 @@ hk_get_device_features(
       .tessellationShader = true,
 
       
-      .taskShader = dev->chip == AGX_CHIP_G17S &&
-                    supported_extensions->EXT_mesh_shader &&
-                    hk_m5_task_record(dev->params.features),
+      .taskShader = supported_extensions->EXT_mesh_shader &&
+                    (hk_g13_software_mesh_supported(dev->chip) ||
+                     (dev->chip == AGX_CHIP_G17S &&
+                      hk_m5_task_record(dev->params.features))),
       .meshShader = supported_extensions->EXT_mesh_shader,
       .multiviewMeshShader = false,
       .primitiveFragmentShadingRateMeshShader = false,
@@ -1223,17 +1224,39 @@ hk_get_device_properties(const struct agx_device *dev,
 
 
 
-      .maxTaskWorkGroupTotalCount = task ? 1u << 22 : 0,
+      .maxTaskWorkGroupTotalCount =
+         g13_mesh && task ? HK_G13_MESH_MAX_GROUP_TOTAL
+                          : (task ? 1u << 22 : 0),
       .maxTaskWorkGroupCount = {
-         task ? 65535 : 0, task ? 65535 : 0, task ? 65535 : 0,
+         g13_mesh && task ? HK_G13_MESH_MAX_GROUP_TOTAL
+                          : (task ? 65535 : 0),
+         g13_mesh && task ? HK_G13_MESH_MAX_GROUP_TOTAL
+                          : (task ? 65535 : 0),
+         g13_mesh && task ? HK_G13_MESH_MAX_GROUP_TOTAL
+                          : (task ? 65535 : 0),
       },
-      .maxTaskWorkGroupInvocations = task ? 1024 : 0,
+      .maxTaskWorkGroupInvocations =
+         g13_mesh && task ? HK_G13_MESH_MAX_INVOCATIONS
+                          : (task ? 1024 : 0),
       .maxTaskWorkGroupSize = {
-         task ? 1024 : 0, task ? 1024 : 0, task ? 1024 : 0,
+         g13_mesh && task ? HK_G13_MESH_MAX_WORKGROUP_X
+                          : (task ? 1024 : 0),
+         g13_mesh && task ? HK_G13_MESH_MAX_WORKGROUP_Y
+                          : (task ? 1024 : 0),
+         g13_mesh && task ? HK_G13_MESH_MAX_WORKGROUP_Z
+                          : (task ? 1024 : 0),
       },
-      .maxTaskPayloadSize = task ? 16384 : 0,
-      .maxTaskSharedMemorySize = task ? 32768 : 0,
-      .maxTaskPayloadAndSharedMemorySize = task ? 32768 : 0,
+      .maxTaskPayloadSize =
+         g13_mesh && task ? HK_MESH_EMULATION_MAX_TASK_PAYLOAD
+                          : (task ? 16384 : 0),
+      .maxTaskSharedMemorySize =
+         g13_mesh && task ? HK_G13_MESH_MAX_SHARED_SIZE
+                          : (task ? 32768 : 0),
+      .maxTaskPayloadAndSharedMemorySize =
+         g13_mesh && task
+            ? HK_G13_MESH_MAX_SHARED_SIZE +
+                 HK_MESH_EMULATION_MAX_TASK_PAYLOAD
+            : (task ? 32768 : 0),
       .maxMeshWorkGroupTotalCount =
          g13_mesh ? HK_G13_MESH_MAX_GROUP_TOTAL : (mesh ? 1u << 22 : 0),
       .maxMeshWorkGroupCount = {
@@ -2079,8 +2102,9 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
 
    /* Experimental and deliberately non-conformant: the G13 software path is
     * public only for API/pipeline bring-up. Its queried limits describe the
-    * bounded implementation and remain below VK_EXT_mesh_shader Required_Limits
-    * until direct-global arbitrary varyings and GPU-side draw consumption land. */
+    * bounded direct-global varying and task/mesh GPU-count implementation and
+    * remain below VK_EXT_mesh_shader Required_Limits until the fixed 4096-group
+    * cap and O(cap) raster recording are removed. */
    supported_extensions.EXT_mesh_shader =
       (hk_g13_software_mesh_supported(pdev->dev.chip) &&
        debug_get_bool_option("ASAHI_G13_SOFTWARE_MESH", false)) ||

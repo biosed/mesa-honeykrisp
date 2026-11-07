@@ -6051,6 +6051,7 @@ hk_compile_g13_mesh_emulation(
    main->info.mesh.primitive_stride_B = layout->primitive_stride_B;
    main->info.mesh.vertex_outputs = layout->vertex_outputs;
    main->info.mesh.primitive_outputs = layout->primitive_outputs;
+   main->info.mesh.payload_size_B = layout->task_payload_size_B;
    main->info.mesh.prim = MESA_PRIM_TRIANGLES;
    for (unsigned i = 0; i < 3; ++i)
       main->info.mesh.local_size[i] = producer->info.workgroup_size[i];
@@ -6100,6 +6101,41 @@ hk_compile_g13_mesh_emulation(
 
    hk_mesh_emulation_admission_unref(admission);
    return result;
+}
+
+static VkResult
+hk_compile_g13_task_emulation(
+   struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
+   nir_shader *task, const struct vk_shader_compile_info *info,
+   enum hk_feature_key features, uint8_t static_set_mask,
+   struct hk_api_shader *obj)
+{
+   assert(task->info.stage == MESA_SHADER_TASK);
+   assert(dev->dev.chip == AGX_CHIP_G13G ||
+          dev->dev.chip == AGX_CHIP_G13X);
+
+   struct hk_task_emulation_layout layout;
+   if (!hk_nir_lower_task_emulation(task, &layout)) {
+      ralloc_free(task);
+      return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "task shader outside the G13 emulation contract");
+   }
+
+   agx_preprocess_nir(task);
+   const nir_lower_compute_system_values_options csv_options = {
+      .has_base_workgroup_id = true,
+   };
+   NIR_PASS(_, task, nir_lower_compute_system_values, &csv_options);
+
+   struct hk_shader *producer = &obj->variants[0];
+   producer->info.mesh.payload_size_B = layout.payload_size_B;
+   for (unsigned i = 0; i < 3; ++i)
+      producer->info.mesh.local_size[i] = layout.local_size[i];
+
+   return hk_compile_nir(
+      dev, pAllocator, task, info->flags, info->robustness, NULL, features,
+      producer, MESA_SHADER_TASK, true, NULL, info->set_layout_count,
+      static_set_mask);
 }
 
 static VkResult
@@ -6603,6 +6639,15 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       }
       /* This compiler-generated object only transports the mesh launch. */
       predicated->info.writes_external_memory = false;
+   } else if (sw_stage == MESA_SHADER_TASK &&
+              (dev->dev.chip == AGX_CHIP_G13G ||
+               dev->dev.chip == AGX_CHIP_G13X)) {
+      result = hk_compile_g13_task_emulation(
+         dev, pAllocator, nir, info, features, static_set_mask, obj);
+      if (result != VK_SUCCESS) {
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return result;
+      }
    } else if (sw_stage == MESA_SHADER_TASK) {
       /* Compile the actual API object shader through captured native payload
        * addressing and child-grid UVSW, never as a CDM mesh producer.

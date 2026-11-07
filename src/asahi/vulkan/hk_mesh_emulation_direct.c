@@ -6,6 +6,7 @@
 #include "hk_mesh_emulation_direct.h"
 
 #include <limits.h>
+#include <stddef.h>
 #include <string.h>
 
 #include "hk_shader.h"
@@ -47,7 +48,8 @@ hk_mesh_emulation_direct_requirements(
        producer->info.mesh.prim != MESA_PRIM_TRIANGLES ||
        !producer->info.mesh.vertex_stride_B ||
        !producer->info.mesh.primitive_stride_B ||
-       !raster->info.mesh.vertex_stride_B)
+       !raster->info.mesh.vertex_stride_B ||
+       producer->info.mesh.payload_size_B)
       return false;
 
    uint64_t groups = 1;
@@ -182,5 +184,194 @@ hk_mesh_emulation_direct_plan_init(
    plan->draw = agx_draw_indexed_indirect(
       draw_params, index_buffer, (uint32_t)index_buffer_size_B,
       AGX_INDEX_SIZE_U32, false);
+   return true;
+}
+
+bool
+hk_mesh_emulation_task_requirements(
+   enum agx_chip chip, const struct hk_api_shader *task,
+   const struct hk_api_shader *mesh, const uint32_t task_group_count[3],
+   struct hk_mesh_emulation_direct_plan *plan)
+{
+   if (!task || !mesh || !task_group_count || !plan ||
+       !hk_g13_software_mesh_supported(chip) ||
+       task->vk.stage != MESA_SHADER_TASK ||
+       mesh->vk.stage != MESA_SHADER_MESH)
+      return false;
+
+   const struct hk_shader *task_producer = &task->variants[0];
+   const struct hk_shader *producer = &mesh->variants[HK_MESH_VARIANT_MAIN];
+   const struct hk_shader *raster = &mesh->variants[HK_MESH_VARIANT_RAST];
+   const struct hk_shader *predicated =
+      &mesh->variants[HK_MESH_VARIANT_PREDICATED_OBJECT];
+   const uint32_t payload = task_producer->info.mesh.payload_size_B;
+   if (!task_producer->compiled || !task_producer->only_linked ||
+       task_producer->info.stage != MESA_SHADER_TASK ||
+       task_producer->b.info.stage != MESA_SHADER_COMPUTE ||
+       !producer->compiled || !producer->only_linked ||
+       producer->b.info.stage != MESA_SHADER_COMPUTE ||
+       !raster->compiled ||
+       (!raster->linked.ht && !raster->linked.lazy_ht) ||
+       raster->b.info.stage != MESA_SHADER_VERTEX || predicated->compiled ||
+       !payload || payload > HK_MESH_EMULATION_MAX_TASK_PAYLOAD ||
+       producer->info.mesh.payload_size_B != payload ||
+       !producer->info.mesh.max_vertices ||
+       !producer->info.mesh.max_primitives ||
+       producer->info.mesh.prim != MESA_PRIM_TRIANGLES ||
+       !producer->info.mesh.vertex_stride_B ||
+       !producer->info.mesh.primitive_stride_B ||
+       !raster->info.mesh.vertex_stride_B)
+      return false;
+
+   uint64_t tasks = 1;
+   uint32_t task_threads[3];
+   for (unsigned i = 0; i < 3; ++i) {
+      const uint32_t local = task_producer->info.mesh.local_size[i];
+      if (!task_group_count[i] || !local ||
+          task_group_count[i] > UINT32_MAX / local ||
+          tasks > UINT64_MAX / task_group_count[i])
+         return false;
+      task_threads[i] = task_group_count[i] * local;
+      tasks *= task_group_count[i];
+   }
+   if (tasks > HK_G13_MESH_MAX_GROUP_TOTAL)
+      return false;
+
+   const uint64_t groups = HK_G13_MESH_MAX_GROUP_TOTAL;
+   const uint64_t vertices = groups * producer->info.mesh.max_vertices;
+   const uint64_t primitives = groups * producer->info.mesh.max_primitives;
+   if (vertices > UINT64_MAX / producer->info.mesh.vertex_stride_B ||
+       primitives > UINT64_MAX / producer->info.mesh.primitive_stride_B ||
+       primitives > UINT64_MAX / 3)
+      return false;
+   const uint64_t expanded_vertices = primitives * 3;
+   if (expanded_vertices >
+          UINT64_MAX / raster->info.mesh.vertex_stride_B ||
+       expanded_vertices > UINT32_MAX)
+      return false;
+
+   const uint64_t task_stride = ALIGN_POT(
+      HK_MESH_EMULATION_TASK_RECORD_HEADER_SIZE + payload, 16);
+   if (tasks > UINT64_MAX / task_stride)
+      return false;
+
+   memset(plan, 0, sizeof(*plan));
+   plan->task_producer = task_producer;
+   plan->producer = producer;
+   plan->raster = raster;
+   plan->task_grid = agx_3d(
+      task_threads[0], task_threads[1], task_threads[2]);
+   plan->task_local_size = agx_workgroup(
+      task_producer->info.mesh.local_size[0],
+      task_producer->info.mesh.local_size[1],
+      task_producer->info.mesh.local_size[2]);
+   plan->producer_local_size = agx_workgroup(
+      producer->info.mesh.local_size[0], producer->info.mesh.local_size[1],
+      producer->info.mesh.local_size[2]);
+   plan->barrier = AGX_BARRIER_ALL | AGX_PREGFX;
+   plan->vertex_records_size_B =
+      vertices * producer->info.mesh.vertex_stride_B;
+   plan->primitive_records_size_B =
+      primitives * producer->info.mesh.primitive_stride_B;
+   plan->expanded_records_size_B =
+      expanded_vertices * raster->info.mesh.vertex_stride_B;
+   plan->index_buffer_size_B = expanded_vertices * sizeof(uint32_t);
+   plan->group_records_size_B =
+      groups * sizeof(struct hk_mesh_emulation_group_record);
+   plan->task_records_size_B = tasks * task_stride;
+   plan->group_to_task_size_B =
+      groups * sizeof(struct hk_mesh_emulation_group_task);
+   plan->draw_params_size_B =
+      groups * sizeof(VkDrawIndexedIndirectCommand);
+   plan->patched_draw_params_size_B = plan->draw_params_size_B;
+   plan->draw_count = groups;
+   plan->draw_stride_B = sizeof(VkDrawIndexedIndirectCommand);
+   plan->task = true;
+
+   uint64_t scratch = sizeof(struct hk_mesh_emulation_params);
+   if (!add_scratch_size(&scratch, plan->vertex_records_size_B) ||
+       !add_scratch_size(&scratch, plan->primitive_records_size_B) ||
+       !add_scratch_size(&scratch, plan->expanded_records_size_B) ||
+       !add_scratch_size(&scratch, plan->index_buffer_size_B) ||
+       !add_scratch_size(&scratch, plan->group_records_size_B) ||
+       !add_scratch_size(&scratch, plan->task_records_size_B) ||
+       !add_scratch_size(&scratch, plan->group_to_task_size_B) ||
+       !add_scratch_size(&scratch, plan->draw_params_size_B) ||
+       !add_scratch_size(&scratch, plan->patched_draw_params_size_B) ||
+       scratch > HK_G13_MESH_MAX_SCRATCH_SIZE)
+      return false;
+   plan->scratch_size_B = scratch;
+   return true;
+}
+
+bool
+hk_mesh_emulation_task_plan_init(
+   enum agx_chip chip, const struct hk_api_shader *task,
+   const struct hk_api_shader *mesh, const uint32_t task_group_count[3],
+   uint64_t vertex_records, uint64_t vertex_records_size_B,
+   uint64_t primitive_records, uint64_t primitive_records_size_B,
+   uint64_t expanded_records, uint64_t expanded_records_size_B,
+   uint64_t index_buffer, uint64_t index_buffer_size_B,
+   uint64_t group_records, uint64_t group_records_size_B,
+   uint64_t task_records, uint64_t task_records_size_B,
+   uint64_t group_to_task, uint64_t group_to_task_size_B,
+   uint64_t draw_params, uint64_t draw_params_size_B,
+   uint64_t patched_draw_params, uint64_t patched_draw_params_size_B,
+   uint64_t params,
+   struct hk_mesh_emulation_direct_plan *plan)
+{
+   struct hk_mesh_emulation_direct_plan req;
+   if (!hk_mesh_emulation_task_requirements(
+          chip, task, mesh, task_group_count, &req) ||
+       !vertex_records || (vertex_records & 15) ||
+       !primitive_records || (primitive_records & 15) ||
+       !expanded_records || (expanded_records & 15) ||
+       !index_buffer || (index_buffer & 3) ||
+       !group_records || (group_records & 31) ||
+       !task_records || (task_records & 15) ||
+       !group_to_task || (group_to_task & 7) ||
+       !draw_params || (draw_params & 3) ||
+       !patched_draw_params || (patched_draw_params & 3) ||
+       !params || (params & 15) ||
+       req.vertex_records_size_B > vertex_records_size_B ||
+       req.primitive_records_size_B > primitive_records_size_B ||
+       req.expanded_records_size_B > expanded_records_size_B ||
+       req.index_buffer_size_B > index_buffer_size_B ||
+       index_buffer_size_B > UINT32_MAX ||
+       req.group_records_size_B > group_records_size_B ||
+       req.task_records_size_B > task_records_size_B ||
+       req.group_to_task_size_B > group_to_task_size_B ||
+       req.draw_params_size_B > draw_params_size_B ||
+       req.patched_draw_params_size_B > patched_draw_params_size_B)
+      return false;
+
+   *plan = req;
+   const uint32_t task_stride = ALIGN_POT(
+      HK_MESH_EMULATION_TASK_RECORD_HEADER_SIZE +
+         req.task_producer->info.mesh.payload_size_B,
+      16);
+   plan->params = (struct hk_mesh_emulation_params){
+      .vertex_records = vertex_records,
+      .primitive_records = primitive_records,
+      .expanded_records = expanded_records,
+      .index_buffer = index_buffer,
+      .group_records = group_records,
+      .task_records = task_records,
+      .draw_params = draw_params,
+      .group_to_task = group_to_task,
+      .mesh_grid = {0, 1, 1},
+      .task_grid = {task_group_count[0], task_group_count[1],
+                    task_group_count[2]},
+      .task_record_stride_B = task_stride,
+      .task_payload_size_B = req.task_producer->info.mesh.payload_size_B,
+      .abi_version = HK_MESH_EMULATION_ABI_VERSION,
+      .flags = HK_MESH_EMULATION_FLAG_DEINDEXED |
+               HK_MESH_EMULATION_FLAG_TASK,
+   };
+   plan->draw = agx_draw_indexed_indirect(
+      patched_draw_params, index_buffer, (uint32_t)index_buffer_size_B,
+      AGX_INDEX_SIZE_U32, false);
+   plan->producer_grid = agx_grid_indirect(
+      params + offsetof(struct hk_mesh_emulation_params, mesh_grid));
    return true;
 }

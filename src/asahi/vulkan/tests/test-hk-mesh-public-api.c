@@ -25,6 +25,14 @@ static const uint32_t g13_mesh_public_triangle_frag_spv[] = {
 #include "g13_mesh_public_triangle.frag.spv.h"
 };
 
+static const uint32_t g13_mesh_public_triangle_task_spv[] = {
+#include "g13_mesh_public_triangle.task.spv.h"
+};
+
+static const uint32_t g13_mesh_public_triangle_payload_spv[] = {
+#include "g13_mesh_public_triangle_payload.mesh.spv.h"
+};
+
 #define CHECK(call)                                                            \
    do {                                                                        \
       VkResult result_ = (call);                                               \
@@ -99,9 +107,16 @@ check_negative(VkPhysicalDevice physical)
 static void
 check_limits(const VkPhysicalDeviceMeshShaderPropertiesEXT *p)
 {
-   assert(p->maxTaskWorkGroupTotalCount == 0);
-   assert(p->maxTaskWorkGroupInvocations == 0);
-   assert(p->maxTaskPayloadSize == 0);
+   assert(p->maxTaskWorkGroupTotalCount == 4096);
+   for (unsigned i = 0; i < 3; ++i)
+      assert(p->maxTaskWorkGroupCount[i] == 4096);
+   assert(p->maxTaskWorkGroupInvocations == 1024);
+   assert(p->maxTaskWorkGroupSize[0] == 1024);
+   assert(p->maxTaskWorkGroupSize[1] == 1024);
+   assert(p->maxTaskWorkGroupSize[2] == 64);
+   assert(p->maxTaskPayloadSize == 4096);
+   assert(p->maxTaskSharedMemorySize == 28 * 1024);
+   assert(p->maxTaskPayloadAndSharedMemorySize == 32 * 1024);
    assert(p->maxMeshWorkGroupTotalCount == 4096);
    for (unsigned i = 0; i < 3; ++i) {
       assert(p->maxMeshWorkGroupCount[i] == 65535);
@@ -121,7 +136,7 @@ check_limits(const VkPhysicalDeviceMeshShaderPropertiesEXT *p)
    assert(p->maxMeshMultiviewViewCount == 1);
    assert(p->meshOutputPerVertexGranularity == 16);
    assert(p->meshOutputPerPrimitiveGranularity == 16);
-   assert(p->maxPreferredTaskWorkGroupInvocations == 0);
+   assert(p->maxPreferredTaskWorkGroupInvocations == 32);
    assert(p->maxPreferredMeshWorkGroupInvocations == 32);
 }
 
@@ -131,6 +146,10 @@ check_required_limit_gaps(
 {
    /* VK_EXT_mesh_shader Required_Limits. Keep this table executable so the
     * opt-in profile cannot be mistaken for conformant exposure. */
+   assert(p->maxTaskWorkGroupTotalCount < (1u << 22));
+   for (unsigned i = 0; i < 3; ++i)
+      assert(p->maxTaskWorkGroupCount[i] < 65535);
+   assert(p->maxTaskPayloadSize < 16384);
    assert(p->maxMeshWorkGroupTotalCount < (1u << 22));
    for (unsigned i = 0; i < 3; ++i)
       assert(p->maxMeshWorkGroupCount[i] >= 65535);
@@ -180,13 +199,7 @@ create_device(VkPhysicalDevice physical, bool task)
       .ppEnabledExtensionNames = extensions,
    };
    VkDevice device = VK_NULL_HANDLE;
-   VkResult result = vkCreateDevice(physical, &info, NULL, &device);
-   if (task) {
-      assert(result == VK_ERROR_FEATURE_NOT_PRESENT);
-      assert(device == VK_NULL_HANDLE);
-      return VK_NULL_HANDLE;
-   }
-   CHECK(result);
+   CHECK(vkCreateDevice(physical, &info, NULL, &device));
    return device;
 }
 
@@ -203,12 +216,32 @@ shader_module(VkDevice device, const uint32_t *code, size_t size)
    return module;
 }
 
+static uint32_t
+first_memory_type(VkPhysicalDevice physical, uint32_t bits)
+{
+   VkPhysicalDeviceMemoryProperties properties;
+   vkGetPhysicalDeviceMemoryProperties(physical, &properties);
+   for (uint32_t i = 0; i < properties.memoryTypeCount; ++i) {
+      if (bits & (1u << i))
+         return i;
+   }
+   assert(!"no compatible memory type");
+   return 0;
+}
+
 static void
-record_public_triangle(VkDevice device)
+record_public_triangle(VkPhysicalDevice physical, VkDevice device, bool task)
 {
    VkShaderModule mesh = shader_module(
-      device, g13_mesh_public_triangle_spv,
-      sizeof(g13_mesh_public_triangle_spv));
+      device,
+      task ? g13_mesh_public_triangle_payload_spv
+           : g13_mesh_public_triangle_spv,
+      task ? sizeof(g13_mesh_public_triangle_payload_spv)
+           : sizeof(g13_mesh_public_triangle_spv));
+   VkShaderModule task_module = task
+      ? shader_module(device, g13_mesh_public_triangle_task_spv,
+                      sizeof(g13_mesh_public_triangle_task_spv))
+      : VK_NULL_HANDLE;
    VkShaderModule fragment = shader_module(
       device, g13_mesh_public_triangle_frag_spv,
       sizeof(g13_mesh_public_triangle_frag_spv));
@@ -224,24 +257,32 @@ record_public_triangle(VkDevice device)
    const VkPipelineRenderingCreateInfo rendering_info = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
    };
-   const VkPipelineShaderStageCreateInfo stages[] = {
-      {
+   VkPipelineShaderStageCreateInfo stages[3] = {0};
+   uint32_t stage_count = 0;
+   if (task) {
+      stages[stage_count++] = (VkPipelineShaderStageCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+         .stage = VK_SHADER_STAGE_TASK_BIT_EXT,
+         .module = task_module,
+         .pName = "main",
+      };
+   }
+   stages[stage_count++] = (VkPipelineShaderStageCreateInfo){
          .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
          .stage = VK_SHADER_STAGE_MESH_BIT_EXT,
          .module = mesh,
          .pName = "main",
-      },
-      {
+      };
+   stages[stage_count++] = (VkPipelineShaderStageCreateInfo){
          .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
          .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
          .module = fragment,
          .pName = "main",
-      },
-   };
+      };
    const VkGraphicsPipelineCreateInfo pipeline_info = {
       .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
       .pNext = &rendering_info,
-      .stageCount = 2,
+      .stageCount = stage_count,
       .pStages = stages,
       .pViewportState = &(VkPipelineViewportStateCreateInfo){
          .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
@@ -303,14 +344,48 @@ record_public_triangle(VkDevice device)
    assert(draw != NULL);
    draw(command, 0, 1, 1);
    draw(command, 2, 1, 1);
+
+   VkBuffer indirect = VK_NULL_HANDLE;
+   VkDeviceMemory indirect_memory = VK_NULL_HANDLE;
+   if (task) {
+      const VkBufferCreateInfo buffer_info = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+         .size = sizeof(VkDrawMeshTasksIndirectCommandEXT),
+         .usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+      };
+      CHECK(vkCreateBuffer(device, &buffer_info, NULL, &indirect));
+      VkMemoryRequirements requirements;
+      vkGetBufferMemoryRequirements(device, indirect, &requirements);
+      const VkMemoryAllocateInfo allocation = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+         .allocationSize = requirements.size,
+         .memoryTypeIndex = first_memory_type(
+            physical, requirements.memoryTypeBits),
+      };
+      CHECK(vkAllocateMemory(device, &allocation, NULL, &indirect_memory));
+      CHECK(vkBindBufferMemory(device, indirect, indirect_memory, 0));
+
+      PFN_vkCmdDrawMeshTasksIndirectEXT draw_indirect =
+         (PFN_vkCmdDrawMeshTasksIndirectEXT)vkGetDeviceProcAddr(
+            device, "vkCmdDrawMeshTasksIndirectEXT");
+      assert(draw_indirect != NULL);
+      draw_indirect(command, indirect, 0, 1,
+                    sizeof(VkDrawMeshTasksIndirectCommandEXT));
+   }
    vkCmdEndRendering(command);
    CHECK(vkEndCommandBuffer(command));
 
    vkDestroyCommandPool(device, pool, NULL);
+   if (indirect != VK_NULL_HANDLE)
+      vkDestroyBuffer(device, indirect, NULL);
+   if (indirect_memory != VK_NULL_HANDLE)
+      vkFreeMemory(device, indirect_memory, NULL);
    vkDestroyPipeline(device, pipeline, NULL);
    vkDestroyPipelineLayout(device, layout, NULL);
    vkDestroyShaderModule(device, fragment, NULL);
    vkDestroyShaderModule(device, mesh, NULL);
+   if (task_module != VK_NULL_HANDLE)
+      vkDestroyShaderModule(device, task_module, NULL);
 }
 
 int
@@ -347,7 +422,7 @@ main(int argc, char **argv)
    };
    vkGetPhysicalDeviceFeatures2(physical, &features);
    assert(has_extension(physical, VK_EXT_MESH_SHADER_EXTENSION_NAME));
-   assert(mesh_features.meshShader && !mesh_features.taskShader &&
+   assert(mesh_features.meshShader && mesh_features.taskShader &&
           !mesh_features.multiviewMeshShader &&
           !mesh_features.primitiveFragmentShadingRateMeshShader &&
           !mesh_features.meshShaderQueries);
@@ -363,11 +438,14 @@ main(int argc, char **argv)
    check_limits(&mesh_properties);
    check_required_limit_gaps(&mesh_properties);
 
-   (void)create_device(physical, true);
-   VkDevice device = create_device(physical, false);
-   record_public_triangle(device);
-   vkDestroyDevice(device, NULL);
+   VkDevice mesh_device = create_device(physical, false);
+   record_public_triangle(physical, mesh_device, false);
+   vkDestroyDevice(mesh_device, NULL);
+   VkDevice task_device = create_device(physical, true);
+   record_public_triangle(physical, task_device, true);
+   vkDestroyDevice(task_device, NULL);
    vkDestroyInstance(instance, NULL);
-   puts("G13 mesh public API: feature/property/pipeline/direct record PASS");
+   puts("G13 mesh public API: mesh/task feature/property, pipeline, direct "
+        "and indirect record PASS");
    return 0;
 }

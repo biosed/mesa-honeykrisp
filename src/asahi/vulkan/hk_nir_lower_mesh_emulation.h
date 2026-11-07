@@ -17,7 +17,8 @@
  * path will place its address in draw.geometry_params before dispatching the
  * lowered shader.  Keep this ABI independent of Vulkan application memory.
  */
-#define HK_MESH_EMULATION_ABI_VERSION 3u
+#define HK_MESH_EMULATION_ABI_VERSION 4u
+#define HK_MESH_EMULATION_PARAMS_SIZE 128u
 #define HK_MESH_EMULATION_TARGET_G13 13u
 #define HK_MESH_EMULATION_MAX_SLOTS 64u
 #define HK_MESH_EMULATION_FLAG_DEINDEXED UINT32_C(1)
@@ -25,6 +26,10 @@
 #define HK_MESH_EMULATION_MAX_WORKGROUP_Y 1024u
 #define HK_MESH_EMULATION_MAX_WORKGROUP_Z 64u
 #define HK_MESH_EMULATION_MAX_WORKGROUP_INVOCATIONS 1024u
+#define HK_MESH_EMULATION_MAX_TASK_PAYLOAD (4u * 1024u)
+#define HK_MESH_EMULATION_TASK_RECORD_HEADER_SIZE 16u
+#define HK_MESH_EMULATION_MAX_EMITTED_GROUPS 4096u
+#define HK_MESH_EMULATION_FLAG_TASK UINT32_C(2)
 
 struct hk_mesh_emulation_params {
    uint64_t vertex_records;
@@ -34,16 +39,32 @@ struct hk_mesh_emulation_params {
    uint64_t group_records;
    uint64_t task_records;
    uint64_t draw_params;
+   uint64_t group_to_task;
    uint32_t mesh_grid[3];
+   uint32_t task_grid[3];
+   uint32_t task_record_stride_B;
+   uint32_t task_payload_size_B;
    uint32_t abi_version;
    uint32_t flags;
-   uint32_t reserved;
+   uint32_t task_emitted_groups;
+   uint32_t task_overflow;
+   uint32_t reserved[4];
+};
+
+struct hk_mesh_emulation_task_record {
+   uint32_t mesh_grid[3];
+   uint32_t first_mesh_group;
+};
+
+struct hk_mesh_emulation_group_task {
+   uint32_t task_index;
+   uint32_t local_mesh_group;
 };
 
 struct hk_mesh_emulation_group_record {
-   uint32_t vertex_count;
+   uint32_t expanded_vertex_count;
    uint32_t primitive_count;
-   uint32_t vertex_base;
+   uint32_t expanded_vertex_base;
    uint32_t primitive_base;
    uint32_t task_index;
    uint32_t flags;
@@ -62,6 +83,7 @@ struct hk_mesh_emulation_layout {
    unsigned position_offset_B;
    unsigned index_offset_B;
    unsigned output_memory_B;
+   unsigned task_payload_size_B;
    uint64_t vertex_outputs;
    uint64_t primitive_outputs;
    uint16_t vertex_offset_B[HK_MESH_EMULATION_MAX_SLOTS];
@@ -90,6 +112,18 @@ struct hk_mesh_emulation_admission;
  */
 bool hk_nir_lower_mesh_emulation(
    nir_shader *shader, struct hk_mesh_emulation_layout *layout_out);
+
+struct hk_task_emulation_layout {
+   unsigned payload_size_B;
+   unsigned task_record_stride_B;
+   unsigned local_size[3];
+};
+
+/* Lower one API task workgroup to a bounded compute producer.  EmitMeshTasks
+ * allocates a contiguous child range in GPU memory and publishes the
+ * task/payload mapping consumed by hk_nir_lower_mesh_emulation(). */
+bool hk_nir_lower_task_emulation(
+   nir_shader *shader, struct hk_task_emulation_layout *layout_out);
 
 /*
  * Build the ordinary vertex-stage consumer for the position scratch.  The

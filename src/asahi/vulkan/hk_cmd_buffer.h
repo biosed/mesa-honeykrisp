@@ -2516,12 +2516,17 @@ void hk_cmd_bind_graphics_shader(struct hk_cmd_buffer *cmd,
 
 struct hk_mesh_emulation_record_trace {
    uint64_t producer_root;
+   uint64_t task_root;
    uint64_t geometry_params;
    uintptr_t linked_raster;
+   bool task_dispatched;
+   bool task_overflow_sanitized;
+   bool mesh_dispatched_indirect;
+   bool raster_count_predicated;
 };
 
-/* Internal-only G13 software-mesh recorder. Feature advertisement and public
- * mesh entrypoints stay disabled until its submitted synthetic draw passes. */
+/* G13 software task/mesh recorder. Public exposure remains behind the explicit
+ * non-conformant bring-up option; tests may request an internal trace. */
 bool hk_cmd_draw_mesh_g13_direct(struct hk_cmd_buffer *cmd,
                                  const uint32_t group_count[3],
                                  uint16_t draw_id,

@@ -12595,6 +12595,12 @@ hk_note_pre_raster_images(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 struct hk_g13_mesh_draw {
    const struct hk_mesh_emulation_direct_plan *plan;
    uint64_t geometry_params;
+   uint64_t source_draw_params;
+   uint64_t patched_draw_params;
+   uint64_t draw_count_addr;
+   uint64_t task_grid_source;
+   uint64_t task_grid_dest;
+   uint64_t task_overflow_addr;
    struct hk_mesh_emulation_record_trace *trace;
    bool dispatch_producer;
 };
@@ -12813,7 +12819,9 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
                 mesh_draw->geometry_params ||
              gfx->root_cpu->draw.geometry_params !=
                 mesh_draw->geometry_params ||
-             hk_shader_root_for_usc(cmd, plan->producer) != gfx->root) {
+             hk_shader_root_for_usc(cmd, plan->producer) != gfx->root ||
+             (plan->task &&
+              hk_shader_root_for_usc(cmd, plan->task_producer) != gfx->root)) {
             vk_command_buffer_set_error(&cmd->vk,
                                         VK_ERROR_FEATURE_NOT_PRESENT);
             return;
@@ -12821,6 +12829,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
 
          if (mesh_draw->trace) {
             mesh_draw->trace->producer_root = gfx->root;
+            mesh_draw->trace->task_root = plan->task ? gfx->root : 0;
             mesh_draw->trace->geometry_params =
                gfx->root_cpu->draw.geometry_params;
             mesh_draw->trace->linked_raster =
@@ -12828,11 +12837,48 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
          }
 
          if (mesh_draw->dispatch_producer) {
+            if (plan->task) {
+               if (mesh_draw->task_grid_source) {
+                  libagx_g13_task_dispatch(
+                     cmd, agx_1d(1), plan->barrier,
+                     mesh_draw->task_grid_dest,
+                     mesh_draw->task_overflow_addr,
+                     mesh_draw->task_grid_source,
+                     HK_G13_MESH_MAX_GROUP_TOTAL);
+               }
+               hk_dispatch_with_local_size(
+                  cmd, ccs, (struct hk_shader *)plan->task_producer,
+                  plan->task_grid, plan->task_local_size);
+               if (vk_command_buffer_has_error(&cmd->vk))
+                  return;
+               libagx_g13_task_finalize(
+                  cmd, agx_1d(1), plan->barrier,
+                  mesh_draw->draw_count_addr,
+                  mesh_draw->task_overflow_addr);
+               if (mesh_draw->trace) {
+                  mesh_draw->trace->task_dispatched = true;
+                  mesh_draw->trace->task_overflow_sanitized = true;
+               }
+            }
             hk_dispatch_with_local_size(
                cmd, ccs, (struct hk_shader *)plan->producer,
                plan->producer_grid, plan->producer_local_size);
             if (vk_command_buffer_has_error(&cmd->vk))
                return;
+            if (mesh_draw->trace)
+               mesh_draw->trace->mesh_dispatched_indirect =
+                  agx_is_indirect(plan->producer_grid);
+
+            if (plan->task) {
+               libagx_predicate_indirect(
+                  cmd, agx_1d(plan->draw_count), plan->barrier,
+                  mesh_draw->patched_draw_params,
+                  mesh_draw->source_draw_params,
+                  mesh_draw->draw_count_addr,
+                  plan->draw_stride_B / sizeof(uint32_t), true);
+               if (mesh_draw->trace)
+                  mesh_draw->trace->raster_count_predicated = true;
+            }
          }
       }
 
@@ -13049,6 +13095,131 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw)
    hk_draw_impl(cmd, draw_id, draw, NULL, NULL);
 }
 
+static bool
+hk_cmd_draw_mesh_g13_task(struct hk_cmd_buffer *cmd,
+                          const uint32_t task_group_count[3],
+                          uint64_t indirect_grid,
+                          uint16_t draw_id,
+                          struct hk_mesh_emulation_record_trace *trace)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_api_shader *task = gfx->shaders[MESA_SHADER_TASK];
+   struct hk_api_shader *mesh = gfx->shaders[MESA_SHADER_MESH];
+   const uint32_t indirect_allocation_count[3] = {
+      HK_G13_MESH_MAX_GROUP_TOTAL, 1, 1,
+   };
+   const uint32_t *allocation_count = indirect_grid
+      ? indirect_allocation_count : task_group_count;
+   struct hk_mesh_emulation_direct_plan req;
+   if (!task || !mesh || gfx->render.view_mask ||
+       !hk_bound_mesh_is_software(gfx) ||
+       !hk_mesh_emulation_task_requirements(
+          dev->dev.chip, task, mesh, allocation_count, &req) ||
+       req.vertex_records_size_B > UINT32_MAX ||
+       req.primitive_records_size_B > UINT32_MAX ||
+       req.expanded_records_size_B > UINT32_MAX ||
+       req.index_buffer_size_B > UINT32_MAX ||
+       req.group_records_size_B > UINT32_MAX ||
+       req.task_records_size_B > UINT32_MAX ||
+       req.group_to_task_size_B > UINT32_MAX ||
+       req.draw_params_size_B > UINT32_MAX ||
+       req.patched_draw_params_size_B > UINT32_MAX) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return false;
+   }
+
+#define ALLOC_ZERO(name, size, alignment)                                     \
+   struct agx_ptr name = hk_pool_alloc(cmd, (size), (alignment));             \
+   if (!name.cpu) {                                                            \
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);   \
+      return false;                                                            \
+   }                                                                           \
+   memset(name.cpu, 0, (size))
+
+   ALLOC_ZERO(vertex_records, req.vertex_records_size_B, 16);
+   ALLOC_ZERO(primitive_records, req.primitive_records_size_B, 16);
+   ALLOC_ZERO(expanded_records, req.expanded_records_size_B, 16);
+   ALLOC_ZERO(index_buffer, req.index_buffer_size_B, 4);
+   ALLOC_ZERO(group_records, req.group_records_size_B, 32);
+   ALLOC_ZERO(task_records, req.task_records_size_B, 16);
+   ALLOC_ZERO(group_to_task, req.group_to_task_size_B, 8);
+   ALLOC_ZERO(draw_params, req.draw_params_size_B, 4);
+   ALLOC_ZERO(patched_draw_params, req.patched_draw_params_size_B, 4);
+#undef ALLOC_ZERO
+
+   const struct agx_ptr params =
+      hk_pool_alloc(cmd, sizeof(struct hk_mesh_emulation_params), 16);
+   if (!params.cpu) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return false;
+   }
+
+   struct hk_mesh_emulation_direct_plan plan;
+   if (!hk_mesh_emulation_task_plan_init(
+          dev->dev.chip, task, mesh, allocation_count,
+          vertex_records.gpu, req.vertex_records_size_B,
+          primitive_records.gpu, req.primitive_records_size_B,
+          expanded_records.gpu, req.expanded_records_size_B,
+          index_buffer.gpu, req.index_buffer_size_B,
+          group_records.gpu, req.group_records_size_B,
+          task_records.gpu, req.task_records_size_B,
+          group_to_task.gpu, req.group_to_task_size_B,
+          draw_params.gpu, req.draw_params_size_B,
+          patched_draw_params.gpu, req.patched_draw_params_size_B,
+          params.gpu, &plan)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return false;
+   }
+
+   if (indirect_grid)
+      memset(plan.params.task_grid, 0, sizeof(plan.params.task_grid));
+
+   memcpy(params.cpu, &plan.params, sizeof(plan.params));
+   assert(plan.params.reserved[0] == 0 && plan.params.reserved[1] == 0 &&
+          plan.params.reserved[2] == 0 && plan.params.reserved[3] == 0);
+   if (indirect_grid) {
+      plan.task_grid = agx_grid_indirect(
+         params.gpu + offsetof(struct hk_mesh_emulation_params, task_grid));
+      hk_xfer_check_draw(cmd, indirect_grid,
+                         indirect_grid + sizeof(VkDrawMeshTasksIndirectCommandEXT));
+   }
+   gfx->descriptors.root.draw.geometry_params = params.gpu;
+   gfx->descriptors.root_dirty = true;
+
+   assert(plan.task_producer->info.stage == MESA_SHADER_TASK);
+   assert(plan.task_producer->b.info.stage == MESA_SHADER_COMPUTE);
+   assert(plan.producer->info.stage == MESA_SHADER_MESH);
+   assert(plan.producer->b.info.stage == MESA_SHADER_COMPUTE);
+   assert(plan.barrier == (AGX_BARRIER_ALL | AGX_PREGFX));
+
+   for (uint32_t i = 0; i < plan.draw_count; ++i) {
+      struct agx_draw draw = plan.draw;
+      draw.b.ptr += (uint64_t)i * plan.draw_stride_B;
+      const struct hk_g13_mesh_draw mesh_draw = {
+         .plan = &plan,
+         .geometry_params = params.gpu,
+         .source_draw_params = draw_params.gpu,
+         .patched_draw_params = patched_draw_params.gpu,
+         .draw_count_addr =
+            params.gpu + offsetof(struct hk_mesh_emulation_params, mesh_grid),
+         .task_grid_source = indirect_grid,
+         .task_grid_dest =
+            params.gpu + offsetof(struct hk_mesh_emulation_params, task_grid),
+         .task_overflow_addr =
+            params.gpu + offsetof(struct hk_mesh_emulation_params,
+                                  task_overflow),
+         .trace = i == 0 ? trace : NULL,
+         .dispatch_producer = i == 0,
+      };
+      hk_draw_impl(cmd, draw_id, draw, NULL, &mesh_draw);
+      if (vk_command_buffer_has_error(&cmd->vk))
+         return false;
+   }
+
+   return true;
+}
+
 bool
 hk_cmd_draw_mesh_g13_direct(struct hk_cmd_buffer *cmd,
                             const uint32_t group_count[3], uint16_t draw_id,
@@ -13060,8 +13231,12 @@ hk_cmd_draw_mesh_g13_direct(struct hk_cmd_buffer *cmd,
    if (trace)
       memset(trace, 0, sizeof(*trace));
 
+   if (gfx->shaders[MESA_SHADER_TASK])
+      return hk_cmd_draw_mesh_g13_task(
+         cmd, group_count, 0, draw_id, trace);
+
    if (!hk_g13_software_mesh_supported(dev->dev.chip) ||
-       !mesh || gfx->shaders[MESA_SHADER_TASK] ||
+       !mesh ||
        !hk_bound_mesh_is_software(gfx)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return false;
@@ -13346,7 +13521,18 @@ hk_CmdDrawMeshTasksIndirectEXT(VkCommandBuffer commandBuffer, VkBuffer buffer,
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    if (hk_g13_software_mesh_supported(hk_cmd_buffer_device(cmd)->dev.chip)) {
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      VK_FROM_HANDLE(hk_buffer, src, buffer);
+      if (!cmd->state.gfx.shaders[MESA_SHADER_TASK]) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return;
+      }
+      for (unsigned i = 0; i < drawCount; ++i) {
+         const uint64_t grid = hk_buffer_address_rw(
+            src, offset + (uint64_t)i * stride);
+         hk_cmd_draw_mesh_g13_task(cmd, NULL, grid, i, NULL);
+         if (vk_command_buffer_has_error(&cmd->vk))
+            break;
+      }
       return;
    }
    VK_FROM_HANDLE(hk_buffer, src, buffer);

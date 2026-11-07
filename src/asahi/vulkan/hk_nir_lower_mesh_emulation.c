@@ -35,6 +35,25 @@ struct hk_mesh_emulation_admission {
    size_t pull_vs_size;
 };
 
+static_assert(sizeof(struct hk_mesh_emulation_params) ==
+                 HK_MESH_EMULATION_PARAMS_SIZE,
+              "software mesh parameter ABI size");
+
+static bool
+task_payload_access_supported(const nir_intrinsic_instr *intr, bool store)
+{
+   const unsigned bit_size = store ? intr->src[0].ssa->bit_size
+                                   : intr->def.bit_size;
+   const unsigned bytes = bit_size / 8;
+   if (!util_is_power_of_two_or_zero(bytes) || bytes == 0 || bytes > 8 ||
+       nir_intrinsic_align_mul(intr) < bytes)
+      return false;
+
+   return ((HK_MESH_EMULATION_TASK_RECORD_HEADER_SIZE +
+            nir_intrinsic_base(intr) + nir_intrinsic_align_offset(intr)) &
+           (bytes - 1)) == 0;
+}
+
 static bool
 record_output(struct hk_mesh_emulation_layout *layout,
               nir_intrinsic_instr *intr, bool primitive)
@@ -111,7 +130,8 @@ validate_shader(const nir_shader *shader,
        shader->info.mesh.max_primitives_out >
           HK_MESH_EMULATION_MAX_PRIMITIVES ||
        shader->info.workgroup_size_variable ||
-       shader->info.task_payload_size != 0 ||
+       shader->info.task_payload_size >
+          HK_MESH_EMULATION_MAX_TASK_PAYLOAD ||
        shader->info.outputs_read != 0 ||
        (shader->info.outputs_written &
         ~(VARYING_BIT_POS | VARYING_BIT_PRIMITIVE_INDICES |
@@ -184,9 +204,14 @@ validate_shader(const nir_shader *shader,
             case nir_intrinsic_load_per_primitive_output:
             case nir_intrinsic_launch_mesh_workgroups:
             case nir_intrinsic_launch_mesh_workgroups_with_payload_deref:
-            case nir_intrinsic_load_task_payload:
             case nir_intrinsic_store_task_payload:
                return false;
+            case nir_intrinsic_load_task_payload:
+               if (!shader->info.task_payload_size)
+                  return false;
+               if (!task_payload_access_supported(intr, false))
+                  return false;
+               break;
             default:
                break;
             }
@@ -203,6 +228,7 @@ validate_shader(const nir_shader *shader,
    layout->primitive_count = layout->vertex_count + sizeof(uint32_t);
    layout->shared_size = ALIGN_POT(layout->primitive_count +
                                    sizeof(uint32_t), 16);
+   layout->task_payload_size_B = shader->info.task_payload_size;
    if (layout->shared_size > 32 * 1024)
       return false;
 
@@ -257,6 +283,130 @@ static nir_def *linear_workgroup_id(nir_builder *b, nir_def *count);
 static nir_def *load_param(nir_builder *b, nir_def *params, unsigned offset);
 static nir_def *load_param_u32(nir_builder *b, nir_def *params,
                                unsigned offset, unsigned components);
+static nir_def *record_address(nir_builder *b, nir_def *base,
+                               nir_def *index, unsigned stride_B);
+
+static nir_def *
+task_record_element_address(nir_builder *b, nir_def *records,
+                            nir_def *task_index, unsigned stride_B)
+{
+   assert((stride_B & 3) == 0);
+   return nir_ulea_agx(
+      b, records, nir_imul_imm(b, task_index, stride_B / 4),
+      nir_imm_int(b, 2));
+}
+
+static nir_def *
+task_payload_element_address(nir_builder *b, nir_def *records,
+                             nir_def *task_index, unsigned stride_B,
+                             nir_def *dynamic_offset_B,
+                             unsigned constant_offset_B,
+                             unsigned bit_size)
+{
+   const unsigned bytes = bit_size / 8;
+   if (!util_is_power_of_two_or_zero(bytes) || bytes == 0 || bytes > 8)
+      return NULL;
+   const unsigned shift = util_logbase2(bytes);
+   nir_def *offset_B = nir_iadd(
+      b, nir_imul_imm(b, task_index, stride_B),
+      nir_iadd_imm(b, dynamic_offset_B, constant_offset_B));
+   return nir_ulea_agx(b, records, nir_ushr_imm(b, offset_B, shift),
+                       nir_imm_int(b, shift));
+}
+
+/* Recover the API mesh identity selected by its parent task.  The hardware
+ * launch is a compact one-dimensional indirect dispatch; this map restores
+ * the task index and the three-dimensional child WorkGroupID. */
+static bool
+lower_mesh_task_interface(nir_builder *b, nir_intrinsic_instr *intr,
+                          void *data)
+{
+   const struct hk_mesh_emulation_layout *layout = data;
+   if (!layout->task_payload_size_B)
+      return false;
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_workgroup_id:
+   case nir_intrinsic_load_num_workgroups:
+   case nir_intrinsic_load_task_payload:
+   case nir_intrinsic_barrier:
+      break;
+   default:
+      return false;
+   }
+
+   if (intr->intrinsic == nir_intrinsic_barrier &&
+       !(nir_intrinsic_memory_modes(intr) & nir_var_mem_task_payload))
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   if (intr->intrinsic == nir_intrinsic_barrier) {
+      nir_intrinsic_set_memory_modes(
+         intr, (nir_intrinsic_memory_modes(intr) &
+                ~nir_var_mem_task_payload) |
+                  nir_var_mem_global);
+      return true;
+   }
+
+   nir_def *params = nir_load_geometry_param_buffer_poly(b);
+   nir_def *mesh_grid = load_param_u32(
+      b, params, offsetof(struct hk_mesh_emulation_params, mesh_grid), 3);
+   nir_def *physical_group = linear_workgroup_id(b, mesh_grid);
+   nir_def *map_base = load_param(
+      b, params, offsetof(struct hk_mesh_emulation_params, group_to_task));
+   nir_def *map = record_address(
+      b, map_base, physical_group,
+      sizeof(struct hk_mesh_emulation_group_task));
+   /* The task dispatch wrote this mapping before the pre-gfx barrier.  It is
+    * mutable cross-dispatch memory, not a constant/speculatable table. */
+   nir_def *mapping = nir_load_global(
+      b, 2, 32, map, .align_mul = 8);
+   nir_def *task_index = nir_channel(b, mapping, 0);
+   nir_def *local_group = nir_channel(b, mapping, 1);
+   nir_def *task_records = load_param(
+      b, params, offsetof(struct hk_mesh_emulation_params, task_records));
+   const unsigned task_stride = ALIGN_POT(
+      HK_MESH_EMULATION_TASK_RECORD_HEADER_SIZE +
+         layout->task_payload_size_B,
+      16);
+   nir_def *task_record = task_record_element_address(
+      b, task_records, task_index, task_stride);
+   nir_def *child_grid = nir_load_global(
+      b, 3, 32, task_record, .align_mul = 16);
+
+   if (intr->intrinsic == nir_intrinsic_load_num_workgroups) {
+      nir_def_replace(&intr->def,
+                      nir_u2uN(b, child_grid, intr->def.bit_size));
+      return true;
+   }
+
+   if (intr->intrinsic == nir_intrinsic_load_workgroup_id) {
+      nir_def *x = nir_channel(b, child_grid, 0);
+      nir_def *y = nir_channel(b, child_grid, 1);
+      nir_def *xy = nir_imul(b, x, y);
+      nir_def *id = nir_vec3(
+         b, nir_umod(b, local_group, x),
+         nir_umod(b, nir_udiv(b, local_group, x), y),
+         nir_udiv(b, local_group, xy));
+      nir_def_replace(&intr->def, nir_u2uN(b, id, intr->def.bit_size));
+      return true;
+   }
+
+   assert(intr->intrinsic == nir_intrinsic_load_task_payload);
+   nir_def *address = task_payload_element_address(
+      b, task_records, task_index, task_stride, intr->src[0].ssa,
+      HK_MESH_EMULATION_TASK_RECORD_HEADER_SIZE + nir_intrinsic_base(intr),
+      intr->def.bit_size);
+   if (!address)
+      return false;
+   nir_def_replace(
+      &intr->def,
+      nir_load_global(b, intr->def.num_components, intr->def.bit_size,
+                      address, .align_mul = nir_intrinsic_align_mul(intr),
+                      .align_offset = nir_intrinsic_align_offset(intr),
+                      .access = nir_intrinsic_access(intr)));
+   return true;
+}
 
 /* Every command-owned record region is bounded to UINT32_MAX bytes before
  * submission.  Keep the shader address arithmetic in that same checked
@@ -291,6 +441,8 @@ lower_output(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       nir_def *records =
          load_param(b, params,
                     offsetof(struct hk_mesh_emulation_params, vertex_records));
+      nir_push_if(
+         b, nir_ult_imm(b, intr->src[1].ssa, layout->vertices_per_group));
       nir_def *index = nir_iadd(
          b, nir_imul_imm(b, group, layout->vertices_per_group),
          intr->src[1].ssa);
@@ -304,6 +456,7 @@ lower_output(nir_builder *b, nir_intrinsic_instr *intr, void *data)
                                      (nir_intrinsic_component(intr) + c)),
             .write_mask = 1, .align_mul = 4);
       }
+      nir_pop_if(b, NULL);
       break;
    }
    case nir_intrinsic_store_per_primitive_output: {
@@ -314,6 +467,8 @@ lower_output(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       nir_def *records = load_param(
          b, params,
          offsetof(struct hk_mesh_emulation_params, primitive_records));
+      nir_push_if(
+         b, nir_ult_imm(b, intr->src[1].ssa, layout->primitives_per_group));
       nir_def *index = nir_iadd(
          b, nir_imul_imm(b, group, layout->primitives_per_group),
          intr->src[1].ssa);
@@ -327,6 +482,7 @@ lower_output(nir_builder *b, nir_intrinsic_instr *intr, void *data)
                                      (nir_intrinsic_component(intr) + c)),
             .write_mask = 1, .align_mul = 4);
       }
+      nir_pop_if(b, NULL);
       break;
    }
    case nir_intrinsic_set_vertex_and_primitive_count:
@@ -443,6 +599,10 @@ export_scratch(nir_builder *b,
    nir_def *flags =
       load_param_u32(b, params,
                      offsetof(struct hk_mesh_emulation_params, flags), 1);
+   nir_def *task_overflow =
+      load_param_u32(b, params,
+                     offsetof(struct hk_mesh_emulation_params, task_overflow),
+                     1);
    nir_def *lane = nir_load_local_invocation_index(b);
    nir_def *group = linear_workgroup_id(b, mesh_grid);
    nir_def *vertex_base =
@@ -459,9 +619,13 @@ export_scratch(nir_builder *b,
       b, primitive_count, nir_imm_int(b, layout->primitives_per_group));
    vertex_count = nir_umin(
       b, vertex_count, nir_imm_int(b, layout->vertices_per_group));
+   const uint32_t expected_flags = HK_MESH_EMULATION_FLAG_DEINDEXED |
+      (layout->task_payload_size_B ? HK_MESH_EMULATION_FLAG_TASK : 0);
    nir_def *valid = nir_iand(
       b, nir_ieq_imm(b, abi_version, HK_MESH_EMULATION_ABI_VERSION),
-      nir_ieq_imm(b, flags, HK_MESH_EMULATION_FLAG_DEINDEXED));
+      nir_ieq_imm(b, flags, expected_flags));
+   if (layout->task_payload_size_B)
+      valid = nir_iand(b, valid, nir_ieq_imm(b, task_overflow, 0));
    /* AGX2 ULEA encodes shifts through four. Address 32-byte records as
     * 16-byte records at an even index, keeping this as one grounded ULEA. */
    nir_def *group_record = nir_ulea_agx(
@@ -483,10 +647,10 @@ export_scratch(nir_builder *b,
       nir_def *primitive_record = record_address(
          b, primitive_records, primitive_index,
          layout->primitive_stride_B);
-      nir_def *indices = nir_load_global_constant(
+      nir_def *indices = nir_load_global(
          b, 3, 32,
          nir_iadd_imm(b, primitive_record, layout->index_offset_B),
-         .align_mul = 4, .access = ACCESS_CAN_SPECULATE);
+         .align_mul = 4);
 
       for (unsigned c = 0; c < 3; ++c) {
          nir_def *source_vertex = nir_channel(b, indices, c);
@@ -503,10 +667,10 @@ export_scratch(nir_builder *b,
          nir_def *expanded_record = record_address(
             b, expanded_records, expanded, layout->expanded_stride_B);
 
-         nir_def *position = nir_load_global_constant(
+         nir_def *position = nir_load_global(
             b, 4, 32,
             nir_iadd_imm(b, source_record, layout->position_offset_B),
-            .align_mul = 4, .access = ACCESS_CAN_SPECULATE);
+            .align_mul = 4);
          position = nir_bcsel(b, source_valid, position,
                               nir_imm_zero(b, 4, 32));
          nir_store_global(
@@ -529,9 +693,9 @@ export_scratch(nir_builder *b,
             const unsigned offset = per_primitive
                ? layout->primitive_offset_B[slot]
                : layout->vertex_offset_B[slot];
-            nir_def *value = nir_load_global_constant(
+            nir_def *value = nir_load_global(
                b, components, 32, nir_iadd_imm(b, record, offset),
-               .align_mul = 4, .access = ACCESS_CAN_SPECULATE);
+               .align_mul = 4);
             value = nir_bcsel(b, source_valid, value,
                               nir_imm_zero(b, components, 32));
             nir_store_global(
@@ -579,6 +743,252 @@ export_scratch(nir_builder *b,
                .memory_modes = nir_var_mem_global);
 }
 
+static nir_def *
+task_record_address(nir_builder *b, nir_def *params, nir_def *task_index,
+                    unsigned stride_B)
+{
+   nir_def *records = load_param(
+      b, params, offsetof(struct hk_mesh_emulation_params, task_records));
+   return task_record_element_address(b, records, task_index, stride_B);
+}
+
+static nir_def *
+task_linear_id(nir_builder *b, nir_def *params)
+{
+   nir_def *grid = load_param_u32(
+      b, params, offsetof(struct hk_mesh_emulation_params, task_grid), 3);
+   return linear_workgroup_id(b, grid);
+}
+
+static bool
+lower_task_interface(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct hk_task_emulation_layout *layout = data;
+   const bool load = intr->intrinsic == nir_intrinsic_load_task_payload;
+   const bool store = intr->intrinsic == nir_intrinsic_store_task_payload;
+   const bool launch =
+      intr->intrinsic == nir_intrinsic_launch_mesh_workgroups;
+   const bool barrier = intr->intrinsic == nir_intrinsic_barrier &&
+      (nir_intrinsic_memory_modes(intr) & nir_var_mem_task_payload);
+   if (!load && !store && !launch && !barrier)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   if (barrier) {
+      nir_intrinsic_set_memory_modes(
+         intr, (nir_intrinsic_memory_modes(intr) &
+                ~nir_var_mem_task_payload) |
+                  nir_var_mem_global);
+      return true;
+   }
+
+   nir_def *params = nir_load_geometry_param_buffer_poly(b);
+   nir_def *task_index = task_linear_id(b, params);
+   nir_def *record = task_record_address(
+      b, params, task_index, layout->task_record_stride_B);
+
+   if (load || store) {
+      nir_def *records = load_param(
+         b, params, offsetof(struct hk_mesh_emulation_params, task_records));
+      const unsigned bit_size = store ? intr->src[0].ssa->bit_size
+                                      : intr->def.bit_size;
+      nir_def *address = task_payload_element_address(
+         b, records, task_index, layout->task_record_stride_B,
+         intr->src[store ? 1 : 0].ssa,
+         HK_MESH_EMULATION_TASK_RECORD_HEADER_SIZE +
+            nir_intrinsic_base(intr),
+         bit_size);
+      if (!address)
+         return false;
+      if (store) {
+         nir_store_global(
+            b, intr->src[0].ssa, address,
+            .write_mask = nir_intrinsic_write_mask(intr),
+            .align_mul = nir_intrinsic_align_mul(intr),
+            .align_offset = nir_intrinsic_align_offset(intr),
+            .access = nir_intrinsic_access(intr));
+         nir_instr_remove(&intr->instr);
+      } else {
+         nir_def_replace(
+            &intr->def,
+            nir_load_global(
+               b, intr->def.num_components, intr->def.bit_size, address,
+               .align_mul = nir_intrinsic_align_mul(intr),
+               .align_offset = nir_intrinsic_align_offset(intr),
+               .access = nir_intrinsic_access(intr)));
+      }
+      return true;
+   }
+
+   /* Allocate a compact child range.  The experimental cap is never used as
+    * partial success: if any task would exceed it, task_overflow is set and
+    * every mesh export in this draw writes zero counts.  mesh_grid.x remains
+    * bounded so the indirect launch and the O(cap) raster predicate are safe. */
+   nir_def *grid = intr->src[0].ssa;
+   /* EmitMeshTasksEXT is a workgroup-uniform operation represented in every
+    * invocation.  Rendezvous after payload stores, then let lane zero own the
+    * single allocation/header/map publication for this task workgroup. */
+   nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
+               .memory_scope = SCOPE_DEVICE,
+               .memory_semantics = NIR_MEMORY_ACQ_REL,
+               .memory_modes = nir_var_mem_global);
+   nir_push_if(b, nir_ieq_imm(b, nir_load_local_invocation_index(b), 0));
+   nir_def *limit = nir_imm_int(
+      b, HK_MESH_EMULATION_MAX_EMITTED_GROUPS + 1);
+   nir_def *x = nir_umin(b, nir_channel(b, grid, 0), limit);
+   nir_def *y = nir_umin(b, nir_channel(b, grid, 1), limit);
+   nir_def *z = nir_umin(b, nir_channel(b, grid, 2), limit);
+   nir_def *xy = nir_umin(b, nir_imul(b, x, y), limit);
+   nir_def *child = nir_umin(b, nir_imul(b, xy, z), limit);
+   nir_def *fits_cap = nir_ule_imm(
+      b, child, HK_MESH_EMULATION_MAX_EMITTED_GROUPS);
+   nir_def *emitted_addr = nir_ulea_agx(
+      b, params,
+      nir_imm_int(
+         b, offsetof(struct hk_mesh_emulation_params,
+                     task_emitted_groups) / 4),
+      nir_imm_int(b, 2));
+   nir_def *first = nir_global_atomic(
+      b, 32, emitted_addr, child, .atomic_op = nir_atomic_op_iadd);
+   nir_def *end = nir_iadd(b, first, child);
+   nir_def *within_cap = nir_iand(
+      b, fits_cap,
+      nir_ule_imm(b, end, HK_MESH_EMULATION_MAX_EMITTED_GROUPS));
+   nir_def *bounded_end = nir_umin(
+      b, end, nir_imm_int(b, HK_MESH_EMULATION_MAX_EMITTED_GROUPS));
+   nir_def *dispatch_addr = nir_ulea_agx(
+      b, params,
+      nir_imm_int(b, offsetof(struct hk_mesh_emulation_params, mesh_grid) / 4),
+      nir_imm_int(b, 2));
+   nir_global_atomic(b, 32, dispatch_addr, bounded_end,
+                     .atomic_op = nir_atomic_op_umax);
+
+   nir_push_if(b, nir_inot(b, within_cap));
+   nir_def *overflow_addr = nir_ulea_agx(
+      b, params,
+      nir_imm_int(b,
+                  offsetof(struct hk_mesh_emulation_params, task_overflow) / 4),
+      nir_imm_int(b, 2));
+   nir_global_atomic(b, 32, overflow_addr, nir_imm_int(b, 1),
+                     .atomic_op = nir_atomic_op_ior);
+   nir_pop_if(b, NULL);
+
+   nir_store_global(b, nir_vec4(b, nir_channel(b, grid, 0),
+                                nir_channel(b, grid, 1),
+                                nir_channel(b, grid, 2), first),
+                    record, .write_mask = 0xf, .align_mul = 16);
+
+   nir_def *map_base = load_param(
+      b, params, offsetof(struct hk_mesh_emulation_params, group_to_task));
+   nir_variable *cursor = nir_local_variable_create(
+      nir_shader_get_entrypoint(b->shader), glsl_uint_type(),
+      "task child mapping cursor");
+   nir_store_var(b, cursor, nir_imm_int(b, 0), 1);
+   nir_def *mapped_children = nir_bcsel(
+      b, within_cap, child, nir_imm_int(b, 0));
+   nir_push_loop(b);
+   nir_def *local = nir_load_var(b, cursor);
+   nir_push_if(b, nir_uge(b, local, mapped_children));
+   nir_jump(b, nir_jump_break);
+   nir_pop_if(b, NULL);
+   nir_push_if(b, within_cap);
+   nir_def *global = nir_iadd(b, first, local);
+   nir_def *mapping = record_address(
+      b, map_base, global, sizeof(struct hk_mesh_emulation_group_task));
+   nir_store_global(b, nir_vec2(b, task_index, local), mapping,
+                    .write_mask = 0x3, .align_mul = 8);
+   nir_pop_if(b, NULL);
+   nir_store_var(b, cursor, nir_iadd_imm(b, local, 1), 1);
+   nir_pop_loop(b, NULL);
+   nir_pop_if(b, NULL);
+
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
+bool
+hk_nir_lower_task_emulation(
+   nir_shader *shader, struct hk_task_emulation_layout *layout_out)
+{
+   if (shader->info.stage != MESA_SHADER_TASK ||
+       !shader->info.io_lowered || shader->info.workgroup_size_variable ||
+       shader->info.task_payload_size >
+          HK_MESH_EMULATION_MAX_TASK_PAYLOAD ||
+       shader->info.shared_size > 28 * 1024)
+      return false;
+
+   struct hk_task_emulation_layout layout = {
+      .payload_size_B = shader->info.task_payload_size,
+      .task_record_stride_B = ALIGN_POT(
+         HK_MESH_EMULATION_TASK_RECORD_HEADER_SIZE +
+            shader->info.task_payload_size,
+         16),
+   };
+   uint64_t threads = 1;
+   const uint32_t limits[3] = {
+      HK_MESH_EMULATION_MAX_WORKGROUP_X,
+      HK_MESH_EMULATION_MAX_WORKGROUP_Y,
+      HK_MESH_EMULATION_MAX_WORKGROUP_Z,
+   };
+   for (unsigned i = 0; i < 3; ++i) {
+      const uint32_t size = shader->info.workgroup_size[i];
+      if (!size || size > limits[i])
+         return false;
+      layout.local_size[i] = size;
+      threads *= size;
+   }
+   if (threads > HK_MESH_EMULATION_MAX_WORKGROUP_INVOCATIONS)
+      return false;
+
+   unsigned launches = 0;
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_jump &&
+                nir_instr_as_jump(instr)->type == nir_jump_return)
+               return false;
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            launches += intr->intrinsic ==
+                        nir_intrinsic_launch_mesh_workgroups;
+            if ((intr->intrinsic == nir_intrinsic_load_task_payload ||
+                 intr->intrinsic == nir_intrinsic_store_task_payload) &&
+                !shader->info.task_payload_size)
+               return false;
+            if (intr->intrinsic ==
+                   nir_intrinsic_launch_mesh_workgroups_with_payload_deref ||
+                intr->intrinsic == nir_intrinsic_task_payload_atomic ||
+                intr->intrinsic == nir_intrinsic_task_payload_atomic_swap)
+               return false;
+            if ((intr->intrinsic == nir_intrinsic_load_task_payload &&
+                 !task_payload_access_supported(intr, false)) ||
+                (intr->intrinsic == nir_intrinsic_store_task_payload &&
+                 !task_payload_access_supported(intr, true)))
+               return false;
+         }
+      }
+   }
+   /* SPIR-V requires EmitMeshTasksEXT in uniform control flow.  The validated
+    * Vulkan input therefore supplies that dynamic guarantee; additionally
+    * admit exactly one static launch so malformed NIR cannot reserve twice. */
+   if (launches != 1)
+      return false;
+
+   if (!nir_shader_intrinsics_pass(
+          shader, lower_task_interface, nir_metadata_none, &layout))
+      return false;
+
+   nir_remove_dead_variables(shader, nir_var_mem_task_payload, NULL);
+   shader->info.stage = MESA_SHADER_COMPUTE;
+   shader->info.task_payload_size = 0;
+   nir_shader_gather_info(shader, nir_shader_get_entrypoint(shader));
+   nir_progress(true, nir_shader_get_entrypoint(shader), nir_metadata_none);
+   if (layout_out)
+      *layout_out = layout;
+   return true;
+}
+
 bool
 hk_nir_lower_mesh_emulation(
    nir_shader *shader, struct hk_mesh_emulation_layout *layout_out)
@@ -599,6 +1009,11 @@ hk_nir_lower_mesh_emulation(
    nir_builder prologue = nir_builder_at(nir_before_impl(impl));
    initialize_scratch(&prologue, &layout, threads);
 
+   if (layout.task_payload_size_B) {
+      nir_shader_intrinsics_pass(
+         shader, lower_mesh_task_interface, nir_metadata_none, &layout);
+   }
+
    bool progress = nir_shader_intrinsics_pass(
       shader, lower_output, nir_metadata_none, &layout);
    if (!progress)
@@ -613,7 +1028,9 @@ hk_nir_lower_mesh_emulation(
     * nir_shader_gather_info() correctly rejects per-primitive output variables
     * on a compute shader.  Hand-built unit NIR did not carry these variables,
     * which is why the public-pipeline fixture is the regression test here. */
-   nir_remove_dead_variables(shader, nir_var_shader_out, NULL);
+   nir_remove_dead_variables(shader,
+                             nir_var_shader_out | nir_var_mem_task_payload,
+                             NULL);
 
    shader->info.stage = MESA_SHADER_COMPUTE;
    shader->info.shared_size = layout.shared_size;
