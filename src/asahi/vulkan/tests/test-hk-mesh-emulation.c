@@ -617,10 +617,23 @@ task_builder(uint32_t x, uint32_t y, uint32_t z)
    b.shader->info.workgroup_size[1] = 1;
    b.shader->info.workgroup_size[2] = 1;
    b.shader->info.task_payload_size = 256;
+   /* Mirror SPIR-V/vtn: NumWorkgroups first arrives as a system-value
+    * variable, not as the intrinsic consumed by the G13 pass.  This catches
+    * regressions where the driver hook runs before nir_lower_system_values. */
+   nir_variable *num_workgroups = nir_variable_create(
+      b.shader, nir_var_system_value, glsl_uvec_type(3),
+      "gl_NumWorkGroups");
+   num_workgroups->data.location = SYSTEM_VALUE_NUM_WORKGROUPS;
    nir_def *lane = nir_load_local_invocation_index(&b);
    nir_store_task_payload(&b, lane, nir_imul_imm(&b, lane, 4),
                           .align_mul = 4);
+   nir_push_if(&b, nir_ieq_imm(&b, lane, 0));
+   nir_store_task_payload(
+      &b, nir_channel(&b, nir_load_var(&b, num_workgroups), 0),
+      nir_imm_int(&b, 128), .align_mul = 4);
+   nir_pop_if(&b, NULL);
    nir_launch_mesh_workgroups(&b, nir_imm_ivec3(&b, x, y, z));
+   NIR_PASS(_, b.shader, nir_lower_system_values);
    return b;
 }
 
@@ -643,6 +656,8 @@ test_task_producer(void)
    unsigned atomics = 0;
    unsigned barriers = 0;
    unsigned lane_ids = 0;
+   unsigned stale_num_workgroups = 0;
+   unsigned geometry_params = 0;
    nir_foreach_function_impl(impl, b.shader) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
@@ -657,6 +672,11 @@ test_task_producer(void)
             barriers += intr->intrinsic == nir_intrinsic_barrier;
             lane_ids += intr->intrinsic ==
                         nir_intrinsic_load_local_invocation_index;
+            stale_num_workgroups +=
+               intr->intrinsic == nir_intrinsic_load_num_workgroups;
+            geometry_params +=
+               intr->intrinsic ==
+                  nir_intrinsic_load_geometry_param_buffer_poly;
          }
       }
    }
@@ -666,6 +686,8 @@ test_task_producer(void)
    assert(atomics == 3);
    assert(barriers >= 1);
    assert(lane_ids >= 1);
+   assert(stale_num_workgroups == 0);
+   assert(geometry_params >= 1);
    task_producer_binary_size = compile_producer(b.shader);
 
    /* A huge child grid takes the cap+1 failure sentinel.  Its generated map

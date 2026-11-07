@@ -560,8 +560,9 @@ static void
 hk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
                   UNUSED const struct vk_pipeline_robustness_state *rs)
 {
-   hk_preprocess_nir_internal(vk_pdev, nir);
    const enum agx_chip chip = ((struct hk_physical_device *)vk_pdev)->dev.chip;
+   hk_preprocess_nir_internal(vk_pdev, nir);
+
    const bool g17p_compute_derivatives =
       (chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip)) &&
       nir->info.stage == MESA_SHADER_COMPUTE &&
@@ -578,6 +579,7 @@ hk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
       csv_options.shuffle_local_ids_for_quad_derivatives = true;
    }
    NIR_PASS(_, nir, nir_lower_compute_system_values, &csv_options);
+
    if (g17p_compute_derivatives)
       NIR_PASS(_, nir, agx_nir_lower_compute_derivatives);
 }
@@ -2989,6 +2991,17 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
              struct vk_descriptor_set_layout *const *set_layouts,
              enum hk_feature_key features)
 {
+   /* vtn starts NumWorkgroups as a system-value variable; preprocessing has
+    * now materialized it, including uses introduced while lowering derived
+    * compute IDs.  Replace every G13 TaskEXT occurrence at the last common
+    * point before descriptor lowering would bind it to root.mesh_grid_addr.
+    * The software task producer instead owns params.task_grid through the
+    * command-private geometry-parameter buffer. */
+   if ((dev->dev.chip == AGX_CHIP_G13G ||
+        dev->dev.chip == AGX_CHIP_G13X) &&
+       nir->info.stage == MESA_SHADER_TASK)
+      hk_nir_lower_g13_task_num_workgroups(nir);
+
    if (HK_PERF(dev, NOROBUST)) {
       rs = &vk_robustness_disabled;
    }

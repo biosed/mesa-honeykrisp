@@ -12595,6 +12595,7 @@ hk_note_pre_raster_images(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 struct hk_g13_mesh_draw {
    const struct hk_mesh_emulation_direct_plan *plan;
    uint64_t geometry_params;
+   uint64_t api_mesh_grid_addr;
    uint64_t source_draw_params;
    uint64_t patched_draw_params;
    uint64_t draw_count_addr;
@@ -12819,6 +12820,10 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
                 mesh_draw->geometry_params ||
              gfx->root_cpu->draw.geometry_params !=
                 mesh_draw->geometry_params ||
+             gfx->descriptors.root.mesh_grid_addr !=
+                mesh_draw->api_mesh_grid_addr ||
+             gfx->root_cpu->mesh_grid_addr !=
+                mesh_draw->api_mesh_grid_addr ||
              hk_shader_root_for_usc(cmd, plan->producer) != gfx->root ||
              (plan->task &&
               hk_shader_root_for_usc(cmd, plan->task_producer) != gfx->root)) {
@@ -12832,6 +12837,8 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
             mesh_draw->trace->task_root = plan->task ? gfx->root : 0;
             mesh_draw->trace->geometry_params =
                gfx->root_cpu->draw.geometry_params;
+            mesh_draw->trace->mesh_grid_addr =
+               gfx->root_cpu->mesh_grid_addr;
             mesh_draw->trace->linked_raster =
                (uintptr_t)gfx->linked[MESA_SHADER_VERTEX];
          }
@@ -13191,6 +13198,14 @@ hk_cmd_draw_mesh_g13_task(struct hk_cmd_buffer *cmd,
       hk_xfer_check_draw(cmd, indirect_grid,
                          indirect_grid + sizeof(VkDrawMeshTasksIndirectCommandEXT));
    }
+   /* Task preprocessing replaces TaskEXT NumWorkgroups with params.task_grid.
+    * Publish the same address in the graphics root as a redundant descriptor
+    * contract and for any task code already lowered by a producer. The child
+    * mesh producer reconstructs its own child grid from task records and must
+    * never interpret this API task grid as MeshEXT NumWorkgroups. */
+   const uint64_t api_grid_addr =
+      params.gpu + offsetof(struct hk_mesh_emulation_params, task_grid);
+   gfx->descriptors.root.mesh_grid_addr = api_grid_addr;
    gfx->descriptors.root.draw.geometry_params = params.gpu;
    gfx->descriptors.root_dirty = true;
 
@@ -13206,6 +13221,7 @@ hk_cmd_draw_mesh_g13_task(struct hk_cmd_buffer *cmd,
       const struct hk_g13_mesh_draw mesh_draw = {
          .plan = &plan,
          .geometry_params = params.gpu,
+         .api_mesh_grid_addr = api_grid_addr,
          .source_draw_params = draw_params.gpu,
          .patched_draw_params = patched_draw_params.gpu,
          .draw_count_addr =
@@ -13321,6 +13337,12 @@ hk_cmd_draw_mesh_g13_direct(struct hk_cmd_buffer *cmd,
       return false;
    }
    memcpy(params.cpu, &plan.params, sizeof(plan.params));
+   /* A taskless MeshEXT NumWorkgroups load follows the generic descriptor
+    * route. Overwrite any pointer retained from a preceding task draw with
+    * this command's own API mesh grid before graphics-root publication. */
+   const uint64_t api_grid_addr =
+      params.gpu + offsetof(struct hk_mesh_emulation_params, mesh_grid);
+   gfx->descriptors.root.mesh_grid_addr = api_grid_addr;
    gfx->descriptors.root.draw.geometry_params = params.gpu;
    gfx->descriptors.root_dirty = true;
 
@@ -13337,6 +13359,7 @@ hk_cmd_draw_mesh_g13_direct(struct hk_cmd_buffer *cmd,
       const struct hk_g13_mesh_draw mesh_draw = {
          .plan = &plan,
          .geometry_params = params.gpu,
+         .api_mesh_grid_addr = api_grid_addr,
          .trace = i == 0 ? trace : NULL,
          .dispatch_producer = i == 0,
       };

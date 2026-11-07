@@ -13,6 +13,7 @@
 
 #include "hk_cmd_buffer.h"
 #include "hk_device.h"
+#include "hk_nir_lower_mesh_emulation.h"
 #include "hk_shader.h"
 #include "compiler/nir/nir_builder.h"
 #include "g17p_wsi_triangle_frag.h"
@@ -399,12 +400,13 @@ main(void)
    struct hk_mesh_emulation_record_trace trace = {
       .producer_root = UINT64_MAX,
       .geometry_params = UINT64_MAX,
+      .mesh_grid_addr = UINT64_MAX,
       .linked_raster = UINTPTR_MAX,
    };
    const uint32_t zero_grid[3] = {1, 0, 1};
    assert(record_mesh(command, mesh, zero_grid, 0, &trace));
    assert(trace.producer_root == 0 && trace.geometry_params == 0 &&
-          trace.linked_raster == 0);
+          trace.mesh_grid_addr == 0 && trace.linked_raster == 0);
    assert(!vk_command_buffer_has_error(&cmd->vk));
 
    const uint32_t grid[3] = {1, 1, 1};
@@ -423,6 +425,10 @@ main(void)
    assert(cmd->state.gfx.root_cpu != NULL);
    assert(trace.geometry_params ==
           cmd->state.gfx.root_cpu->draw.geometry_params);
+   assert(trace.mesh_grid_addr ==
+          trace.geometry_params +
+             offsetof(struct hk_mesh_emulation_params, mesh_grid));
+   assert(trace.mesh_grid_addr == cmd->state.gfx.root_cpu->mesh_grid_addr);
 
    vkCmdEndRendering(command);
    image_barrier(command, image,

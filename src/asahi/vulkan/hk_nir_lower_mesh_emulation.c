@@ -600,6 +600,32 @@ load_param_u32(nir_builder *b, nir_def *params, unsigned offset,
                                    .access = ACCESS_CAN_SPECULATE);
 }
 
+static bool
+lower_g13_task_num_workgroups(nir_builder *b, nir_intrinsic_instr *intr,
+                              UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_num_workgroups)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *params = nir_load_geometry_param_buffer_poly(b);
+   nir_def *task_grid = load_param_u32(
+      b, params, offsetof(struct hk_mesh_emulation_params, task_grid), 3);
+   nir_def_replace(&intr->def,
+                   nir_u2uN(b, task_grid, intr->def.bit_size));
+   return true;
+}
+
+bool
+hk_nir_lower_g13_task_num_workgroups(nir_shader *shader)
+{
+   if (shader->info.stage != MESA_SHADER_TASK)
+      return false;
+
+   return nir_shader_intrinsics_pass(
+      shader, lower_g13_task_num_workgroups, nir_metadata_none, NULL);
+}
+
 static void
 initialize_scratch(nir_builder *b,
                    const struct hk_mesh_emulation_layout *layout,
@@ -988,6 +1014,10 @@ hk_nir_lower_task_emulation(
        shader->info.shared_size > 28 * 1024)
       return false;
 
+   /* Public shaders take this pass before generic descriptor preprocessing.
+    * Keep direct-NIR/internal callers safe and the pass idempotent. */
+   hk_nir_lower_g13_task_num_workgroups(shader);
+
    struct hk_task_emulation_layout layout = {
       .payload_size_B = shader->info.task_payload_size,
       .task_record_stride_B = ALIGN_POT(
@@ -1021,6 +1051,12 @@ hk_nir_lower_task_emulation(
             if (instr->type != nir_instr_type_intrinsic)
                continue;
             nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            /* A surviving source load would be consumed as the unrelated
+             * graphics-root mesh grid.  Never compile a silently wrong task
+             * producer: the public preprocessing hook and the idempotent
+             * safety-net above must have replaced every occurrence. */
+            if (intr->intrinsic == nir_intrinsic_load_num_workgroups)
+               return false;
             launches += intr->intrinsic ==
                         nir_intrinsic_launch_mesh_workgroups;
             if ((intr->intrinsic == nir_intrinsic_load_task_payload ||

@@ -2518,6 +2518,7 @@ struct hk_mesh_emulation_record_trace {
    uint64_t producer_root;
    uint64_t task_root;
    uint64_t geometry_params;
+   uint64_t mesh_grid_addr;
    uintptr_t linked_raster;
    bool task_dispatched;
    bool task_overflow_sanitized;

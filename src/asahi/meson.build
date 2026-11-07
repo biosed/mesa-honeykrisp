@@ -93,6 +93,7 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
         'ASAHI_SHIM_CHIP=g13x',
         'ASAHI_G13_SOFTWARE_MESH=1',
         'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+        'HK_TEST_ICD=' + libvulkan_asahi.full_path(),
       ],
       depends : [_dev_icd, libvulkan_asahi],
       suite : ['asahi'],

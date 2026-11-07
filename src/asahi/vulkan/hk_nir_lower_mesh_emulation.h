@@ -120,6 +120,11 @@ struct hk_task_emulation_layout {
    unsigned local_size[3];
 };
 
+/* Preserve Vulkan TaskEXT NumWorkgroups before generic preprocessing lowers
+ * it to a graphics-root pointer.  The G13 task producer instead owns the
+ * command parameters' task_grid field. */
+bool hk_nir_lower_g13_task_num_workgroups(nir_shader *shader);
+
 /* Lower one API task workgroup to a bounded compute producer.  EmitMeshTasks
  * allocates a contiguous child range in GPU memory and publishes the
  * task/payload mapping consumed by hk_nir_lower_mesh_emulation(). */

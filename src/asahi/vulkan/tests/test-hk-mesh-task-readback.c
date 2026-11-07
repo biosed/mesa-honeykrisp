@@ -10,6 +10,8 @@
 #include <assert.h>
 
 #include <stdbool.h>
+#include <dlfcn.h>
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,6 +58,10 @@ struct buffer {
 
 static VkDevice device;
 static VkPhysicalDeviceMemoryProperties memory_properties;
+
+typedef bool (*hk_test_mesh_root_snapshot_fn)(
+   VkCommandBuffer command, bool task, uint64_t *geometry_params,
+   uint64_t *mesh_grid_addr);
 
 static uint32_t
 memory_type(uint32_t bits, VkMemoryPropertyFlags flags)
@@ -274,6 +280,9 @@ check_grid(const uint8_t *pixels, unsigned task_count, const char *name)
 {
    const unsigned columns = task_count * 2;
    unsigned wrong = 0;
+   unsigned clear_black = 0;
+   unsigned transparent_black = 0;
+   unsigned payload_magenta = 0;
    for (unsigned y = 0; y < HEIGHT; ++y) {
       const unsigned child_y = ((2 * y + 1) * 2) / (2 * HEIGHT);
       for (unsigned x = 0; x < WIDTH; ++x) {
@@ -281,6 +290,12 @@ check_grid(const uint8_t *pixels, unsigned task_count, const char *name)
          const unsigned task = column / 2;
          const unsigned child_x = column & 1;
          const uint8_t *pixel = pixels + (y * WIDTH + x) * 4;
+         clear_black += pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 0 &&
+                        pixel[3] == 255;
+         transparent_black += pixel[0] == 0 && pixel[1] == 0 &&
+                              pixel[2] == 0 && pixel[3] == 0;
+         payload_magenta += pixel[0] == 255 && pixel[1] == 0 &&
+                            pixel[2] == 255 && pixel[3] == 255;
          wrong += !near_byte(pixel[0], quarter_unorm(task + 1)) ||
                   !near_byte(pixel[1], quarter_unorm(child_x ? 3 : 1)) ||
                   !near_byte(pixel[2], quarter_unorm(child_y ? 3 : 1)) ||
@@ -288,8 +303,16 @@ check_grid(const uint8_t *pixels, unsigned task_count, const char *name)
       }
    }
 
-   printf("%s: task=%u child={2,2,1} exact_regions=%u wrong=%u %s\n",
-          name, task_count, WIDTH * HEIGHT - wrong, wrong,
+   const uint8_t *first = pixels;
+   const uint8_t *center = pixels +
+      ((HEIGHT / 2) * WIDTH + WIDTH / 2) * 4;
+   printf("%s: task=%u child={2,2,1} exact_regions=%u wrong=%u "
+          "clear_black=%u transparent_black=%u payload_magenta=%u "
+          "first=%u,%u,%u,%u center=%u,%u,%u,%u %s\n",
+          name, task_count, WIDTH * HEIGHT - wrong, wrong, clear_black,
+          transparent_black, payload_magenta,
+          first[0], first[1], first[2], first[3],
+          center[0], center[1], center[2], center[3],
           wrong == 0 ? "PASS" : "FAIL");
    return wrong == 0;
 }
@@ -376,6 +399,23 @@ main(int argc, char **argv)
       .ppEnabledExtensionNames = extensions,
    };
    CHECK(vkCreateDevice(physical, &device_info, NULL, &device));
+
+   const char *icd_path = getenv("HK_TEST_ICD");
+   void *icd = NULL;
+   hk_test_mesh_root_snapshot_fn root_snapshot = NULL;
+   if (icd_path) {
+      icd = dlopen(icd_path, RTLD_NOW | RTLD_LOCAL);
+      if (!icd) {
+         fprintf(stderr, "dlopen(%s): %s\n", icd_path, dlerror());
+         return 2;
+      }
+      root_snapshot = (hk_test_mesh_root_snapshot_fn)dlsym(
+         icd, "hk_test_mesh_root_snapshot");
+      if (!root_snapshot) {
+         fprintf(stderr, "mesh root test hook: %s\n", dlerror());
+         return 2;
+      }
+   }
 
    VkQueue queue;
    vkGetDeviceQueue(device, 0, 0, &queue);
@@ -507,16 +547,33 @@ main(int argc, char **argv)
 
    begin_target(command, &targets[0], pipeline);
    draw_mesh(command, 2, 1, 1);
+   uint64_t geometry_params[CASE_COUNT] = {0};
+   uint64_t mesh_grid_addr[CASE_COUNT] = {0};
+   if (root_snapshot)
+      assert(root_snapshot(command, true, &geometry_params[0],
+                           &mesh_grid_addr[0]));
    end_target(command, &targets[0], readback.buffer, 0);
 
    begin_target(command, &targets[1], pipeline);
    draw_mesh_indirect(command, indirect.buffer, 0, 1,
                       sizeof(VkDrawMeshTasksIndirectCommandEXT));
+   if (root_snapshot) {
+      assert(root_snapshot(command, true, &geometry_params[1],
+                           &mesh_grid_addr[1]));
+      assert(geometry_params[1] != geometry_params[0]);
+      assert(mesh_grid_addr[1] != mesh_grid_addr[0]);
+   }
    end_target(command, &targets[1], readback.buffer, IMAGE_SIZE);
 
    begin_target(command, &targets[2], pipeline);
    draw_mesh_indirect(command, indirect.buffer, sizeof(indirect_record), 1,
                       sizeof(VkDrawMeshTasksIndirectCommandEXT));
+   if (root_snapshot) {
+      assert(root_snapshot(command, true, &geometry_params[2],
+                           &mesh_grid_addr[2]));
+      assert(geometry_params[2] != geometry_params[1]);
+      assert(mesh_grid_addr[2] != mesh_grid_addr[1]);
+   }
    end_target(command, &targets[2], readback.buffer, 2 * IMAGE_SIZE);
    buffer_barrier(command, readback.buffer,
                   VK_PIPELINE_STAGE_2_COPY_BIT,
@@ -528,7 +585,12 @@ main(int argc, char **argv)
 
    bool pass = true;
    if (record_only) {
-      puts("G13 task mesh public readback: record-only PASS (no submit)");
+      if (root_snapshot)
+         printf("G13 task mesh public readback: record-only PASS (no submit); "
+                "root params=%#" PRIx64 " grid=%#" PRIx64 "\n",
+                geometry_params[2], mesh_grid_addr[2]);
+      else
+         puts("G13 task mesh public readback: record-only PASS (no submit)");
    } else {
       const VkSubmitInfo submit = {
          .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -561,6 +623,8 @@ main(int argc, char **argv)
    vkDestroyShaderModule(device, mesh_module, NULL);
    vkDestroyShaderModule(device, task_module, NULL);
    vkDestroyDevice(device, NULL);
+   if (icd)
+      dlclose(icd);
    vkDestroyInstance(instance, NULL);
    return pass ? 0 : 1;
 }

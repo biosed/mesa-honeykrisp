@@ -865,7 +865,7 @@ if with_tests
       g13_mesh_task_readback_mesh_spv,
       g13_mesh_task_readback_frag_spv,
       include_directories : [inc_include],
-      dependencies : [cc.find_library('vulkan')],
+      dependencies : [cc.find_library('vulkan'), dep_dl],
       c_args : [c_msvc_compat_args],
       gnu_symbol_visibility : 'hidden',
     )
