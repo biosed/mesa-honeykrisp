@@ -57,6 +57,51 @@ if with_tools.contains('drm-shim')
 endif
 
 if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
+  if prog_glslang.found()
+    # Public extension query/pipeline/direct-record proof is compile-only under
+    # the no-op shim: no command buffer is submitted to hardware here.
+    test(
+      'hk-g13-mesh-public-api',
+      prog_python,
+      args : [
+        files('../gallium/drivers/asahi/tests/run-shim.py'),
+        libasahi_noop_drm_shim,
+        hk_mesh_public_api_test,
+        'supported',
+      ],
+      env : [
+        'ASAHI_SHIM_CHIP=g13x',
+        'ASAHI_G13_SOFTWARE_MESH=1',
+        'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+      ],
+      depends : [_dev_icd, libvulkan_asahi],
+      suite : ['asahi'],
+    )
+
+    foreach negative : [
+      ['g13-disabled', 'g13x', '0'],
+      ['g14', 'g14g', '1'],
+    ]
+      test(
+        'hk-' + negative[0] + '-mesh-public-api-negative',
+        prog_python,
+        args : [
+          files('../gallium/drivers/asahi/tests/run-shim.py'),
+          libasahi_noop_drm_shim,
+          hk_mesh_public_api_test,
+          'unsupported',
+        ],
+        env : [
+          'ASAHI_SHIM_CHIP=' + negative[1],
+          'ASAHI_G13_SOFTWARE_MESH=' + negative[2],
+          'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+        ],
+        depends : [_dev_icd, libvulkan_asahi],
+        suite : ['asahi'],
+      )
+    endforeach
+  endif
+
   # Compile, upload and shader-binary-cache round-trip the G13 software-mesh
   # producer/pull-VS pair without advertising or executing mesh commands.
   test(

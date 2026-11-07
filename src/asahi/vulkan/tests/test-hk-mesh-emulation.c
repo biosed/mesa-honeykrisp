@@ -223,6 +223,14 @@ test_fail_closed(void)
    nir_validate_shader(returning.shader,
                        "returning mesh shader left unchanged");
    ralloc_free(returning.shader);
+
+   nir_builder oversized_z = triangle_builder(false);
+   oversized_z.shader->info.workgroup_size[0] = 1;
+   oversized_z.shader->info.workgroup_size[2] =
+      HK_MESH_EMULATION_MAX_WORKGROUP_Z + 1;
+   assert(!hk_nir_lower_mesh_emulation(oversized_z.shader, NULL));
+   assert(oversized_z.shader->info.stage == MESA_SHADER_MESH);
+   ralloc_free(oversized_z.shader);
 }
 
 static void

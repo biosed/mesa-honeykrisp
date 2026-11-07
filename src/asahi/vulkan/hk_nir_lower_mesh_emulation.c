@@ -95,13 +95,19 @@ validate_shader(const nir_shader *shader,
        layout->shared_size > 32 * 1024)
       return false;
 
+   const uint32_t max_workgroup_size[3] = {
+      HK_MESH_EMULATION_MAX_WORKGROUP_X,
+      HK_MESH_EMULATION_MAX_WORKGROUP_Y,
+      HK_MESH_EMULATION_MAX_WORKGROUP_Z,
+   };
    uint64_t threads = 1;
    for (unsigned i = 0; i < 3; ++i) {
-      if (shader->info.workgroup_size[i] == 0)
+      if (shader->info.workgroup_size[i] == 0 ||
+          shader->info.workgroup_size[i] > max_workgroup_size[i])
          return false;
       threads *= shader->info.workgroup_size[i];
    }
-   if (threads > 1024)
+   if (threads > HK_MESH_EMULATION_MAX_WORKGROUP_INVOCATIONS)
       return false;
 
    bool counts = false;
@@ -425,6 +431,14 @@ hk_nir_lower_mesh_emulation(
 
    nir_builder epilogue = nir_builder_at(nir_after_cf_list(&impl->body));
    export_scratch(&epilogue, &layout, threads);
+
+   /* SPIR-V frontends retain the mesh output variables after nir_lower_io().
+    * The emulation pass has replaced every output intrinsic above, so these
+    * variables are dead.  Drop them before changing the API stage to compute:
+    * nir_shader_gather_info() correctly rejects per-primitive output variables
+    * on a compute shader.  Hand-built unit NIR did not carry these variables,
+    * which is why the public-pipeline fixture is the regression test here. */
+   nir_remove_dead_variables(shader, nir_var_shader_out, NULL);
 
    shader->info.stage = MESA_SHADER_COMPUTE;
    shader->info.shared_size = layout.shared_size;

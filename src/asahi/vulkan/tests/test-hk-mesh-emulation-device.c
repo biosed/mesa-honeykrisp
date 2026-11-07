@@ -192,6 +192,23 @@ main(void)
    assert(direct.vertex_records_size_B == 96);
    assert(direct.index_buffer_size_B == 24);
    assert(direct.group_records_size_B == 64);
+   const uint32_t max_host_grid[3] = {
+      HK_G13_MESH_MAX_GROUP_TOTAL, 1, 1,
+   };
+   assert(hk_mesh_emulation_direct_requirements(
+      dev->dev.chip, compiled, max_host_grid, &direct));
+   assert(direct.draw_count == HK_G13_MESH_MAX_GROUP_TOTAL);
+   const uint32_t over_host_grid[3] = {
+      HK_G13_MESH_MAX_GROUP_TOTAL + 1, 1, 1,
+   };
+   assert(!hk_mesh_emulation_direct_requirements(
+      dev->dev.chip, compiled, over_host_grid, &direct));
+   const uint32_t product_over_host_grid[3] = {64, 64, 2};
+   assert(!hk_mesh_emulation_direct_requirements(
+      dev->dev.chip, compiled, product_over_host_grid, &direct));
+   const uint32_t thread_overflow_grid[3] = {UINT32_MAX, 1, 1};
+   assert(!hk_mesh_emulation_direct_requirements(
+      dev->dev.chip, compiled, thread_overflow_grid, &direct));
    assert(!hk_mesh_emulation_direct_plan_init(
       dev->dev.chip, compiled, direct_grid, UINT64_C(0x100000), 95,
       UINT64_C(0x200000), 4096, UINT64_C(0x300000), 4096,

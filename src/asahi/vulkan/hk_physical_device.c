@@ -24,6 +24,7 @@
 #include "hk_instance.h"
 #include "hk_m5_acceleration_structure.h"
 #include "hk_memory_budget_core.h"
+#include "hk_mesh_emulation_direct.h"
 #include "hk_agx3_vdm_decode.h"
 #include "hk_native_descriptor.h"
 #include "hk_nir_lower_mesh.h"
@@ -342,8 +343,8 @@ hk_get_device_features(
       .meshShader = supported_extensions->EXT_mesh_shader,
       .multiviewMeshShader = false,
       .primitiveFragmentShadingRateMeshShader = false,
-      .meshShaderQueries =
-         !agx_chip_g17_m5(dev->chip) && supported_extensions->EXT_mesh_shader,
+      .meshShaderQueries = dev->chip == AGX_CHIP_G17P &&
+                           supported_extensions->EXT_mesh_shader,
       .sampleRateShading = true,
       .dualSrcBlend = true,
       .logicOp = true,
@@ -1055,6 +1056,10 @@ hk_get_device_properties(const struct agx_device *dev,
    const VkSampleCountFlagBits storage_sample_counts =
       agx_chip_native_agx3(dev->chip) ? VK_SAMPLE_COUNT_1_BIT : sample_counts;
 
+   const bool mesh = features->meshShader;
+   const bool task = features->taskShader;
+   const bool g13_mesh = mesh && hk_g13_software_mesh_supported(dev->chip);
+
    uint64_t os_page_size = 16384;
    os_get_page_size(&os_page_size);
 
@@ -1218,34 +1223,57 @@ hk_get_device_properties(const struct agx_device *dev,
 
 
 
-      .maxTaskWorkGroupTotalCount = 1u << 22,
-      .maxTaskWorkGroupCount = {65535, 65535, 65535},
-      .maxTaskWorkGroupInvocations = 1024,
-      .maxTaskWorkGroupSize = {1024, 1024, 1024},
-      .maxTaskPayloadSize = 16384,
-      .maxTaskSharedMemorySize = 32768,
-      .maxTaskPayloadAndSharedMemorySize = 32768,
-      .maxMeshWorkGroupTotalCount = 1u << 22,
-      .maxMeshWorkGroupCount = {65535, 65535, 65535},
-      .maxMeshWorkGroupInvocations = 1024,
-      .maxMeshWorkGroupSize = {1024, 1024, 1024},
-      .maxMeshSharedMemorySize = 28672,
-      .maxMeshPayloadAndSharedMemorySize = 28672 + 16384,
-      .maxMeshOutputMemorySize = 32768,
-      .maxMeshPayloadAndOutputMemorySize = 32768 + 16384,
-      .maxMeshOutputComponents = 128,
-      .maxMeshOutputVertices = 256,
-      .maxMeshOutputPrimitives = 256,
-      .maxMeshOutputLayers = 8,
-      .maxMeshMultiviewViewCount = 1,
-      .meshOutputPerVertexGranularity = 32,
-      .meshOutputPerPrimitiveGranularity = 32,
-      .maxPreferredTaskWorkGroupInvocations = 32,
-      .maxPreferredMeshWorkGroupInvocations = 32,
-      .prefersLocalInvocationVertexOutput = true,
-      .prefersLocalInvocationPrimitiveOutput = true,
-      .prefersCompactVertexOutput = true,
-      .prefersCompactPrimitiveOutput = true,
+      .maxTaskWorkGroupTotalCount = task ? 1u << 22 : 0,
+      .maxTaskWorkGroupCount = {
+         task ? 65535 : 0, task ? 65535 : 0, task ? 65535 : 0,
+      },
+      .maxTaskWorkGroupInvocations = task ? 1024 : 0,
+      .maxTaskWorkGroupSize = {
+         task ? 1024 : 0, task ? 1024 : 0, task ? 1024 : 0,
+      },
+      .maxTaskPayloadSize = task ? 16384 : 0,
+      .maxTaskSharedMemorySize = task ? 32768 : 0,
+      .maxTaskPayloadAndSharedMemorySize = task ? 32768 : 0,
+      .maxMeshWorkGroupTotalCount =
+         g13_mesh ? HK_G13_MESH_MAX_GROUP_TOTAL : (mesh ? 1u << 22 : 0),
+      .maxMeshWorkGroupCount = {
+         g13_mesh ? HK_G13_MESH_MAX_GROUP_COUNT : (mesh ? 65535 : 0),
+         g13_mesh ? HK_G13_MESH_MAX_GROUP_COUNT : (mesh ? 65535 : 0),
+         g13_mesh ? HK_G13_MESH_MAX_GROUP_COUNT : (mesh ? 65535 : 0),
+      },
+      .maxMeshWorkGroupInvocations =
+         g13_mesh ? HK_G13_MESH_MAX_INVOCATIONS : (mesh ? 1024 : 0),
+      .maxMeshWorkGroupSize = {
+         g13_mesh ? HK_G13_MESH_MAX_WORKGROUP_X : (mesh ? 1024 : 0),
+         g13_mesh ? HK_G13_MESH_MAX_WORKGROUP_Y : (mesh ? 1024 : 0),
+         g13_mesh ? HK_G13_MESH_MAX_WORKGROUP_Z : (mesh ? 1024 : 0),
+      },
+      .maxMeshSharedMemorySize =
+         g13_mesh ? HK_G13_MESH_MAX_SHARED_SIZE : (mesh ? 28672 : 0),
+      .maxMeshPayloadAndSharedMemorySize =
+         g13_mesh ? HK_G13_MESH_MAX_SHARED_SIZE
+                  : (mesh ? 28672 + 16384 : 0),
+      .maxMeshOutputMemorySize =
+         g13_mesh ? HK_G13_MESH_MAX_OUTPUT_SIZE : (mesh ? 32768 : 0),
+      .maxMeshPayloadAndOutputMemorySize =
+         g13_mesh ? HK_G13_MESH_MAX_OUTPUT_SIZE
+                  : (mesh ? 32768 + 16384 : 0),
+      .maxMeshOutputComponents =
+         g13_mesh ? HK_G13_MESH_MAX_OUTPUT_COMPONENTS : (mesh ? 128 : 0),
+      .maxMeshOutputVertices =
+         g13_mesh ? HK_G13_MESH_MAX_VERTICES : (mesh ? 256 : 0),
+      .maxMeshOutputPrimitives =
+         g13_mesh ? HK_G13_MESH_MAX_PRIMITIVES : (mesh ? 256 : 0),
+      .maxMeshOutputLayers = g13_mesh ? 1 : (mesh ? 8 : 0),
+      .maxMeshMultiviewViewCount = mesh ? 1 : 0,
+      .meshOutputPerVertexGranularity = g13_mesh ? 16 : (mesh ? 32 : 0),
+      .meshOutputPerPrimitiveGranularity = g13_mesh ? 4 : (mesh ? 32 : 0),
+      .maxPreferredTaskWorkGroupInvocations = task ? 32 : 0,
+      .maxPreferredMeshWorkGroupInvocations = mesh ? 32 : 0,
+      .prefersLocalInvocationVertexOutput = mesh,
+      .prefersLocalInvocationPrimitiveOutput = mesh,
+      .prefersCompactVertexOutput = mesh,
+      .prefersCompactPrimitiveOutput = mesh,
 
       /* Set to match maxVertexOutputComponents, hardware limit is higher. */
       .maxFragmentInputComponents = max_vgt_output_components,
@@ -2049,9 +2077,16 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    supported_extensions.EXT_primitives_generated_query =
       agx_chip_g17_m5(pdev->dev.chip);
 
-   supported_extensions.EXT_mesh_shader = pdev->dev.chip == AGX_CHIP_G17S &&
-      hk_mesh_mode() == HK_MESH_MODE_NATIVE_PROBE &&
-      (pdev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2);
+   /* Experimental and deliberately non-conformant: the G13 software path is
+    * public only for API/pipeline bring-up. Its queried limits describe the
+    * bounded implementation and remain below VK_EXT_mesh_shader Required_Limits
+    * until direct-global arbitrary varyings and GPU-side draw consumption land. */
+   supported_extensions.EXT_mesh_shader =
+      (hk_g13_software_mesh_supported(pdev->dev.chip) &&
+       debug_get_bool_option("ASAHI_G13_SOFTWARE_MESH", false)) ||
+      (pdev->dev.chip == AGX_CHIP_G17S &&
+       hk_mesh_mode() == HK_MESH_MODE_NATIVE_PROBE &&
+       (pdev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2));
 
    /* Gen5 adds native component-wise minimum/maximum sampler reduction. */
    supported_extensions.EXT_sampler_filter_minmax =

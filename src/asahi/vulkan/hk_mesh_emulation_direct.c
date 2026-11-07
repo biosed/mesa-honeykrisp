@@ -17,7 +17,7 @@ hk_mesh_emulation_direct_requirements(
    struct hk_mesh_emulation_direct_plan *plan)
 {
    if (!api || !group_count || !plan ||
-       (chip != AGX_CHIP_G13G && chip != AGX_CHIP_G13X) ||
+       !hk_g13_software_mesh_supported(chip) ||
        api->vk.stage != MESA_SHADER_MESH)
       return false;
 
@@ -49,6 +49,12 @@ hk_mesh_emulation_direct_requirements(
       threads[i] = group_count[i] * local;
       groups *= group_count[i];
    }
+
+   /* Command recording currently emits one ordinary indexed consumer per
+    * group. Keep that host loop bounded until it is replaced by a GPU-side
+    * indirect/count consumer. */
+   if (groups > HK_G13_MESH_MAX_GROUP_TOTAL)
+      return false;
 
    const uint64_t vertices =
       groups * producer->info.mesh.max_vertices;

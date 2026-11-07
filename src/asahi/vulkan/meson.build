@@ -792,6 +792,31 @@ if with_tests and ld_args_gc_sections.length() > 0
 endif
 
 if with_tests
+  hk_mesh_public_api_test = []
+  if prog_glslang.found()
+    g13_mesh_public_triangle_spv = custom_target(
+      'g13_mesh_public_triangle.spv.h',
+      input : 'tests/g13_mesh_public_triangle.mesh',
+      output : 'g13_mesh_public_triangle.spv.h',
+      command : [
+        prog_glslang, '-V', '--target-env', 'vulkan1.3', '-S', 'mesh',
+        '-x', '-o', '@OUTPUT@', '@INPUT@', glslang_quiet, glslang_depfile,
+      ],
+      depfile : 'g13_mesh_public_triangle.spv.h.d',
+    )
+    hk_mesh_public_api_test = executable(
+      'hk_mesh_public_api_test',
+      files('tests/test-hk-mesh-public-api.c'),
+      g13_mesh_public_triangle_spv,
+      include_directories : [
+        include_directories('tests'), inc_include,
+      ],
+      dependencies : [cc.find_library('vulkan')],
+      c_args : [c_msvc_compat_args],
+      gnu_symbol_visibility : 'hidden',
+    )
+  endif
+
   hk_mesh_emulation_device_test = executable(
     'hk_mesh_emulation_device_test',
     files('tests/test-hk-mesh-emulation-device.c',

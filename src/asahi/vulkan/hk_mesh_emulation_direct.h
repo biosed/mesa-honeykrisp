@@ -15,6 +15,28 @@
 struct hk_api_shader;
 struct hk_shader;
 
+/* Experimental G13 software-mesh profile.  It is intentionally narrower
+ * than VK_EXT_mesh_shader Required_Limits and is exposed only by the explicit
+ * bring-up option until every wider dimension has submitted-pixel proof. */
+#define HK_G13_MESH_MAX_GROUP_TOTAL        4096u
+#define HK_G13_MESH_MAX_GROUP_COUNT        65535u
+#define HK_G13_MESH_MAX_INVOCATIONS \
+   HK_MESH_EMULATION_MAX_WORKGROUP_INVOCATIONS
+#define HK_G13_MESH_MAX_WORKGROUP_X HK_MESH_EMULATION_MAX_WORKGROUP_X
+#define HK_G13_MESH_MAX_WORKGROUP_Y HK_MESH_EMULATION_MAX_WORKGROUP_Y
+#define HK_G13_MESH_MAX_WORKGROUP_Z HK_MESH_EMULATION_MAX_WORKGROUP_Z
+#define HK_G13_MESH_MAX_VERTICES           256u
+#define HK_G13_MESH_MAX_PRIMITIVES         256u
+#define HK_G13_MESH_MAX_OUTPUT_COMPONENTS  4u
+#define HK_G13_MESH_MAX_SHARED_SIZE        (24u * 1024u)
+#define HK_G13_MESH_MAX_OUTPUT_SIZE         8192u
+
+static inline bool
+hk_g13_software_mesh_supported(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G13G || chip == AGX_CHIP_G13X;
+}
+
 /*
  * Non-public command contract for the first direct G13 software-mesh draw.
  * It deliberately stops before command recording: a future caller must put

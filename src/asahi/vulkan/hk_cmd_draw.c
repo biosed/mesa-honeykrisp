@@ -12596,6 +12596,7 @@ struct hk_g13_mesh_draw {
    const struct hk_mesh_emulation_direct_plan *plan;
    uint64_t geometry_params;
    struct hk_mesh_emulation_record_trace *trace;
+   bool dispatch_producer;
 };
 
 static __attribute__((hot)) void
@@ -12826,11 +12827,13 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
                (uintptr_t)gfx->linked[MESA_SHADER_VERTEX];
          }
 
-         hk_dispatch_with_local_size(
-            cmd, ccs, (struct hk_shader *)plan->producer,
-            plan->producer_grid, plan->producer_local_size);
-         if (vk_command_buffer_has_error(&cmd->vk))
-            return;
+         if (mesh_draw->dispatch_producer) {
+            hk_dispatch_with_local_size(
+               cmd, ccs, (struct hk_shader *)plan->producer,
+               plan->producer_grid, plan->producer_local_size);
+            if (vk_command_buffer_has_error(&cmd->vk))
+               return;
+         }
       }
 
       if (ia_stats) {
@@ -13057,8 +13060,7 @@ hk_cmd_draw_mesh_g13_direct(struct hk_cmd_buffer *cmd,
    if (trace)
       memset(trace, 0, sizeof(*trace));
 
-   if ((dev->dev.chip != AGX_CHIP_G13G &&
-        dev->dev.chip != AGX_CHIP_G13X) ||
+   if (!hk_g13_software_mesh_supported(dev->dev.chip) ||
        !mesh || gfx->shaders[MESA_SHADER_TASK] ||
        !hk_bound_mesh_is_software(gfx)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
@@ -13078,7 +13080,8 @@ hk_cmd_draw_mesh_g13_direct(struct hk_cmd_buffer *cmd,
        requirements.index_buffer_size_B > UINT32_MAX ||
        requirements.group_records_size_B > UINT32_MAX ||
        requirements.draw_params_size_B > UINT32_MAX ||
-       requirements.draw_count != 1 || gfx->render.view_mask) {
+       requirements.draw_count > HK_G13_MESH_MAX_GROUP_TOTAL ||
+       gfx->render.view_mask) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return false;
    }
@@ -13128,19 +13131,24 @@ hk_cmd_draw_mesh_g13_direct(struct hk_cmd_buffer *cmd,
 
    assert(plan.producer->info.stage == MESA_SHADER_MESH);
    assert(plan.producer->b.info.stage == MESA_SHADER_COMPUTE);
-   /* hk_draw_impl() publishes graphics once, dispatches MAIN on that render's
-    * pre-gfx stream, then consumes the producer's GPU-written indirect draw.
-    * Keep the first submitted proof single-group; the allocation/ABI helpers
-    * already model one independent record per group for the next slice. */
+   /* hk_draw_impl() publishes graphics once. The first raster record dispatches
+    * MAIN over the complete API grid on that render's pre-gfx stream; every
+    * later record consumes another GPU-written group draw without re-running
+    * the producer. The pre-gfx barrier orders the whole render stream. */
    assert(plan.barrier == (AGX_BARRIER_ALL | AGX_PREGFX));
-   const struct hk_g13_mesh_draw mesh_draw = {
-      .plan = &plan,
-      .geometry_params = params.gpu,
-      .trace = trace,
-   };
-   hk_draw_impl(cmd, draw_id, plan.draw, NULL, &mesh_draw);
-   if (vk_command_buffer_has_error(&cmd->vk))
-      return false;
+   for (uint32_t i = 0; i < plan.draw_count; ++i) {
+      struct agx_draw draw = plan.draw;
+      draw.b.ptr += (uint64_t)i * plan.draw_stride_B;
+      const struct hk_g13_mesh_draw mesh_draw = {
+         .plan = &plan,
+         .geometry_params = params.gpu,
+         .trace = i == 0 ? trace : NULL,
+         .dispatch_producer = i == 0,
+      };
+      hk_draw_impl(cmd, draw_id, draw, NULL, &mesh_draw);
+      if (vk_command_buffer_has_error(&cmd->vk))
+         return false;
+   }
 
    return true;
 }
@@ -13303,6 +13311,16 @@ hk_CmdDrawMeshTasksEXT(VkCommandBuffer commandBuffer, uint32_t groupCountX,
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    if (!groupCountX || !groupCountY || !groupCountZ)
       return;
+
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (hk_g13_software_mesh_supported(dev->dev.chip)) {
+      const uint32_t group_count[3] = {
+         groupCountX, groupCountY, groupCountZ,
+      };
+      hk_cmd_draw_mesh_g13_direct(cmd, group_count, 0, NULL);
+      return;
+   }
+
    const uint32_t grid[4] = {groupCountX, groupCountY, groupCountZ, 0};
    hk_draw_mesh_native(cmd, hk_pool_upload(cmd, grid, sizeof(grid), 16), grid,
                        0, 0);
@@ -13314,6 +13332,10 @@ hk_CmdDrawMeshTasksIndirectEXT(VkCommandBuffer commandBuffer, VkBuffer buffer,
                               uint32_t stride)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   if (hk_g13_software_mesh_supported(hk_cmd_buffer_device(cmd)->dev.chip)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
    VK_FROM_HANDLE(hk_buffer, src, buffer);
    for (unsigned i = 0; i < drawCount; ++i)
       hk_draw_mesh_native(cmd, hk_buffer_address_rw(src, offset + (uint64_t)i * stride),
@@ -13327,6 +13349,10 @@ hk_CmdDrawMeshTasksIndirectCountEXT(VkCommandBuffer commandBuffer, VkBuffer buff
                                    uint32_t maxDrawCount, uint32_t stride)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   if (hk_g13_software_mesh_supported(hk_cmd_buffer_device(cmd)->dev.chip)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
    VK_FROM_HANDLE(hk_buffer, src, buffer);
    VK_FROM_HANDLE(hk_buffer, count, countBuffer);
    const uint64_t count_address = hk_buffer_address_rw(count, countBufferOffset);
