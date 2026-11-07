@@ -1375,8 +1375,10 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                AGX3_CDM_STREAM_TERMINATE_SIZE,
          },
       };
-      if (queue->sync.exact_prior)
-         header.size = sizeof(cmd);
+      header.size = hk_drm_compute_command_size(
+         dev->dev.params.features &
+            DRM_ASAHI_FEATURE_COMPUTE_TIMESTAMP_COPIES,
+         queue->sync.exact_prior);
       util_dynarray_append(&payload, header);
       util_dynarray_append_array(&payload, uint8_t, &cmd, header.size);
       nr_cdm++;
@@ -1454,6 +1456,16 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                 header.cdm_barrier <= nr_cdm);
 
          if (cs->type == HK_CS_CDM) {
+            /* The append-only timestamp-copy tail is not part of the legacy
+             * G13/G14 kernel ABI.  An old kernel consumes only its 64-byte
+             * compute structure; advertising the larger userspace structure
+             * would make its second parser treat the zero tail as another
+             * command. */
+            header.size = hk_drm_compute_command_size(
+               dev->dev.params.features &
+                  DRM_ASAHI_FEATURE_COMPUTE_TIMESTAMP_COPIES,
+               false);
+
             perf_debug(
                cmdbuf,
                "%u: Submitting CDM with %u API calls, %u dispatches, %u flushes, %u merged",

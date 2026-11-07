@@ -37,7 +37,15 @@ struct hk_mesh_emulation_direct_plan {
    uint64_t vertex_records_size_B;
    uint64_t index_buffer_size_B;
    uint64_t group_records_size_B;
+   uint64_t draw_params_size_B;
+   uint32_t draw_count;
+   uint32_t draw_stride_B;
 };
+
+bool hk_mesh_emulation_direct_requirements(
+   enum agx_chip chip, const struct hk_api_shader *api,
+   const uint32_t group_count[3],
+   struct hk_mesh_emulation_direct_plan *plan);
 
 bool hk_mesh_emulation_direct_plan_init(
    enum agx_chip chip, const struct hk_api_shader *api,
@@ -45,4 +53,5 @@ bool hk_mesh_emulation_direct_plan_init(
    uint64_t vertex_records_size_B, uint64_t index_buffer,
    uint64_t index_buffer_size_B, uint64_t group_records,
    uint64_t group_records_size_B, uint64_t draw_params,
+   uint64_t draw_params_size_B,
    struct hk_mesh_emulation_direct_plan *plan);

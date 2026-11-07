@@ -119,6 +119,17 @@ hk_drm_render_command_size(bool native, bool exact_prior)
                  : offsetof(struct drm_asahi_cmd_render, bg_eot_rsrc_spec_hi);
 }
 
+uint16_t
+hk_drm_compute_command_size(bool timestamp_copies, bool exact_prior)
+{
+   if (exact_prior)
+      return sizeof(struct drm_asahi_cmd_compute_with_prior);
+
+   return timestamp_copies
+             ? sizeof(struct drm_asahi_cmd_compute)
+             : offsetof(struct drm_asahi_cmd_compute, ts_end_copies);
+}
+
 void
 hk_drm_attachment_set_init(struct hk_drm_attachment_set *set)
 {

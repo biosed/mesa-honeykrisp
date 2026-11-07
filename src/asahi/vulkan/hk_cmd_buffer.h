@@ -1961,9 +1961,13 @@ hk_bound_hw_vs(struct hk_graphics_state *gfx)
    struct hk_api_shader *gs = gfx->shaders[MESA_SHADER_GEOMETRY];
    struct hk_api_shader *mesh = gfx->shaders[MESA_SHADER_MESH];
 
-   /* A mesh pipeline has no vertex, tessellation or geometry stage; its
-    * native mesh variant is the hardware vertex program. */
-   if (mesh)
+   /* G13 lowers mesh to a compute producer plus an ordinary pull vertex
+    * shader. Native mesh generations keep MAIN as their VDM program. */
+   if (mesh &&
+       mesh->variants[HK_MESH_VARIANT_MAIN].b.info.stage ==
+          MESA_SHADER_COMPUTE)
+      return &mesh->variants[HK_MESH_VARIANT_RAST];
+   else if (mesh)
       return &mesh->variants[HK_MESH_VARIANT_MAIN];
    else if (gs)
       return &gs->variants[HK_GS_VARIANT_RAST];
@@ -1971,6 +1975,17 @@ hk_bound_hw_vs(struct hk_graphics_state *gfx)
       return &tes->variants[HK_VS_VARIANT_HW];
    else
       return &vs->variants[HK_VS_VARIANT_HW];
+}
+
+static inline bool
+hk_bound_mesh_is_software(const struct hk_graphics_state *gfx)
+{
+   const struct hk_api_shader *mesh = gfx->shaders[MESA_SHADER_MESH];
+   return mesh &&
+          mesh->variants[HK_MESH_VARIANT_MAIN].b.info.stage ==
+             MESA_SHADER_COMPUTE &&
+          mesh->variants[HK_MESH_VARIANT_RAST].b.info.stage ==
+             MESA_SHADER_VERTEX;
 }
 
 static inline struct hk_shader *
@@ -2499,6 +2514,19 @@ void hk_cmd_bind_graphics_shader(struct hk_cmd_buffer *cmd,
                                  const mesa_shader_stage stage,
                                  struct hk_api_shader *shader);
 
+struct hk_mesh_emulation_record_trace {
+   uint64_t producer_root;
+   uint64_t geometry_params;
+   uintptr_t linked_raster;
+};
+
+/* Internal-only G13 software-mesh recorder. Feature advertisement and public
+ * mesh entrypoints stay disabled until its submitted synthetic draw passes. */
+bool hk_cmd_draw_mesh_g13_direct(struct hk_cmd_buffer *cmd,
+                                 const uint32_t group_count[3],
+                                 uint16_t draw_id,
+                                 struct hk_mesh_emulation_record_trace *trace);
+
 void hk_cmd_bind_compute_shader(struct hk_cmd_buffer *cmd,
                                 struct hk_api_shader *shader);
 
@@ -2594,6 +2622,12 @@ uint64_t hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd,
                                       bool task);
 uint64_t hk_upload_usc_words(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                              struct hk_linked_shader *linked);
+
+/* Exact descriptor root selected by the AGX2 USC upload path. Internal
+ * graphics stages retain the application's graphics root even when their
+ * backend stage is compute. */
+uint64_t hk_shader_root_for_usc(struct hk_cmd_buffer *cmd,
+                                const struct hk_shader *s);
 
 void hk_usc_upload_spilled_rt_descs(struct agx_usc_builder *b,
                                     struct hk_cmd_buffer *cmd);

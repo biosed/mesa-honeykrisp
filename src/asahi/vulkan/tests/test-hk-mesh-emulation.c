@@ -187,7 +187,7 @@ test_triangle(void)
    assert(zero_global_stores == 2);
    assert(barriers >= 3);
    assert(mesh_intrinsics == 0);
-   assert(leas == 5);
+   assert(leas == 6);
 
    NIR_PASS(_, b.shader, nir_shader_intrinsics_pass, lower_driver_sysvals,
             nir_metadata_control_flow, NULL);

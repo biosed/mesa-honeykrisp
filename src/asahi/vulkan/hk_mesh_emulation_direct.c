@@ -11,12 +11,9 @@
 #include "hk_shader.h"
 
 bool
-hk_mesh_emulation_direct_plan_init(
+hk_mesh_emulation_direct_requirements(
    enum agx_chip chip, const struct hk_api_shader *api,
-   const uint32_t group_count[3], uint64_t vertex_records,
-   uint64_t vertex_records_size_B, uint64_t index_buffer,
-   uint64_t index_buffer_size_B, uint64_t group_records,
-   uint64_t group_records_size_B, uint64_t draw_params,
+   const uint32_t group_count[3],
    struct hk_mesh_emulation_direct_plan *plan)
 {
    if (!api || !group_count || !plan ||
@@ -32,7 +29,8 @@ hk_mesh_emulation_direct_plan_init(
       &api->variants[HK_MESH_VARIANT_PREDICATED_OBJECT];
    if (!producer->compiled || !producer->only_linked ||
        producer->b.info.stage != MESA_SHADER_COMPUTE ||
-       !raster->compiled || !raster->only_linked ||
+       !raster->compiled ||
+       (!raster->linked.ht && !raster->linked.lazy_ht) ||
        raster->b.info.stage != MESA_SHADER_VERTEX || predicated->compiled ||
        !producer->info.mesh.max_vertices ||
        !producer->info.mesh.max_primitives ||
@@ -62,7 +60,9 @@ hk_mesh_emulation_direct_plan_init(
       return false;
 
    if (vertices > UINT64_MAX / 16 || primitives > UINT32_MAX / 3 ||
-       groups > UINT64_MAX / sizeof(struct hk_mesh_emulation_group_record))
+       groups > UINT64_MAX / sizeof(struct hk_mesh_emulation_group_record) ||
+       groups > UINT64_MAX / sizeof(VkDrawIndexedIndirectCommand) ||
+       groups > UINT32_MAX)
       return false;
 
    const uint64_t vertex_need = vertices * 16;
@@ -70,17 +70,52 @@ hk_mesh_emulation_direct_plan_init(
    const uint64_t index_need = index_count * sizeof(uint32_t);
    const uint64_t group_need =
       groups * sizeof(struct hk_mesh_emulation_group_record);
-   if (!vertex_records || (vertex_records & 15) || !index_buffer ||
-       (index_buffer & 3) || !group_records || (group_records & 31) ||
-       !draw_params || (draw_params & 3) ||
-       vertex_need > vertex_records_size_B ||
-       index_need > index_buffer_size_B || index_buffer_size_B > UINT32_MAX ||
-       group_need > group_records_size_B)
-      return false;
+   const uint64_t draw_need =
+      groups * sizeof(VkDrawIndexedIndirectCommand);
 
    memset(plan, 0, sizeof(*plan));
    plan->producer = producer;
    plan->raster = raster;
+   plan->producer_grid = agx_3d(threads[0], threads[1], threads[2]);
+   plan->producer_local_size = agx_workgroup(
+      producer->info.mesh.local_size[0], producer->info.mesh.local_size[1],
+      producer->info.mesh.local_size[2]);
+   plan->barrier = AGX_BARRIER_ALL | AGX_PREGFX;
+   plan->vertex_records_size_B = vertex_need;
+   plan->index_buffer_size_B = index_need;
+   plan->group_records_size_B = group_need;
+   plan->draw_params_size_B = draw_need;
+   plan->draw_count = groups;
+   plan->draw_stride_B = sizeof(VkDrawIndexedIndirectCommand);
+   return true;
+}
+
+bool
+hk_mesh_emulation_direct_plan_init(
+   enum agx_chip chip, const struct hk_api_shader *api,
+   const uint32_t group_count[3], uint64_t vertex_records,
+   uint64_t vertex_records_size_B, uint64_t index_buffer,
+   uint64_t index_buffer_size_B, uint64_t group_records,
+   uint64_t group_records_size_B, uint64_t draw_params,
+   uint64_t draw_params_size_B,
+   struct hk_mesh_emulation_direct_plan *plan)
+{
+   struct hk_mesh_emulation_direct_plan requirements;
+   if (!hk_mesh_emulation_direct_requirements(chip, api, group_count,
+                                               &requirements))
+      return false;
+
+   if (!vertex_records || (vertex_records & 15) || !index_buffer ||
+       (index_buffer & 3) || !group_records || (group_records & 31) ||
+       !draw_params || (draw_params & 3) ||
+       requirements.vertex_records_size_B > vertex_records_size_B ||
+       requirements.index_buffer_size_B > index_buffer_size_B ||
+       index_buffer_size_B > UINT32_MAX ||
+       requirements.group_records_size_B > group_records_size_B ||
+       requirements.draw_params_size_B > draw_params_size_B)
+      return false;
+
+   *plan = requirements;
    plan->params = (struct hk_mesh_emulation_params){
       .vertex_records = vertex_records,
       .index_buffer = index_buffer,
@@ -89,16 +124,8 @@ hk_mesh_emulation_direct_plan_init(
       .mesh_grid = {group_count[0], group_count[1], group_count[2]},
       .abi_version = HK_MESH_EMULATION_ABI_VERSION,
    };
-   plan->producer_grid = agx_3d(threads[0], threads[1], threads[2]);
-   plan->producer_local_size = agx_workgroup(
-      producer->info.mesh.local_size[0], producer->info.mesh.local_size[1],
-      producer->info.mesh.local_size[2]);
-   plan->barrier = AGX_BARRIER_ALL | AGX_PREGFX;
    plan->draw = agx_draw_indexed_indirect(
       draw_params, index_buffer, (uint32_t)index_buffer_size_B,
       AGX_INDEX_SIZE_U32, false);
-   plan->vertex_records_size_B = vertex_need;
-   plan->index_buffer_size_B = index_need;
-   plan->group_records_size_B = group_need;
    return true;
 }

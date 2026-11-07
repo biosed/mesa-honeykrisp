@@ -566,12 +566,18 @@ hk_deps = [
   idep_libagx_shaders_h,
 ]
 
+libhk_test_sources = []
+if with_tests
+  libhk_test_sources += files('tests/hk-mesh-emulation-test-hook.c')
+endif
+
 libhk = static_library(
   'hk',
   [
     hk_entrypoints,
     hk_drirc,
     hk_files,
+    libhk_test_sources,
     hk_bvh_spv,
     sha1_h,
   ],
@@ -795,6 +801,19 @@ if with_tests
       inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm,
     ],
     dependencies : [hk_deps, cc.find_library('vulkan')],
+    gnu_symbol_visibility : 'hidden',
+  )
+
+  hk_mesh_emulation_draw_test = executable(
+    'hk_mesh_emulation_draw_test',
+    files('tests/test-hk-mesh-emulation-draw.c'),
+    include_directories : [
+      include_directories('.'), include_directories('tests'),
+      inc_gallium, inc_gallium_aux, inc_include, inc_src, inc_asahi,
+      inc_virtio_gpu, inc_virtio_vdrm,
+    ],
+    dependencies : [hk_deps, cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args, '-Wno-pointer-arith'],
     gnu_symbol_visibility : 'hidden',
   )
 

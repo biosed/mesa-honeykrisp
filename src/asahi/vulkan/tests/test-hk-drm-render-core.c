@@ -276,7 +276,7 @@ test_legacy_kernel_command_boundaries(void)
                   hk_drm_render_command_size(false, false));
    const size_t compute_offset = size;
    append_command(buffer, &size, DRM_ASAHI_CMD_COMPUTE,
-                  sizeof(struct drm_asahi_cmd_compute));
+                  hk_drm_compute_command_size(false, false));
 
    /* The legacy kernel's Reader::read_up_to consumes min(sizeof(T), size).
     * Its next header must be the compute command, not a resource-spec tail.
@@ -298,6 +298,16 @@ test_legacy_kernel_command_boundaries(void)
    assert(hk_drm_render_command_size(true, false) == 320);
    assert(hk_drm_render_command_size(false, true) == 336);
    assert(hk_drm_render_command_size(true, true) == 336);
+
+   /* The installed G13/G14 kernel structure ends before the append-only
+    * timestamp-copy tail.  A larger advertised payload is not self-skipping:
+    * Reader::read_up_to advances by the kernel structure size, so its zeroed
+    * tail would become a phantom command on the second parsing pass. */
+   assert(offsetof(struct drm_asahi_cmd_compute, ts_end_copies) == 64);
+   assert(hk_drm_compute_command_size(false, false) == 64);
+   assert(hk_drm_compute_command_size(true, false) == 128);
+   assert(hk_drm_compute_command_size(false, true) == 200);
+   assert(hk_drm_compute_command_size(true, true) == 200);
 }
 
 int

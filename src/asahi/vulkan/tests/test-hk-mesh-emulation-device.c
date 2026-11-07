@@ -82,12 +82,13 @@ check_uploaded_pair(const struct hk_api_shader *obj)
 
    assert(main->compiled && rast->compiled && !predicated->compiled);
    assert(main->info.stage == MESA_SHADER_MESH);
-   assert(rast->info.stage == MESA_SHADER_MESH);
+   assert(rast->info.stage == MESA_SHADER_VERTEX);
    assert(main->b.info.stage == MESA_SHADER_COMPUTE);
    assert(rast->b.info.stage == MESA_SHADER_VERTEX);
    assert(main->code_ptr && main->code_size && main->only_linked);
-   assert(rast->code_ptr && rast->code_size && rast->only_linked);
-   assert(main->only_linked->b.bo && rast->only_linked->b.bo);
+   assert(rast->code_ptr && rast->code_size && !rast->only_linked);
+   assert(rast->linked.ht || rast->linked.lazy_ht);
+   assert(main->only_linked->b.bo);
    assert(!predicated->code_ptr && !predicated->only_linked);
 }
 
@@ -159,10 +160,16 @@ main(void)
 
    const uint32_t direct_grid[3] = {2, 1, 1};
    struct hk_mesh_emulation_direct_plan direct;
+   assert(hk_mesh_emulation_direct_requirements(
+      dev->dev.chip, compiled, direct_grid, &direct));
+   assert(direct.draw_count == 2);
+   assert(direct.draw_stride_B == sizeof(VkDrawIndexedIndirectCommand));
+   assert(direct.draw_params_size_B ==
+          2 * sizeof(VkDrawIndexedIndirectCommand));
    assert(hk_mesh_emulation_direct_plan_init(
       dev->dev.chip, compiled, direct_grid, UINT64_C(0x100000), 4096,
       UINT64_C(0x200000), 4096, UINT64_C(0x300000), 4096,
-      UINT64_C(0x400000), &direct));
+      UINT64_C(0x400000), 4096, &direct));
    assert(direct.producer == hk_main_mesh_variant(compiled));
    assert(direct.raster == hk_rast_mesh_variant(compiled));
    assert(direct.params.abi_version == HK_MESH_EMULATION_ABI_VERSION);
@@ -188,11 +195,11 @@ main(void)
    assert(!hk_mesh_emulation_direct_plan_init(
       dev->dev.chip, compiled, direct_grid, UINT64_C(0x100000), 95,
       UINT64_C(0x200000), 4096, UINT64_C(0x300000), 4096,
-      UINT64_C(0x400000), &direct));
+      UINT64_C(0x400000), 4096, &direct));
    assert(!hk_mesh_emulation_direct_plan_init(
       AGX_CHIP_G14X, compiled, direct_grid, UINT64_C(0x100000), 4096,
       UINT64_C(0x200000), 4096, UINT64_C(0x300000), 4096,
-      UINT64_C(0x400000), &direct));
+      UINT64_C(0x400000), 4096, &direct));
 
    struct blob blob;
    blob_init(&blob);
@@ -230,8 +237,12 @@ main(void)
                  hk_rast_mesh_variant(first)->code_size) == 0);
    assert(hk_main_mesh_variant(first)->only_linked !=
           hk_main_mesh_variant(second)->only_linked);
-   assert(hk_rast_mesh_variant(first)->only_linked !=
-          hk_rast_mesh_variant(second)->only_linked);
+   assert(!hk_rast_mesh_variant(first)->only_linked);
+   assert(!hk_rast_mesh_variant(second)->only_linked);
+   assert(hk_rast_mesh_variant(first)->linked.lazy_ht);
+   assert(hk_rast_mesh_variant(second)->linked.lazy_ht);
+   assert(&hk_rast_mesh_variant(first)->linked !=
+          &hk_rast_mesh_variant(second)->linked);
 
    const uint32_t producer_size = hk_main_mesh_variant(compiled)->code_size;
    const uint32_t pull_vs_size = hk_rast_mesh_variant(compiled)->code_size;

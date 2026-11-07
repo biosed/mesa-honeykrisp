@@ -321,6 +321,10 @@ export_scratch(nir_builder *b,
     * 16-byte records at an even index, keeping this as one grounded ULEA. */
    nir_def *group_record = nir_ulea_agx(
       b, group_records, nir_imul_imm(b, group, 2), nir_imm_int(b, 4));
+   /* VkDrawIndexedIndirectCommand is five dwords. Address one GPU-owned draw
+    * record per mesh workgroup as (group * 5) << 2. */
+   nir_def *draw_record = nir_ulea_agx(
+      b, draw_params, nir_imul_imm(b, group, 5), nir_imm_int(b, 2));
 
    nir_push_if(b, valid);
 
@@ -371,28 +375,20 @@ export_scratch(nir_builder *b,
                   primitive_base),
       group_record, .write_mask = 0xf, .align_mul = 16);
 
-   nir_push_if(b, nir_ieq_imm(b, group, 0));
-   nir_def *group_total = nir_imul(
-      b, nir_channel(b, mesh_grid, 0),
-      nir_imul(b, nir_channel(b, mesh_grid, 1),
-               nir_channel(b, mesh_grid, 2)));
-   nir_def *index_count = nir_imul_imm(
-      b, group_total, layout->primitives_per_group * 3);
+   nir_def *index_count = nir_imul_imm(b, primitive_count, 3);
+   nir_def *first_index = nir_imul_imm(b, primitive_base, 3);
    nir_store_global(
-      b, nir_vec4(b, index_count, nir_imm_int(b, 1), nir_imm_int(b, 0),
+      b, nir_vec4(b, index_count, nir_imm_int(b, 1), first_index,
                   nir_imm_int(b, 0)),
-      draw_params, .write_mask = 0xf, .align_mul = 4);
-   nir_pop_if(b, NULL);
+      draw_record, .write_mask = 0xf, .align_mul = 4);
    nir_pop_if(b, NULL);
 
    nir_push_else(b, NULL);
    nir_push_if(b, nir_ieq_imm(b, lane, 0));
    nir_store_global(b, nir_imm_zero(b, 4, 32), group_record,
                     .write_mask = 0xf, .align_mul = 16);
-   nir_push_if(b, nir_ieq_imm(b, group, 0));
-   nir_store_global(b, nir_imm_zero(b, 4, 32), draw_params,
+   nir_store_global(b, nir_imm_zero(b, 4, 32), draw_record,
                     .write_mask = 0xf, .align_mul = 4);
-   nir_pop_if(b, NULL);
    nir_pop_if(b, NULL);
    nir_pop_if(b, NULL);
 

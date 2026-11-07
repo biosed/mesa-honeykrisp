@@ -33,6 +33,7 @@
 #include "agx_vdm_hal200_direct_draw_core.h"
 #include "hk_buffer.h"
 #include "hk_cmd_buffer.h"
+#include "hk_mesh_emulation_direct.h"
 #include "hk_native_vertex_template.h"
 #include "hk_frame_anatomy.h"
 #include "asahi/lib/agx_vdm_mesh_core.h"
@@ -8060,7 +8061,8 @@ hk_effective_viewport_count(struct hk_cmd_buffer *cmd)
       &cmd->vk.dynamic_graphics_state;
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    if (gfx->shaders[MESA_SHADER_MESH]) {
-      const struct hk_mesh_info *mesh = &hk_bound_hw_vs(gfx)->info.mesh;
+      const struct hk_mesh_info *mesh =
+         &hk_main_mesh_variant(gfx->shaders[MESA_SHADER_MESH])->info.mesh;
       if (!((mesh->vertex_outputs | mesh->primitive_outputs) &
             (VARYING_BIT_VIEWPORT | VARYING_BIT_LAYER)))
          return 1;
@@ -10987,7 +10989,8 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    struct hk_shader *fs = hk_bound_fs(cmd);
    bool gt_dirty = IS_SHADER_DIRTY(TESS_CTRL) || IS_SHADER_DIRTY(TESS_EVAL) ||
                    IS_SHADER_DIRTY(GEOMETRY);
-   const bool native_mesh = gfx->shaders[MESA_SHADER_MESH] != NULL;
+   const bool mesh_pipeline = gfx->shaders[MESA_SHADER_MESH] != NULL;
+   const bool native_mesh = mesh_pipeline && !hk_bound_mesh_is_software(gfx);
    bool vgt_dirty = IS_SHADER_DIRTY(VERTEX) || IS_SHADER_DIRTY(MESH) || gt_dirty;
    bool fs_dirty = IS_SHADER_DIRTY(FRAGMENT);
    if (native_mesh && gfx->linked[MESA_SHADER_VERTEX] != hw_vs->only_linked) {
@@ -11227,7 +11230,9 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    bool topology_changed = false;
    if (IS_DIRTY(IA_PRIMITIVE_TOPOLOGY) || gt_dirty || vgt_dirty || IS_SHADER_DIRTY(MESH)) {
-      enum mesa_prim prim = native_mesh ? hw_vs->info.mesh.prim : hk_rast_prim(cmd);
+      enum mesa_prim prim = mesh_pipeline
+         ? hk_main_mesh_variant(gfx->shaders[MESA_SHADER_MESH])->info.mesh.prim
+         : hk_rast_prim(cmd);
       const unsigned topology = translate_hw_primitive_topology(prim);
 
       topology_changed = topology != gfx->topology && IS_SHADER_DIRTY(MESH);
@@ -11998,8 +12003,9 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
 
    const bool geom = gfx->shaders[MESA_SHADER_GEOMETRY];
    const bool tess = gfx->shaders[MESA_SHADER_TESS_EVAL];
-   bool adj = mesa_prim_has_adjacency(
-      vk_topology_to_mesa(dyn->ia.primitive_topology));
+   bool adj = !gfx->shaders[MESA_SHADER_MESH] &&
+      mesa_prim_has_adjacency(
+         vk_topology_to_mesa(dyn->ia.primitive_topology));
    adj &= !geom;
    *needs_idx_robust =
       hk_needs_index_robustness(cmd, draw, conditional_direct);
@@ -12586,9 +12592,16 @@ hk_note_pre_raster_images(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
       hk_sync_vertex_images(cmd, cs);
 }
 
+struct hk_g13_mesh_draw {
+   const struct hk_mesh_emulation_direct_plan *plan;
+   uint64_t geometry_params;
+   struct hk_mesh_emulation_record_trace *trace;
+};
+
 static __attribute__((hot)) void
 hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
-             struct hk_robust_index_batch *batch)
+             struct hk_robust_index_batch *batch,
+             const struct hk_g13_mesh_draw *mesh_draw)
 {
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
@@ -12609,8 +12622,12 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
 
    hk_g17p_note_depth_use(cmd);
 
-   draw_.restart = dyn->ia.primitive_restart_enable && draw_.indexed;
-   draw_.index_size = cmd->state.gfx.index.size;
+   draw_.restart = mesh_draw ? false
+                             : dyn->ia.primitive_restart_enable && draw_.indexed;
+   /* Internal software mesh always materializes uint32_t indices. Do not let
+    * the application's unrelated index binding rewrite that contract. */
+   draw_.index_size = mesh_draw ? AGX_INDEX_SIZE_U32
+                                : cmd->state.gfx.index.size;
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
    /* Null index bindings execute the requested vertices, all with index zero.
@@ -12759,8 +12776,9 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
       struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
       bool geom = cmd->state.gfx.shaders[MESA_SHADER_GEOMETRY];
       bool tess = cmd->state.gfx.shaders[MESA_SHADER_TESS_EVAL];
-      bool adj = mesa_prim_has_adjacency(
-         vk_topology_to_mesa(dyn->ia.primitive_topology));
+      bool adj = !cmd->state.gfx.shaders[MESA_SHADER_MESH] &&
+         mesa_prim_has_adjacency(
+            vk_topology_to_mesa(dyn->ia.primitive_topology));
       adj &= !geom;
       needs_idx_robust &= !adj;
 
@@ -12774,10 +12792,44 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
       cs->stats.calls++;
       hk_upload_stat(cmd, draws, 1);
 
-      if (geom || tess) {
+      if (geom || tess || mesh_draw) {
          ccs =
             hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.pre_gfx, true);
          if (!ccs)
+            return;
+      }
+
+      if (mesh_draw) {
+         struct hk_graphics_state *gfx = &cmd->state.gfx;
+         const struct hk_mesh_emulation_direct_plan *plan = mesh_draw->plan;
+
+         /* hk_flush_gfx_state() is the single owner of graphics publication:
+          * it dynamically links the generated pull VS to the application FS
+          * and uploads the graphics descriptor/push root consumed by MAIN. */
+         if (!gfx->root || !gfx->root_cpu ||
+             !gfx->linked[MESA_SHADER_VERTEX] ||
+             gfx->descriptors.root.draw.geometry_params !=
+                mesh_draw->geometry_params ||
+             gfx->root_cpu->draw.geometry_params !=
+                mesh_draw->geometry_params ||
+             hk_shader_root_for_usc(cmd, plan->producer) != gfx->root) {
+            vk_command_buffer_set_error(&cmd->vk,
+                                        VK_ERROR_FEATURE_NOT_PRESENT);
+            return;
+         }
+
+         if (mesh_draw->trace) {
+            mesh_draw->trace->producer_root = gfx->root;
+            mesh_draw->trace->geometry_params =
+               gfx->root_cpu->draw.geometry_params;
+            mesh_draw->trace->linked_raster =
+               (uintptr_t)gfx->linked[MESA_SHADER_VERTEX];
+         }
+
+         hk_dispatch_with_local_size(
+            cmd, ccs, (struct hk_shader *)plan->producer,
+            plan->producer_grid, plan->producer_local_size);
+         if (vk_command_buffer_has_error(&cmd->vk))
             return;
       }
 
@@ -12991,7 +13043,106 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
 static __attribute__((hot)) void
 hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw)
 {
-   hk_draw_impl(cmd, draw_id, draw, NULL);
+   hk_draw_impl(cmd, draw_id, draw, NULL, NULL);
+}
+
+bool
+hk_cmd_draw_mesh_g13_direct(struct hk_cmd_buffer *cmd,
+                            const uint32_t group_count[3], uint16_t draw_id,
+                            struct hk_mesh_emulation_record_trace *trace)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_api_shader *mesh = gfx->shaders[MESA_SHADER_MESH];
+   if (trace)
+      memset(trace, 0, sizeof(*trace));
+
+   if ((dev->dev.chip != AGX_CHIP_G13G &&
+        dev->dev.chip != AGX_CHIP_G13X) ||
+       !mesh || gfx->shaders[MESA_SHADER_TASK] ||
+       !hk_bound_mesh_is_software(gfx)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return false;
+   }
+
+   /* Vulkan defines a zero in any direct group-count dimension as a no-op.
+    * Return before deriving sizes so the recorder never asks the uploader for
+    * a zero-byte allocation and mistakes its null pointer for OOM. */
+   if (!group_count[0] || !group_count[1] || !group_count[2])
+      return true;
+
+   struct hk_mesh_emulation_direct_plan requirements;
+   if (!hk_mesh_emulation_direct_requirements(
+          dev->dev.chip, mesh, group_count, &requirements) ||
+       requirements.vertex_records_size_B > UINT32_MAX ||
+       requirements.index_buffer_size_B > UINT32_MAX ||
+       requirements.group_records_size_B > UINT32_MAX ||
+       requirements.draw_params_size_B > UINT32_MAX ||
+       requirements.draw_count != 1 || gfx->render.view_mask) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return false;
+   }
+
+   struct agx_ptr vertex_records = hk_pool_alloc(
+      cmd, requirements.vertex_records_size_B, 16);
+   struct agx_ptr index_buffer = hk_pool_alloc(
+      cmd, requirements.index_buffer_size_B, 4);
+   struct agx_ptr group_records = hk_pool_alloc(
+      cmd, requirements.group_records_size_B, 32);
+   struct agx_ptr draw_params = hk_pool_alloc(
+      cmd, requirements.draw_params_size_B, 4);
+   if (!vertex_records.cpu || !index_buffer.cpu || !group_records.cpu ||
+       !draw_params.cpu) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return false;
+   }
+
+   /* Command-owned uploader memory is CPU mapped and submitted only after
+    * recording completes. Zero every consumer-visible byte here, including
+    * reserved group fields and VkDrawIndexedIndirectCommand::firstInstance. */
+   memset(vertex_records.cpu, 0, requirements.vertex_records_size_B);
+   memset(index_buffer.cpu, 0, requirements.index_buffer_size_B);
+   memset(group_records.cpu, 0, requirements.group_records_size_B);
+   memset(draw_params.cpu, 0, requirements.draw_params_size_B);
+
+   struct hk_mesh_emulation_direct_plan plan;
+   if (!hk_mesh_emulation_direct_plan_init(
+          dev->dev.chip, mesh, group_count,
+          vertex_records.gpu, requirements.vertex_records_size_B,
+          index_buffer.gpu, requirements.index_buffer_size_B,
+          group_records.gpu, requirements.group_records_size_B,
+          draw_params.gpu, requirements.draw_params_size_B, &plan)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return false;
+   }
+
+   const struct agx_ptr params =
+      hk_pool_alloc(cmd, sizeof(plan.params), 16);
+   if (!params.cpu) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return false;
+   }
+   memcpy(params.cpu, &plan.params, sizeof(plan.params));
+   gfx->descriptors.root.draw.geometry_params = params.gpu;
+   gfx->descriptors.root_dirty = true;
+
+   assert(plan.producer->info.stage == MESA_SHADER_MESH);
+   assert(plan.producer->b.info.stage == MESA_SHADER_COMPUTE);
+   /* hk_draw_impl() publishes graphics once, dispatches MAIN on that render's
+    * pre-gfx stream, then consumes the producer's GPU-written indirect draw.
+    * Keep the first submitted proof single-group; the allocation/ABI helpers
+    * already model one independent record per group for the next slice. */
+   assert(plan.barrier == (AGX_BARRIER_ALL | AGX_PREGFX));
+   const struct hk_g13_mesh_draw mesh_draw = {
+      .plan = &plan,
+      .geometry_params = params.gpu,
+      .trace = trace,
+   };
+   hk_draw_impl(cmd, draw_id, plan.draw, NULL, &mesh_draw);
+   if (vk_command_buffer_has_error(&cmd->vk))
+      return false;
+
+   return true;
 }
 
 static void
@@ -13610,7 +13761,7 @@ hk_g17p_draw_robust_multi(struct hk_cmd_buffer *cmd, uint64_t buffer,
    if (!batch.jobs.cpu)
       return true;
 
-   hk_draw_impl(cmd, 0, first, &batch);
+   hk_draw_impl(cmd, 0, first, &batch, NULL);
    if (vk_command_buffer_has_error(&cmd->vk))
       return true;
 

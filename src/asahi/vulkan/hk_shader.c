@@ -5696,7 +5696,8 @@ hk_compile_fs_sample_variant(struct hk_device *dev,
 static VkResult hk_deserialize_shader(struct hk_device *dev,
                                       struct blob_reader *blob,
                                       struct hk_shader *shader, bool absent,
-                                      bool cache_candidate);
+                                      bool cache_candidate,
+                                      bool g13_mesh_pair);
 static void hk_shader_serialize(struct vk_device *vk_dev,
                                 const struct hk_shader *shader,
                                 struct blob *blob);
@@ -5747,7 +5748,7 @@ hk_fs_sample_variant_load(struct hk_device *dev, struct hk_shader *shader,
       return false;
    struct blob_reader blob;
    blob_reader_init(&blob, data, size);
-   bool ok = hk_deserialize_shader(dev, &blob, shader, false, false) ==
+   bool ok = hk_deserialize_shader(dev, &blob, shader, false, false, false) ==
              VK_SUCCESS;
    const uint32_t mono_size = ok ? blob_read_uint32(&blob) : 0;
    if (ok && mono_size) {
@@ -6073,10 +6074,15 @@ hk_compile_g13_mesh_emulation(
 
    struct hk_shader *rast = hk_rast_mesh_variant(obj);
    agx_preprocess_nir(pull_vs);
-   hk_lower_hw_vs(pull_vs, rast, false, false, false, false);
+   const union hk_key pull_key = {
+      .vs = {
+         .kill_psiz = true,
+         .no_default_layer = true,
+      },
+   };
    result = hk_compile_nir(
-      dev, pAllocator, pull_vs, info->flags, info->robustness, NULL, features,
-      rast, MESA_SHADER_MESH, true, NULL, 0, 0);
+      dev, pAllocator, pull_vs, info->flags, info->robustness, &pull_key,
+      features, rast, MESA_SHADER_VERTEX, true, NULL, 0, 0);
 
    hk_mesh_emulation_admission_unref(admission);
    return result;
@@ -7348,7 +7354,7 @@ enum hk_serialized_variant {
 static VkResult
 hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
                       struct hk_shader *shader, bool absent,
-                      bool cache_candidate)
+                      bool cache_candidate, bool g13_mesh_pair)
 {
    struct hk_shader_info info;
    blob_copy_bytes(blob, &info, sizeof(info));
@@ -7409,13 +7415,9 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
     * copying/uploading an executable or eagerly linking it, so the caller
     * can deserialize once with the final object's allocation callbacks.
     * VK_NOT_READY is private to this probe and is consumed by the wrapper. */
-   const bool g13_mesh_single_link =
-      info.stage == MESA_SHADER_MESH &&
-      (dev->dev.chip == AGX_CHIP_G13G ||
-       dev->dev.chip == AGX_CHIP_G13X);
    if (cache_candidate &&
        (b_info.has_preamble || b_info.rodata.size_16) &&
-       !g13_mesh_single_link)
+       !g13_mesh_pair)
       return VK_NOT_READY;
 
    shader->b.info = b_info;
@@ -7445,10 +7447,10 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
 
    shader->b.binary = (void *)shader->code_ptr;
    if (cache_candidate) {
-      /* A cache template owns immutable CPU payload only.  Dynamic
-       * vertex/fragment link tables are created lazily by its wrappers;
-       * the bounded G13 mesh pair instead gives each wrapper an eager,
-       * private upload in hk_shader_binary_cache_clone(). */
+      /* A cache template owns immutable CPU payload only. Dynamic
+       * vertex/fragment link tables, including the G13 pull VS, are created
+       * lazily by wrappers. The G13 producer instead gets an eager private
+       * upload in hk_shader_binary_cache_clone(). */
       shader->compiled = true;
       return VK_SUCCESS;
    }
@@ -7583,9 +7585,12 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
       const uint8_t marker = blob_read_uint8(blob);
       if (marker == HK_SERIALIZED_COMPILED ||
           marker == HK_SERIALIZED_ABSENT) {
+         const bool g13_mesh_pair = stage == MESA_SHADER_MESH &&
+            (dev->dev.chip == AGX_CHIP_G13G ||
+             dev->dev.chip == AGX_CHIP_G13X);
          result = hk_deserialize_shader(dev, blob, shader,
                                         marker == HK_SERIALIZED_ABSENT,
-                                        cache_candidate);
+                                        cache_candidate, g13_mesh_pair);
       } else {
          result = vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
       }
@@ -7783,9 +7788,9 @@ hk_shader_binary_cache_clone(struct hk_device *dev,
    }
 
    /* Initialize every mutex before an upload can fail: object destruction
-    * always walks all variants.  G13 mesh variants have one fixed linked
-    * executable rather than a dynamic vertex/fragment link table, so each
-    * wrapper uploads its own while borrowing only the immutable payload. */
+    * always walks all variants. The G13 mesh producer has one fixed linked
+    * executable, so each wrapper uploads its own while borrowing only the
+    * immutable payload. Its pull VS uses the normal dynamic vertex table. */
    for (unsigned i = 0; i < hk_api_num_variants(src_obj); ++i) {
       struct hk_shader *dst = &obj->variants[i];
       const struct hk_shader *src = &src_obj->variants[i];

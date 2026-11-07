@@ -3584,6 +3584,15 @@ hk_upload_usc_words_internal(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                              struct hk_linked_shader *linked);
 
 uint64_t
+hk_shader_root_for_usc(struct hk_cmd_buffer *cmd, const struct hk_shader *s)
+{
+   return s->info.stage == MESA_SHADER_COMPUTE
+             ? hk_cmd_buffer_upload_root(cmd,
+                                         VK_PIPELINE_BIND_POINT_COMPUTE)
+             : cmd->state.gfx.root;
+}
+
+uint64_t
 hk_m5_multi_draw_vertex_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                                 struct hk_linked_shader *linked)
 {
@@ -3822,13 +3831,7 @@ hk_upload_usc_words_internal(struct hk_cmd_buffer *cmd, struct hk_shader *s,
 
    struct agx_usc_builder b = agx_usc_builder(t.cpu, usc_size);
 
-   uint64_t root_ptr;
-
-   if (sw_stage == MESA_SHADER_COMPUTE) {
-      root_ptr = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
-   } else {
-      root_ptr = cmd->state.gfx.root;
-   }
+   const uint64_t root_ptr = hk_shader_root_for_usc(cmd, s);
 
    static_assert(offsetof(struct hk_root_descriptor_table, root_desc_addr) == 0,
                  "self-reflective");
