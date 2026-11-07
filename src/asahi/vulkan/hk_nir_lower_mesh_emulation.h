@@ -41,3 +41,11 @@ struct hk_mesh_emulation_layout {
  */
 bool hk_nir_lower_mesh_emulation(
    nir_shader *shader, struct hk_mesh_emulation_layout *layout_out);
+
+/*
+ * Build the ordinary vertex-stage consumer for the position scratch.  The
+ * matching U32 index scratch is consumed by the fixed-function indexed draw;
+ * its fetched index arrives here as load_vertex_id.
+ */
+nir_shader *hk_nir_mesh_emulation_pull_vs(
+   const nir_shader_compiler_options *options);

@@ -276,10 +276,9 @@ export_scratch(nir_builder *b,
          b, 4, 32,
          nir_iadd_imm(b, nir_imul_imm(b, vertex, 16), layout->position),
          .align_mul = 16);
-      nir_def *address = nir_iadd(
-         b, vertex_buffer,
-         nir_u2u64(b, nir_imul_imm(
-                         b, nir_iadd(b, vertex_base, vertex), 16)));
+      nir_def *address =
+         nir_ulea_agx(b, vertex_buffer, nir_iadd(b, vertex_base, vertex),
+                      nir_imm_int(b, 4));
       nir_store_global(b, value, address,
                        .write_mask = 0xf, .align_mul = 16);
       nir_pop_if(b, NULL);
@@ -356,4 +355,31 @@ hk_nir_lower_mesh_emulation(
       *layout_out = layout;
 
    return true;
+}
+
+nir_shader *
+hk_nir_mesh_emulation_pull_vs(const nir_shader_compiler_options *options)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, options, "G13 software mesh pull VS");
+   nir_def *params = nir_load_geometry_param_buffer_poly(&b);
+   nir_def *vertex_buffer =
+      load_param(&b, params,
+                 offsetof(struct hk_mesh_emulation_params, vertex_buffer));
+   nir_def *vertex = nir_load_vertex_id(&b);
+   nir_def *address =
+      nir_ulea_agx(&b, vertex_buffer, vertex, nir_imm_int(&b, 4));
+   nir_def *position = nir_load_global_constant(
+      &b, 4, 32, address, .align_mul = 16,
+      .access = ACCESS_CAN_SPECULATE);
+
+   nir_store_output(
+      &b, position, nir_imm_int(&b, 0), .write_mask = 0xf,
+      .src_type = nir_type_float32,
+      .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+   b.shader->info.outputs_written = VARYING_BIT_POS;
+   b.shader->info.io_lowered = true;
+   nir_shader_gather_info(b.shader, b.impl);
+
+   return b.shader;
 }

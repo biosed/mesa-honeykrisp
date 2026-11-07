@@ -15,6 +15,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+static unsigned producer_binary_size;
+static unsigned pull_vs_binary_size;
+
 static bool
 lower_driver_sysvals(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
@@ -31,6 +34,25 @@ lower_driver_sysvals(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    default:
       return false;
    }
+}
+
+static bool
+lower_pull_vs_output(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_store_output)
+      return false;
+
+   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   assert(sem.location == VARYING_SLOT_POS);
+   b->cursor = nir_instr_remove(&intr->instr);
+
+   u_foreach_bit(c, nir_intrinsic_write_mask(intr)) {
+      nir_store_uvs_agx(
+         b, nir_channel(b, intr->src[0].ssa, c),
+         nir_imm_intN_t(b, nir_intrinsic_component(intr) + c, 16));
+   }
+
+   return true;
 }
 
 static nir_builder
@@ -108,9 +130,15 @@ test_triangle(void)
    unsigned global_stores = 0;
    unsigned barriers = 0;
    unsigned mesh_intrinsics = 0;
+   unsigned leas = 0;
    nir_foreach_function_impl(impl, b.shader) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_alu) {
+               nir_alu_instr *alu = nir_instr_as_alu(instr);
+               leas += alu->op == nir_op_ulea_agx;
+               continue;
+            }
             if (instr->type != nir_instr_type_intrinsic)
                continue;
             nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
@@ -134,6 +162,7 @@ test_triangle(void)
    assert(global_stores == 4);
    assert(barriers >= 3);
    assert(mesh_intrinsics == 0);
+   assert(leas == 4);
 
    NIR_PASS(_, b.shader, nir_shader_intrinsics_pass, lower_driver_sysvals,
             nir_metadata_control_flow, NULL);
@@ -146,6 +175,7 @@ test_triangle(void)
    assert(agx_compile_shader_nir(b.shader, &key, &part));
    assert(part.binary != NULL);
    assert(part.info.binary_size > 0);
+   producer_binary_size = part.info.binary_size;
    free(part.binary);
    ralloc_free(b.shader);
 }
@@ -162,11 +192,77 @@ test_fail_closed(void)
    ralloc_free(b.shader);
 }
 
+static void
+test_pull_vs(void)
+{
+   static const nir_shader_compiler_options options = {0};
+   nir_shader *vs = hk_nir_mesh_emulation_pull_vs(&options);
+   nir_validate_shader(vs, "G13 software mesh pull VS");
+   assert(vs->info.stage == MESA_SHADER_VERTEX);
+   assert(vs->info.io_lowered);
+   assert(vs->info.outputs_written == VARYING_BIT_POS);
+
+   unsigned geometry_params = 0;
+   unsigned vertex_ids = 0;
+   unsigned global_constants = 0;
+   unsigned output_stores = 0;
+   unsigned leas = 0;
+   nir_foreach_function_impl(impl, vs) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic) {
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               geometry_params += intr->intrinsic ==
+                                  nir_intrinsic_load_geometry_param_buffer_poly;
+               vertex_ids += intr->intrinsic == nir_intrinsic_load_vertex_id;
+               global_constants +=
+                  intr->intrinsic == nir_intrinsic_load_global_constant;
+               output_stores +=
+                  intr->intrinsic == nir_intrinsic_store_output;
+            } else if (instr->type == nir_instr_type_alu) {
+               nir_alu_instr *alu = nir_instr_as_alu(instr);
+               leas += alu->op == nir_op_ulea_agx;
+               if (alu->op == nir_op_ulea_agx) {
+                  assert(nir_src_is_const(alu->src[2].src));
+                  assert(nir_src_as_uint(alu->src[2].src) == 4);
+               }
+            }
+         }
+      }
+   }
+
+   assert(geometry_params == 1);
+   assert(vertex_ids == 1);
+   assert(global_constants == 2);
+   assert(output_stores == 1);
+   assert(leas == 1);
+
+   NIR_PASS(_, vs, nir_shader_intrinsics_pass, lower_driver_sysvals,
+            nir_metadata_control_flow, NULL);
+   NIR_PASS(_, vs, nir_shader_intrinsics_pass, lower_pull_vs_output,
+            nir_metadata_control_flow, NULL);
+   agx_preprocess_nir(vs);
+   struct agx_shader_key key = {
+      .dev.encoding = AGX_ISA_ENCODING_AGX2,
+      .no_preamble = true,
+   };
+   struct agx_shader_part part = {0};
+   assert(agx_compile_shader_nir(vs, &key, &part));
+   assert(part.binary != NULL);
+   assert(part.info.binary_size > 0);
+   pull_vs_binary_size = part.info.binary_size;
+   free(part.binary);
+   ralloc_free(vs);
+}
+
 int
 main(void)
 {
    test_triangle();
    test_fail_closed();
-   puts("G13 mesh emulation NIR contract: triangle PASS, unsupported PASS");
+   test_pull_vs();
+   printf("G13 mesh NIR: producer PASS (%u B), pull VS PASS (%u B), "
+          "unsupported PASS\n",
+          producer_binary_size, pull_vs_binary_size);
    return 0;
 }
