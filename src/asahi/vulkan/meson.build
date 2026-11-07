@@ -68,6 +68,8 @@ hk_files = files(
   'hk_nir_lower_gs.c',
   'hk_nir_lower_tes_rq.c',
   'hk_nir_lower_gs.h',
+  'hk_mesh_emulation_direct.c',
+  'hk_mesh_emulation_direct.h',
   'hk_nir_lower_mesh_emulation.c',
   'hk_nir_lower_mesh_emulation.h',
   'hk_nir_root_size.c',
@@ -786,7 +788,8 @@ endif
 if with_tests
   hk_mesh_emulation_device_test = executable(
     'hk_mesh_emulation_device_test',
-    files('tests/test-hk-mesh-emulation-device.c'),
+    files('tests/test-hk-mesh-emulation-device.c',
+          'hk_mesh_emulation_direct.c'),
     include_directories : [
       include_directories('.'), inc_gallium, inc_gallium_aux, inc_include,
       inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm,

@@ -928,13 +928,26 @@ hk_hash_graphics_state(struct vk_physical_device *device,
       _mesa_blake3_update(&blake3_ctx, &pipeline_mesh, sizeof(pipeline_mesh));
    }
 
+   /* G13 lowers an API mesh shader to a software compute/pull-VS pair.  Keep
+    * that versioned contract in the durable pipeline key, independently of
+    * the serialized NIR admission identity, so it cannot alias a native mesh
+    * pipeline compiled from identical application state. */
+   struct hk_physical_device *pdev =
+      container_of(device, struct hk_physical_device, vk);
+   if ((pdev->dev.chip == AGX_CHIP_G13G ||
+        pdev->dev.chip == AGX_CHIP_G13X) &&
+       (stages & VK_SHADER_STAGE_MESH_BIT_EXT)) {
+      const uint32_t abi = HK_MESH_EMULATION_ABI_VERSION;
+      const uint32_t target = HK_MESH_EMULATION_TARGET_G13;
+      _mesa_blake3_update(&blake3_ctx, &abi, sizeof(abi));
+      _mesa_blake3_update(&blake3_ctx, &target, sizeof(target));
+   }
+
    enum hk_feature_key feature_key = hk_make_feature_key(features);
    _mesa_blake3_update(&blake3_ctx, &feature_key, sizeof(feature_key));
 
    /* Whether G17P and M5 shaders compile the custom-border emulation in
     * (hk_compile_shader_impl): a cached shader was compiled the same way. */
-   struct hk_physical_device *pdev =
-      container_of(device, struct hk_physical_device, vk);
    if (agx_native_graphics(&pdev->dev) || agx_chip_g17_m5(pdev->dev.chip)) {
       const uint32_t border = p_atomic_read(&pdev->border_emulation);
       _mesa_blake3_update(&blake3_ctx, &border, sizeof(border));

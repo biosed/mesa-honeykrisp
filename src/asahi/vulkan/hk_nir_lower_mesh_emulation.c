@@ -286,30 +286,43 @@ export_scratch(nir_builder *b,
                .memory_modes = nir_var_mem_shared);
 
    nir_def *params = nir_load_geometry_param_buffer_poly(b);
-   nir_def *vertex_buffer =
+   nir_def *vertex_records =
       load_param(b, params, offsetof(struct hk_mesh_emulation_params,
-                                     vertex_buffer));
+                                     vertex_records));
    nir_def *index_buffer =
       load_param(b, params,
                  offsetof(struct hk_mesh_emulation_params, index_buffer));
-   nir_def *group_count =
+   nir_def *group_records =
+      load_param(b, params,
+                 offsetof(struct hk_mesh_emulation_params, group_records));
+   nir_def *draw_params =
+      load_param(b, params,
+                 offsetof(struct hk_mesh_emulation_params, draw_params));
+   nir_def *mesh_grid =
       load_param_u32(b, params,
-                     offsetof(struct hk_mesh_emulation_params, group_count),
-                     3);
+                     offsetof(struct hk_mesh_emulation_params, mesh_grid), 3);
    nir_def *abi_version =
       load_param_u32(b, params,
                      offsetof(struct hk_mesh_emulation_params, abi_version),
                      1);
-   nir_push_if(b, nir_ieq_imm(b, abi_version,
-                              HK_MESH_EMULATION_ABI_VERSION));
    nir_def *lane = nir_load_local_invocation_index(b);
-   nir_def *group = linear_workgroup_id(b, group_count);
+   nir_def *group = linear_workgroup_id(b, mesh_grid);
    nir_def *vertex_base =
       nir_imul_imm(b, group, layout->vertices_per_group);
    nir_def *primitive_base =
       nir_imul_imm(b, group, layout->primitives_per_group);
    nir_def *primitive_count = nir_load_shared(
       b, 1, 32, nir_imm_int(b, layout->primitive_count), .align_mul = 4);
+   nir_def *vertex_count = nir_load_shared(
+      b, 1, 32, nir_imm_int(b, layout->vertex_count), .align_mul = 4);
+   nir_def *valid =
+      nir_ieq_imm(b, abi_version, HK_MESH_EMULATION_ABI_VERSION);
+   /* AGX2 ULEA encodes shifts through four. Address 32-byte records as
+    * 16-byte records at an even index, keeping this as one grounded ULEA. */
+   nir_def *group_record = nir_ulea_agx(
+      b, group_records, nir_imul_imm(b, group, 2), nir_imm_int(b, 4));
+
+   nir_push_if(b, valid);
 
    for (unsigned base = 0; base < layout->vertices_per_group;
         base += threads) {
@@ -320,7 +333,7 @@ export_scratch(nir_builder *b,
          nir_iadd_imm(b, nir_imul_imm(b, vertex, 16), layout->position),
          .align_mul = 16);
       nir_def *address =
-         nir_ulea_agx(b, vertex_buffer, nir_iadd(b, vertex_base, vertex),
+         nir_ulea_agx(b, vertex_records, nir_iadd(b, vertex_base, vertex),
                       nir_imm_int(b, 4));
       nir_store_global(b, value, address,
                        .write_mask = 0xf, .align_mul = 16);
@@ -352,11 +365,41 @@ export_scratch(nir_builder *b,
       nir_pop_if(b, NULL);
    }
 
+   nir_push_if(b, nir_ieq_imm(b, lane, 0));
+   nir_store_global(
+      b, nir_vec4(b, vertex_count, primitive_count, vertex_base,
+                  primitive_base),
+      group_record, .write_mask = 0xf, .align_mul = 16);
+
+   nir_push_if(b, nir_ieq_imm(b, group, 0));
+   nir_def *group_total = nir_imul(
+      b, nir_channel(b, mesh_grid, 0),
+      nir_imul(b, nir_channel(b, mesh_grid, 1),
+               nir_channel(b, mesh_grid, 2)));
+   nir_def *index_count = nir_imul_imm(
+      b, group_total, layout->primitives_per_group * 3);
+   nir_store_global(
+      b, nir_vec4(b, index_count, nir_imm_int(b, 1), nir_imm_int(b, 0),
+                  nir_imm_int(b, 0)),
+      draw_params, .write_mask = 0xf, .align_mul = 4);
+   nir_pop_if(b, NULL);
+   nir_pop_if(b, NULL);
+
+   nir_push_else(b, NULL);
+   nir_push_if(b, nir_ieq_imm(b, lane, 0));
+   nir_store_global(b, nir_imm_zero(b, 4, 32), group_record,
+                    .write_mask = 0xf, .align_mul = 16);
+   nir_push_if(b, nir_ieq_imm(b, group, 0));
+   nir_store_global(b, nir_imm_zero(b, 4, 32), draw_params,
+                    .write_mask = 0xf, .align_mul = 4);
+   nir_pop_if(b, NULL);
+   nir_pop_if(b, NULL);
+   nir_pop_if(b, NULL);
+
    nir_barrier(b, .execution_scope = SCOPE_NONE,
                .memory_scope = SCOPE_DEVICE,
                .memory_semantics = NIR_MEMORY_RELEASE,
                .memory_modes = nir_var_mem_global);
-   nir_pop_if(b, NULL);
 }
 
 bool
@@ -407,12 +450,12 @@ hk_nir_mesh_emulation_pull_vs(const nir_shader_compiler_options *options)
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_VERTEX, options, "G13 software mesh pull VS");
    nir_def *params = nir_load_geometry_param_buffer_poly(&b);
-   nir_def *vertex_buffer =
+   nir_def *vertex_records =
       load_param(&b, params,
-                 offsetof(struct hk_mesh_emulation_params, vertex_buffer));
+                 offsetof(struct hk_mesh_emulation_params, vertex_records));
    nir_def *vertex = nir_load_vertex_id(&b);
    nir_def *address =
-      nir_ulea_agx(&b, vertex_buffer, vertex, nir_imm_int(&b, 4));
+      nir_ulea_agx(&b, vertex_records, vertex, nir_imm_int(&b, 4));
    nir_def *position = nir_load_global_constant(
       &b, 4, 32, address, .align_mul = 16,
       .access = ACCESS_CAN_SPECULATE);
@@ -499,11 +542,13 @@ hk_mesh_emulation_admission_create(
    admission->layout = layout;
 
    const uint32_t version = HK_MESH_EMULATION_ADMISSION_VERSION;
+   const uint32_t target = HK_MESH_EMULATION_TARGET_G13;
    const uint64_t producer_size = admission->producer_size;
    const uint64_t pull_vs_size = admission->pull_vs_size;
    blake3_hasher hasher;
    _mesa_blake3_init(&hasher);
    _mesa_blake3_update(&hasher, &version, sizeof(version));
+   _mesa_blake3_update(&hasher, &target, sizeof(target));
    _mesa_blake3_update(&hasher, &producer_size, sizeof(producer_size));
    _mesa_blake3_update(&hasher, admission->producer,
                        admission->producer_size);

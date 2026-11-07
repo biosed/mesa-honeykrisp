@@ -17,13 +17,28 @@
  * path will place its address in draw.geometry_params before dispatching the
  * lowered shader.  Keep this ABI independent of Vulkan application memory.
  */
-#define HK_MESH_EMULATION_ABI_VERSION 1u
+#define HK_MESH_EMULATION_ABI_VERSION 2u
+#define HK_MESH_EMULATION_TARGET_G13 13u
 
 struct hk_mesh_emulation_params {
-   uint64_t vertex_buffer;
+   uint64_t vertex_records;
+   uint64_t primitive_records;
    uint64_t index_buffer;
-   uint32_t group_count[3];
+   uint64_t group_records;
+   uint64_t task_records;
+   uint64_t draw_params;
+   uint32_t mesh_grid[3];
    uint32_t abi_version;
+};
+
+struct hk_mesh_emulation_group_record {
+   uint32_t vertex_count;
+   uint32_t primitive_count;
+   uint32_t vertex_base;
+   uint32_t primitive_base;
+   uint32_t task_index;
+   uint32_t flags;
+   uint32_t reserved[2];
 };
 
 struct hk_mesh_emulation_layout {

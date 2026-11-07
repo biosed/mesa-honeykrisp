@@ -9,6 +9,7 @@
 
 #include "hk_agx3_vdm_decode.h"
 #include "hk_device.h"
+#include "hk_mesh_emulation_direct.h"
 #include "hk_shader.h"
 #include "compiler/nir/nir_builder.h"
 #include "util/blob.h"
@@ -156,6 +157,43 @@ main(void)
       container_of(compiled_vk, struct hk_api_shader, vk);
    check_uploaded_pair(compiled);
 
+   const uint32_t direct_grid[3] = {2, 1, 1};
+   struct hk_mesh_emulation_direct_plan direct;
+   assert(hk_mesh_emulation_direct_plan_init(
+      dev->dev.chip, compiled, direct_grid, UINT64_C(0x100000), 4096,
+      UINT64_C(0x200000), 4096, UINT64_C(0x300000), 4096,
+      UINT64_C(0x400000), &direct));
+   assert(direct.producer == hk_main_mesh_variant(compiled));
+   assert(direct.raster == hk_rast_mesh_variant(compiled));
+   assert(direct.params.abi_version == HK_MESH_EMULATION_ABI_VERSION);
+   assert(direct.params.mesh_grid[0] == 2 &&
+          direct.params.mesh_grid[1] == 1 &&
+          direct.params.mesh_grid[2] == 1);
+   assert(direct.params.primitive_records == 0);
+   assert(direct.params.task_records == 0);
+   assert(direct.producer_grid.mode == AGX_CDM_MODE_DIRECT);
+   assert(direct.producer_grid.count[0] == 6 &&
+          direct.producer_grid.count[1] == 1 &&
+          direct.producer_grid.count[2] == 1);
+   assert(direct.producer_local_size.x == 3 &&
+          direct.producer_local_size.y == 1 &&
+          direct.producer_local_size.z == 1);
+   assert(direct.barrier == (AGX_BARRIER_ALL | AGX_PREGFX));
+   assert(direct.draw.indexed && agx_is_indirect(direct.draw.b));
+   assert(direct.draw.index_size == AGX_INDEX_SIZE_U32);
+   assert(direct.draw.b.ptr == UINT64_C(0x400000));
+   assert(direct.vertex_records_size_B == 96);
+   assert(direct.index_buffer_size_B == 24);
+   assert(direct.group_records_size_B == 64);
+   assert(!hk_mesh_emulation_direct_plan_init(
+      dev->dev.chip, compiled, direct_grid, UINT64_C(0x100000), 95,
+      UINT64_C(0x200000), 4096, UINT64_C(0x300000), 4096,
+      UINT64_C(0x400000), &direct));
+   assert(!hk_mesh_emulation_direct_plan_init(
+      AGX_CHIP_G14X, compiled, direct_grid, UINT64_C(0x100000), 4096,
+      UINT64_C(0x200000), 4096, UINT64_C(0x300000), 4096,
+      UINT64_C(0x400000), &direct));
+
    struct blob blob;
    blob_init(&blob);
    assert(compiled->vk.ops->serialize(&dev->vk, &compiled->vk, &blob));
@@ -180,6 +218,16 @@ main(void)
           hk_main_mesh_variant(second)->code_ptr);
    assert(hk_rast_mesh_variant(first)->code_ptr ==
           hk_rast_mesh_variant(second)->code_ptr);
+   assert(hk_main_mesh_variant(first)->code_size ==
+          hk_main_mesh_variant(compiled)->code_size);
+   assert(hk_rast_mesh_variant(first)->code_size ==
+          hk_rast_mesh_variant(compiled)->code_size);
+   assert(memcmp(hk_main_mesh_variant(first)->code_ptr,
+                 hk_main_mesh_variant(compiled)->code_ptr,
+                 hk_main_mesh_variant(first)->code_size) == 0);
+   assert(memcmp(hk_rast_mesh_variant(first)->code_ptr,
+                 hk_rast_mesh_variant(compiled)->code_ptr,
+                 hk_rast_mesh_variant(first)->code_size) == 0);
    assert(hk_main_mesh_variant(first)->only_linked !=
           hk_main_mesh_variant(second)->only_linked);
    assert(hk_rast_mesh_variant(first)->only_linked !=

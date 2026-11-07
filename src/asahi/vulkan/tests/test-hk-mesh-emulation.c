@@ -124,15 +124,21 @@ test_triangle(void)
    assert(layout.indices == 128);
    assert(layout.shared_size == 192);
    assert(b.shader->info.shared_size == layout.shared_size);
-   assert(offsetof(struct hk_mesh_emulation_params, vertex_buffer) == 0);
-   assert(offsetof(struct hk_mesh_emulation_params, index_buffer) == 8);
-   assert(offsetof(struct hk_mesh_emulation_params, group_count) == 16);
-   assert(offsetof(struct hk_mesh_emulation_params, abi_version) == 28);
-   assert(sizeof(struct hk_mesh_emulation_params) == 32);
+   assert(offsetof(struct hk_mesh_emulation_params, vertex_records) == 0);
+   assert(offsetof(struct hk_mesh_emulation_params, primitive_records) == 8);
+   assert(offsetof(struct hk_mesh_emulation_params, index_buffer) == 16);
+   assert(offsetof(struct hk_mesh_emulation_params, group_records) == 24);
+   assert(offsetof(struct hk_mesh_emulation_params, task_records) == 32);
+   assert(offsetof(struct hk_mesh_emulation_params, draw_params) == 40);
+   assert(offsetof(struct hk_mesh_emulation_params, mesh_grid) == 48);
+   assert(offsetof(struct hk_mesh_emulation_params, abi_version) == 60);
+   assert(sizeof(struct hk_mesh_emulation_params) == 64);
+   assert(sizeof(struct hk_mesh_emulation_group_record) == 32);
 
    unsigned geometry_params = 0;
    unsigned global_constants = 0;
    unsigned global_stores = 0;
+   unsigned zero_global_stores = 0;
    unsigned barriers = 0;
    unsigned mesh_intrinsics = 0;
    unsigned leas = 0;
@@ -152,6 +158,17 @@ test_triangle(void)
             global_constants +=
                intr->intrinsic == nir_intrinsic_load_global_constant;
             global_stores += intr->intrinsic == nir_intrinsic_store_global;
+            if (intr->intrinsic == nir_intrinsic_store_global) {
+               const nir_const_value *value =
+                  nir_src_as_const_value(intr->src[0]);
+               bool all_zero = value != NULL;
+               for (unsigned c = 0;
+                    all_zero && c < intr->src[0].ssa->num_components; ++c) {
+                  all_zero &= nir_const_value_as_uint(
+                                 value[c], intr->src[0].ssa->bit_size) == 0;
+               }
+               zero_global_stores += all_zero;
+            }
             barriers += intr->intrinsic == nir_intrinsic_barrier;
             mesh_intrinsics +=
                intr->intrinsic == nir_intrinsic_store_per_vertex_output ||
@@ -163,11 +180,14 @@ test_triangle(void)
    }
 
    assert(geometry_params == 1);
-   assert(global_constants == 4);
-   assert(global_stores == 4);
+   assert(global_constants == 6);
+   assert(global_stores == 8);
+   /* The ABI-mismatch arm explicitly clears both group counts/bases and the
+    * GPU-resident indexed-draw header, so stale allocations draw nothing. */
+   assert(zero_global_stores == 2);
    assert(barriers >= 3);
    assert(mesh_intrinsics == 0);
-   assert(leas == 4);
+   assert(leas == 5);
 
    NIR_PASS(_, b.shader, nir_shader_intrinsics_pass, lower_driver_sysvals,
             nir_metadata_control_flow, NULL);
