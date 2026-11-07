@@ -408,6 +408,68 @@ lower_mesh_task_interface(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
+static nir_def *
+mesh_task_global_id(nir_builder *b, unsigned bit_size)
+{
+   nir_def *group = nir_u2uN(b, nir_load_workgroup_id(b), bit_size);
+   nir_def *local = nir_u2uN(b, nir_load_local_invocation_id(b), bit_size);
+   nir_def *size = nir_imm_ivec3(
+      b, b->shader->info.workgroup_size[0],
+      b->shader->info.workgroup_size[1],
+      b->shader->info.workgroup_size[2]);
+   return nir_iadd(b, nir_imul(b, group, nir_u2uN(b, size, bit_size)), local);
+}
+
+/* Derived compute IDs must be expanded while WorkGroupId still denotes the
+ * Vulkan mesh identity.  If left until the ordinary compute preprocessing
+ * pass, that pass would derive them from the compact physical 1-D dispatch
+ * introduced by task lowering rather than the reconstructed task child grid. */
+static bool
+lower_mesh_task_derived_ids(nir_builder *b, nir_intrinsic_instr *intr,
+                            UNUSED void *data)
+{
+   const unsigned bit_size = intr->def.bit_size;
+   nir_def *value;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_global_invocation_id:
+      value = mesh_task_global_id(b, bit_size);
+      break;
+   case nir_intrinsic_load_global_invocation_index: {
+      nir_def *global = mesh_task_global_id(b, bit_size);
+      nir_def *groups = nir_u2uN(b, nir_load_num_workgroups(b), bit_size);
+      nir_def *size = nir_imm_ivec3(
+         b, b->shader->info.workgroup_size[0],
+         b->shader->info.workgroup_size[1],
+         b->shader->info.workgroup_size[2]);
+      nir_def *global_size = nir_imul(b, groups,
+                                      nir_u2uN(b, size, bit_size));
+      value = nir_imul(b, nir_channel(b, global, 2),
+                       nir_channel(b, global_size, 1));
+      value = nir_iadd(b, nir_channel(b, global, 1), value);
+      value = nir_imul(b, nir_channel(b, global_size, 0), value);
+      value = nir_iadd(b, nir_channel(b, global, 0), value);
+      break;
+   }
+   case nir_intrinsic_load_workgroup_index: {
+      nir_def *group = nir_u2uN(b, nir_load_workgroup_id(b), bit_size);
+      nir_def *groups = nir_u2uN(b, nir_load_num_workgroups(b), bit_size);
+      value = nir_imul(b, nir_channel(b, group, 2),
+                       nir_channel(b, groups, 1));
+      value = nir_iadd(b, nir_channel(b, group, 1), value);
+      value = nir_imul(b, nir_channel(b, groups, 0), value);
+      value = nir_iadd(b, nir_channel(b, group, 0), value);
+      break;
+   }
+   default:
+      return false;
+   }
+
+   nir_def_replace(&intr->def, value);
+   return true;
+}
+
 /* Every command-owned record region is bounded to UINT32_MAX bytes before
  * submission.  Keep the shader address arithmetic in that same checked
  * domain and use AGX's grounded base + u32 offset form, including for strides
@@ -737,6 +799,15 @@ export_scratch(nir_builder *b,
    nir_pop_if(b, NULL);
    nir_pop_if(b, NULL);
 
+   /* The generic indirect-count predicate copies all five indexed-draw
+    * dwords.  The producer above owns the first four; define firstInstance as
+    * zero explicitly so draw_params no longer relies on a CPU-side clear. */
+   nir_push_if(b, nir_ieq_imm(b, lane, 0));
+   nir_store_global(b, nir_imm_int(b, 0),
+                    nir_iadd_imm(b, draw_record, 16),
+                    .write_mask = 1, .align_mul = 4);
+   nir_pop_if(b, NULL);
+
    nir_barrier(b, .execution_scope = SCOPE_NONE,
                .memory_scope = SCOPE_DEVICE,
                .memory_semantics = NIR_MEMORY_RELEASE,
@@ -1010,6 +1081,8 @@ hk_nir_lower_mesh_emulation(
    initialize_scratch(&prologue, &layout, threads);
 
    if (layout.task_payload_size_B) {
+      nir_shader_intrinsics_pass(
+         shader, lower_mesh_task_derived_ids, nir_metadata_none, NULL);
       nir_shader_intrinsics_pass(
          shader, lower_mesh_task_interface, nir_metadata_none, &layout);
    }

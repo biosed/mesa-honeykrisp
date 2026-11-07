@@ -1225,14 +1225,14 @@ hk_get_device_properties(const struct agx_device *dev,
 
 
       .maxTaskWorkGroupTotalCount =
-         g13_mesh && task ? HK_G13_MESH_MAX_GROUP_TOTAL
+         g13_mesh && task ? HK_G13_TASK_MAX_GROUP_TOTAL
                           : (task ? 1u << 22 : 0),
       .maxTaskWorkGroupCount = {
-         g13_mesh && task ? HK_G13_MESH_MAX_GROUP_TOTAL
+         g13_mesh && task ? HK_G13_TASK_MAX_GROUP_TOTAL
                           : (task ? 65535 : 0),
-         g13_mesh && task ? HK_G13_MESH_MAX_GROUP_TOTAL
+         g13_mesh && task ? HK_G13_TASK_MAX_GROUP_TOTAL
                           : (task ? 65535 : 0),
-         g13_mesh && task ? HK_G13_MESH_MAX_GROUP_TOTAL
+         g13_mesh && task ? HK_G13_TASK_MAX_GROUP_TOTAL
                           : (task ? 65535 : 0),
       },
       .maxTaskWorkGroupInvocations =
@@ -2103,8 +2103,8 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    /* Experimental and deliberately non-conformant: the G13 software path is
     * public only for API/pipeline bring-up. Its queried limits describe the
     * bounded direct-global varying and task/mesh GPU-count implementation and
-    * remain below VK_EXT_mesh_shader Required_Limits until the fixed 4096-group
-    * cap and O(cap) raster recording are removed. */
+    * remain below VK_EXT_mesh_shader Required_Limits until the 4096 input-task
+    * / 2048 emitted-mesh caps and O(cap) raster recording are removed. */
    supported_extensions.EXT_mesh_shader =
       (hk_g13_software_mesh_supported(pdev->dev.chip) &&
        debug_get_bool_option("ASAHI_G13_SOFTWARE_MESH", false)) ||

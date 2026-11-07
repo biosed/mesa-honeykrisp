@@ -19,8 +19,8 @@ struct hk_shader;
  * than VK_EXT_mesh_shader Required_Limits and is exposed only by the explicit
  * bring-up option.  The varying path has submitted-pixel proof; task payload,
  * indirect producer and overflow sanitization are offline-qualified only. */
-#define HK_G13_MESH_MAX_GROUP_TOTAL \
-   HK_MESH_EMULATION_MAX_EMITTED_GROUPS
+#define HK_G13_TASK_MAX_GROUP_TOTAL HK_MESH_EMULATION_MAX_TASK_GROUPS
+#define HK_G13_MESH_MAX_GROUP_TOTAL HK_MESH_EMULATION_MAX_EMITTED_GROUPS
 #define HK_G13_MESH_MAX_GROUP_COUNT        65535u
 #define HK_G13_MESH_MAX_INVOCATIONS \
    HK_MESH_EMULATION_MAX_WORKGROUP_INVOCATIONS

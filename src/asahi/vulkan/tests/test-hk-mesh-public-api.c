@@ -117,7 +117,7 @@ check_limits(const VkPhysicalDeviceMeshShaderPropertiesEXT *p)
    assert(p->maxTaskPayloadSize == 4096);
    assert(p->maxTaskSharedMemorySize == 28 * 1024);
    assert(p->maxTaskPayloadAndSharedMemorySize == 32 * 1024);
-   assert(p->maxMeshWorkGroupTotalCount == 4096);
+   assert(p->maxMeshWorkGroupTotalCount == 2048);
    for (unsigned i = 0; i < 3; ++i) {
       assert(p->maxMeshWorkGroupCount[i] == 65535);
    }

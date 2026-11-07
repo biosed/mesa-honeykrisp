@@ -226,9 +226,9 @@ test_triangle(void)
    assert(geometry_params >= 1);
    assert(global_constants >= 6);
    assert(global_stores >= 8);
-   /* The ABI-mismatch arm explicitly clears both group counts/bases and the
-    * GPU-resident indexed-draw header, so stale allocations draw nothing. */
-   assert(zero_global_stores == 2);
+   /* The ABI-mismatch arm clears group/draw headers, and the producer always
+    * defines the indexed draw's fifth firstInstance dword. */
+   assert(zero_global_stores == 3);
    assert(barriers >= 3);
    assert(mesh_intrinsics == 0);
 
@@ -669,17 +669,21 @@ test_task_producer(void)
    task_producer_binary_size = compile_producer(b.shader);
 
    /* A huge child grid takes the cap+1 failure sentinel.  Its generated map
-    * loop has zero iterations on that arm and remains bounded at 4096 for
+    * loop has zero iterations on that arm and remains bounded at 2048 for
     * every admitted launch; lowering and AGX2 compile must terminate. */
-   nir_builder first_overflow = task_builder(4097, 1, 1);
+   nir_builder first_overflow = task_builder(2049, 1, 1);
    assert(hk_nir_lower_task_emulation(first_overflow.shader, NULL));
    assert(compile_producer(first_overflow.shader) > 0);
 
-   /* Two task workgroups emitting 3000 children each exercise the aggregate
+   nir_builder former_cap_overflow = task_builder(4097, 1, 1);
+   assert(hk_nir_lower_task_emulation(former_cap_overflow.shader, NULL));
+   assert(compile_producer(former_cap_overflow.shader) > 0);
+
+   /* Two task workgroups emitting 1200 children each exercise the aggregate
     * overflow arm at execution time.  Lowering is independent of the parent
     * grid and must keep the same bounded sentinel/map loop; the command test
     * records its post-task overflow sanitizer before the indirect mesh kick. */
-   nir_builder aggregate_overflow = task_builder(3000, 1, 1);
+   nir_builder aggregate_overflow = task_builder(1200, 1, 1);
    assert(hk_nir_lower_task_emulation(aggregate_overflow.shader, NULL));
    assert(compile_producer(aggregate_overflow.shader) > 0);
 
@@ -700,7 +704,16 @@ test_task_mesh_interface(void)
    b.shader->info.outputs_written |= VARYING_BIT_VAR(0);
    nir_def *word = nir_load_task_payload(
       &b, 1, 32, nir_imm_int(&b, 0), .align_mul = 4);
-   nir_def *value = nir_replicate(&b, word, 4);
+   nir_def *global_id = nir_load_global_invocation_id(&b, 32);
+   nir_def *global_index = nir_load_global_invocation_index(&b, 32);
+   nir_def *workgroup_index = nir_load_workgroup_index(&b);
+   nir_def *derived = nir_iadd(
+      &b,
+      nir_iadd(&b, nir_channel(&b, global_id, 0),
+               nir_channel(&b, global_id, 1)),
+      nir_iadd(&b, nir_channel(&b, global_id, 2),
+               nir_iadd(&b, global_index, workgroup_index)));
+   nir_def *value = nir_replicate(&b, nir_iadd(&b, word, derived), 4);
    nir_store_per_vertex_output(
       &b, value, nir_load_local_invocation_index(&b), nir_imm_int(&b, 0),
       .write_mask = 0xf, .src_type = nir_type_float32,
@@ -711,6 +724,8 @@ test_task_mesh_interface(void)
    assert(layout.task_payload_size_B == 256);
    unsigned payload_ops = 0;
    unsigned global_loads = 0;
+   unsigned stale_derived_ids = 0;
+   unsigned stale_num_workgroups = 0;
    nir_foreach_function_impl(impl, b.shader) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
@@ -719,10 +734,19 @@ test_task_mesh_interface(void)
             nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
             payload_ops += intr->intrinsic == nir_intrinsic_load_task_payload;
             global_loads += intr->intrinsic == nir_intrinsic_load_global;
+            stale_derived_ids +=
+               intr->intrinsic == nir_intrinsic_load_global_invocation_id ||
+               intr->intrinsic ==
+                  nir_intrinsic_load_global_invocation_index ||
+               intr->intrinsic == nir_intrinsic_load_workgroup_index;
+            stale_num_workgroups +=
+               intr->intrinsic == nir_intrinsic_load_num_workgroups;
          }
       }
    }
    assert(payload_ops == 0);
+   assert(stale_derived_ids == 0);
+   assert(stale_num_workgroups == 0);
    assert(global_loads >= 4);
    task_mesh_binary_size = compile_producer(b.shader);
 }

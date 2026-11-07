@@ -327,11 +327,14 @@ main(void)
    struct hk_mesh_emulation_direct_plan task_plan;
    assert(hk_mesh_emulation_task_requirements(
       dev->dev.chip, task, payload_mesh, task_grid, &task_plan));
-   assert(task_plan.task && task_plan.draw_count == 4096);
+   assert(task_plan.task &&
+          task_plan.draw_count == HK_G13_MESH_MAX_GROUP_TOTAL);
    assert(task_plan.task_records_size_B == 272);
-   assert(task_plan.group_to_task_size_B == 4096 * 8);
+   assert(task_plan.group_to_task_size_B ==
+          HK_G13_MESH_MAX_GROUP_TOTAL * 8);
    assert(task_plan.draw_params_size_B ==
-          4096 * sizeof(VkDrawIndexedIndirectCommand));
+          HK_G13_MESH_MAX_GROUP_TOTAL *
+             sizeof(VkDrawIndexedIndirectCommand));
    assert(task_plan.patched_draw_params_size_B ==
           task_plan.draw_params_size_B);
    assert(task_plan.task_grid.mode == AGX_CDM_MODE_DIRECT);
@@ -367,6 +370,58 @@ main(void)
    assert(task_plan.producer_grid.ptr ==
           UINT64_C(0xa0000000) +
              offsetof(struct hk_mesh_emulation_params, mesh_grid));
+
+   /* Title-wide paired extrema (key 1515d800ca824dec): 64V/126P,
+    * 52 per-vertex components, strides 224/16/224 and 3200-byte task
+    * payload.  2048 emitted groups is the largest power-of-two cap that
+    * keeps this exact 102616-byte/group layout under the 256-MiB recorder
+    * budget while retaining 4096 input task groups. */
+   struct hk_shader *task_variant = &task->variants[0];
+   struct hk_shader *payload_main = hk_main_mesh_variant(payload_mesh);
+   struct hk_shader *payload_rast = hk_rast_mesh_variant(payload_mesh);
+   const struct hk_mesh_info saved_title_main = payload_main->info.mesh;
+   const uint32_t saved_title_rast_stride =
+      payload_rast->info.mesh.vertex_stride_B;
+   const uint32_t saved_task_payload =
+      task_variant->info.mesh.payload_size_B;
+   task_variant->info.mesh.payload_size_B = 3200;
+   payload_main->info.mesh.payload_size_B = 3200;
+   payload_main->info.mesh.max_vertices = 64;
+   payload_main->info.mesh.max_primitives = 126;
+   payload_main->info.mesh.vertex_stride_B = 224;
+   payload_main->info.mesh.primitive_stride_B = 16;
+   payload_rast->info.mesh.vertex_stride_B = 224;
+   const uint32_t max_task_grid[3] = {
+      HK_G13_TASK_MAX_GROUP_TOTAL, 1, 1,
+   };
+   struct hk_mesh_emulation_direct_plan title_plan;
+   assert(hk_mesh_emulation_task_requirements(
+      dev->dev.chip, task, payload_mesh, max_task_grid, &title_plan));
+   assert(title_plan.draw_count == HK_G13_MESH_MAX_GROUP_TOTAL);
+   const uint64_t group_dependent =
+      title_plan.vertex_records_size_B +
+      title_plan.primitive_records_size_B +
+      title_plan.expanded_records_size_B +
+      title_plan.index_buffer_size_B +
+      title_plan.group_records_size_B +
+      title_plan.group_to_task_size_B +
+      title_plan.draw_params_size_B +
+      title_plan.patched_draw_params_size_B;
+   assert(group_dependent % title_plan.draw_count == 0);
+   assert(group_dependent / title_plan.draw_count == 102616);
+   assert(title_plan.scratch_size_B <= HK_G13_MESH_MAX_SCRATCH_SIZE);
+   assert(title_plan.scratch_size_B + group_dependent >
+          HK_G13_MESH_MAX_SCRATCH_SIZE);
+   const uint32_t too_many_input_task_groups[3] = {
+      HK_G13_TASK_MAX_GROUP_TOTAL + 1, 1, 1,
+   };
+   assert(!hk_mesh_emulation_task_requirements(
+      dev->dev.chip, task, payload_mesh, too_many_input_task_groups,
+      &task_plan));
+   task_variant->info.mesh.payload_size_B = saved_task_payload;
+   payload_main->info.mesh = saved_title_main;
+   payload_rast->info.mesh.vertex_stride_B = saved_title_rast_stride;
+
    assert(!hk_mesh_emulation_task_requirements(
       AGX_CHIP_G14X, task, payload_mesh, task_grid, &task_plan));
 

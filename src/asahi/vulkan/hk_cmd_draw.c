@@ -12844,7 +12844,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
                      mesh_draw->task_grid_dest,
                      mesh_draw->task_overflow_addr,
                      mesh_draw->task_grid_source,
-                     HK_G13_MESH_MAX_GROUP_TOTAL);
+                     HK_G13_TASK_MAX_GROUP_TOTAL);
                }
                hk_dispatch_with_local_size(
                   cmd, ccs, (struct hk_shader *)plan->task_producer,
@@ -13107,7 +13107,7 @@ hk_cmd_draw_mesh_g13_task(struct hk_cmd_buffer *cmd,
    struct hk_api_shader *task = gfx->shaders[MESA_SHADER_TASK];
    struct hk_api_shader *mesh = gfx->shaders[MESA_SHADER_MESH];
    const uint32_t indirect_allocation_count[3] = {
-      HK_G13_MESH_MAX_GROUP_TOTAL, 1, 1,
+      HK_G13_TASK_MAX_GROUP_TOTAL, 1, 1,
    };
    const uint32_t *allocation_count = indirect_grid
       ? indirect_allocation_count : task_group_count;
@@ -13129,24 +13129,30 @@ hk_cmd_draw_mesh_g13_task(struct hk_cmd_buffer *cmd,
       return false;
    }
 
-#define ALLOC_ZERO(name, size, alignment)                                     \
+#define ALLOC_SCRATCH(name, size, alignment)                                  \
    struct agx_ptr name = hk_pool_alloc(cmd, (size), (alignment));             \
    if (!name.cpu) {                                                            \
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);   \
       return false;                                                            \
-   }                                                                           \
-   memset(name.cpu, 0, (size))
+   }
 
-   ALLOC_ZERO(vertex_records, req.vertex_records_size_B, 16);
-   ALLOC_ZERO(primitive_records, req.primitive_records_size_B, 16);
-   ALLOC_ZERO(expanded_records, req.expanded_records_size_B, 16);
-   ALLOC_ZERO(index_buffer, req.index_buffer_size_B, 4);
-   ALLOC_ZERO(group_records, req.group_records_size_B, 32);
-   ALLOC_ZERO(task_records, req.task_records_size_B, 16);
-   ALLOC_ZERO(group_to_task, req.group_to_task_size_B, 8);
-   ALLOC_ZERO(draw_params, req.draw_params_size_B, 4);
-   ALLOC_ZERO(patched_draw_params, req.patched_draw_params_size_B, 4);
-#undef ALLOC_ZERO
+   /* Do not CPU-clear tens of MiB of GPU-owned scratch per task draw.  Task
+    * workgroups write every consumed header/map entry; payload and source
+    * vertex/primitive fields are application outputs and are undefined by
+    * Vulkan when the application did not write them.  Mesh writes every
+    * consumed expanded vertex, U32 index and all five source draw dwords; the
+    * predicate writes all five dwords of every patched draw record. Overflow
+    * sanitization prevents any unmapped record from reaching mesh/raster. */
+   ALLOC_SCRATCH(vertex_records, req.vertex_records_size_B, 16);
+   ALLOC_SCRATCH(primitive_records, req.primitive_records_size_B, 16);
+   ALLOC_SCRATCH(expanded_records, req.expanded_records_size_B, 16);
+   ALLOC_SCRATCH(index_buffer, req.index_buffer_size_B, 4);
+   ALLOC_SCRATCH(group_records, req.group_records_size_B, 32);
+   ALLOC_SCRATCH(task_records, req.task_records_size_B, 16);
+   ALLOC_SCRATCH(group_to_task, req.group_to_task_size_B, 8);
+   ALLOC_SCRATCH(draw_params, req.draw_params_size_B, 4);
+   ALLOC_SCRATCH(patched_draw_params, req.patched_draw_params_size_B, 4);
+#undef ALLOC_SCRATCH
 
    const struct agx_ptr params =
       hk_pool_alloc(cmd, sizeof(struct hk_mesh_emulation_params), 16);
@@ -13175,6 +13181,7 @@ hk_cmd_draw_mesh_g13_task(struct hk_cmd_buffer *cmd,
    if (indirect_grid)
       memset(plan.params.task_grid, 0, sizeof(plan.params.task_grid));
 
+   memset(params.cpu, 0, sizeof(plan.params));
    memcpy(params.cpu, &plan.params, sizeof(plan.params));
    assert(plan.params.reserved[0] == 0 && plan.params.reserved[1] == 0 &&
           plan.params.reserved[2] == 0 && plan.params.reserved[3] == 0);

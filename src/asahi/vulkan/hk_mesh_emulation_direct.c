@@ -234,7 +234,7 @@ hk_mesh_emulation_task_requirements(
       task_threads[i] = task_group_count[i] * local;
       tasks *= task_group_count[i];
    }
-   if (tasks > HK_G13_MESH_MAX_GROUP_TOTAL)
+   if (tasks > HK_G13_TASK_MAX_GROUP_TOTAL)
       return false;
 
    const uint64_t groups = HK_G13_MESH_MAX_GROUP_TOTAL;
