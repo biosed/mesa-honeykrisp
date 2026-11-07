@@ -57,6 +57,24 @@ if with_tools.contains('drm-shim')
 endif
 
 if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
+  # Compile, upload and shader-binary-cache round-trip the G13 software-mesh
+  # producer/pull-VS pair without advertising or executing mesh commands.
+  test(
+    'hk-g13-mesh-emulation-device-cache',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      hk_mesh_emulation_device_test,
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g13x',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
   # Graphics-path copies from one layer of a block-compressed image into a
   # compressed G17P image; encoded and stream-validated, not executed.
   test(

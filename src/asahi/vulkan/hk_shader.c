@@ -5481,8 +5481,12 @@ hk_shader_destroy(struct hk_device *dev, struct hk_shader *s,
    if (owns_payload) {
       free((void *)s->code_ptr);
       free((void *)s->data_ptr);
-      agx_bo_unreference(&dev->dev, s->bo);
    }
+
+   /* A binary-cache wrapper borrows immutable code/data, but always owns any
+    * executable/preamble upload that hk_upload_shader() built for it. Cache
+    * templates are CPU-only and therefore keep bo == NULL. */
+   agx_bo_unreference(&dev->dev, s->bo);
 
    simple_mtx_destroy(&s->linked.lock);
    free(s->g17p_mono_nir);
@@ -6034,8 +6038,15 @@ hk_compile_g13_mesh_emulation(
       main->info.mesh.local_size[i] = producer->info.workgroup_size[i];
 
    /* The admission lowering introduces shared/global operations after the
-    * API shader's ordinary preprocessing pass. */
+    * API shader's ordinary preprocessing pass.  It also introduces compute
+    * system values while converting the mesh stage to the producer compute
+    * stage, so lower those values after preprocessing just like
+    * hk_preprocess_nir() does for an application compute shader. */
    agx_preprocess_nir(producer);
+   const nir_lower_compute_system_values_options csv_options = {
+      .has_base_workgroup_id = true,
+   };
+   NIR_PASS(_, producer, nir_lower_compute_system_values, &csv_options);
 
    VkResult result = hk_compile_nir(
       dev, pAllocator, producer, info->flags, info->robustness, NULL, features,
@@ -7385,8 +7396,13 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
     * copying/uploading an executable or eagerly linking it, so the caller
     * can deserialize once with the final object's allocation callbacks.
     * VK_NOT_READY is private to this probe and is consumed by the wrapper. */
+   const bool g13_mesh_single_link =
+      info.stage == MESA_SHADER_MESH &&
+      (dev->dev.chip == AGX_CHIP_G13G ||
+       dev->dev.chip == AGX_CHIP_G13X);
    if (cache_candidate &&
-       (b_info.has_preamble || b_info.rodata.size_16 || !shader->linked.ht))
+       (b_info.has_preamble || b_info.rodata.size_16) &&
+       !g13_mesh_single_link)
       return VK_NOT_READY;
 
    shader->b.info = b_info;
@@ -7415,6 +7431,15 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
       return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
 
    shader->b.binary = (void *)shader->code_ptr;
+   if (cache_candidate) {
+      /* A cache template owns immutable CPU payload only.  Dynamic
+       * vertex/fragment link tables are created lazily by its wrappers;
+       * the bounded G13 mesh pair instead gives each wrapper an eager,
+       * private upload in hk_shader_binary_cache_clone(). */
+      shader->compiled = true;
+      return VK_SUCCESS;
+   }
+
    result = hk_upload_shader(dev, shader);
    if (result != VK_SUCCESS)
       return vk_error(dev, result);
@@ -7633,7 +7658,8 @@ hk_shader_binary_cache_find_locked(struct hk_device *dev,
 }
 
 static bool
-hk_shader_binary_payload_cacheable(struct hk_api_shader *obj)
+hk_shader_binary_payload_cacheable(struct hk_device *dev,
+                                   struct hk_api_shader *obj)
 {
    /* A cached payload is immutable CPU code/data only.  Hardware allocations
     * and eager linked variants keep their existing per-object ownership. */
@@ -7641,7 +7667,12 @@ hk_shader_binary_payload_cacheable(struct hk_api_shader *obj)
       /* A never-compiled variant carries nothing to share. */
       if (!shader->compiled)
          continue;
-      if (shader->bo || shader->only_linked || !shader->linked.ht)
+      const bool g13_mesh_single_link =
+         obj->vk.stage == MESA_SHADER_MESH &&
+         (dev->dev.chip == AGX_CHIP_G13G ||
+          dev->dev.chip == AGX_CHIP_G13X);
+      if (shader->bo || shader->only_linked ||
+          (!shader->linked.ht && !g13_mesh_single_link))
          return false;
    }
 
@@ -7734,7 +7765,28 @@ hk_shader_binary_cache_clone(struct hk_device *dev,
       simple_mtx_init(&dst->linked.lock, mtx_plain);
       /* Every compiled variant links on demand, including one whose main
        * compiled to zero bytes. */
-      dst->linked.lazy_ht = src->compiled;
+      if (src->linked.ht)
+         dst->linked.lazy_ht = src->compiled;
+   }
+
+   /* Initialize every mutex before an upload can fail: object destruction
+    * always walks all variants.  G13 mesh variants have one fixed linked
+    * executable rather than a dynamic vertex/fragment link table, so each
+    * wrapper uploads its own while borrowing only the immutable payload. */
+   for (unsigned i = 0; i < hk_api_num_variants(src_obj); ++i) {
+      struct hk_shader *dst = &obj->variants[i];
+      const struct hk_shader *src = &src_obj->variants[i];
+      if (!src->compiled || src->linked.ht)
+         continue;
+
+      assert(src_obj->vk.stage == MESA_SHADER_MESH);
+      assert(dev->dev.chip == AGX_CHIP_G13G ||
+             dev->dev.chip == AGX_CHIP_G13X);
+      VkResult result = hk_upload_shader(dev, dst);
+      if (result != VK_SUCCESS) {
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return vk_error(dev, result);
+      }
    }
 
    *shader_out = &obj->vk;
@@ -7806,7 +7858,7 @@ hk_deserialize_api_shader(struct vk_device *vk_dev, struct blob_reader *blob,
          ? container_of(template_vk, struct hk_api_shader, vk)
          : NULL;
       if (result == VK_SUCCESS &&
-          hk_shader_binary_payload_cacheable(template_obj)) {
+          hk_shader_binary_payload_cacheable(dev, template_obj)) {
          struct hk_shader_binary_cache_entry *new_entry =
             calloc(1, sizeof(*new_entry));
          if (new_entry)

@@ -1,0 +1,205 @@
+/*
+ * Copyright 2026 Aurora Silicon
+ * SPDX-License-Identifier: MIT
+ *
+ * Game-free G13 drm-shim fixture for the software-mesh shader pair.  It uses
+ * Honeykrisp's real device shader callbacks, code heap and binary cache, but
+ * never records or submits a command buffer.
+ */
+
+#include "hk_agx3_vdm_decode.h"
+#include "hk_device.h"
+#include "hk_shader.h"
+#include "compiler/nir/nir_builder.h"
+#include "util/blob.h"
+#include "vk_shader.h"
+
+#undef NDEBUG
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <vulkan/vulkan.h>
+
+#define CHECK(call)                                                            \
+   do {                                                                        \
+      VkResult result_ = (call);                                               \
+      if (result_ != VK_SUCCESS) {                                             \
+         fprintf(stderr, "%s: %d\n", #call, result_);                         \
+         exit(2);                                                              \
+      }                                                                        \
+   } while (0)
+
+static nir_shader *
+triangle_mesh(void)
+{
+   static const nir_shader_compiler_options options = {0};
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_MESH, &options, "G13 device-cache mesh triangle");
+   b.shader->info.io_lowered = true;
+   b.shader->info.workgroup_size[0] = 3;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.mesh.max_vertices_out = 3;
+   b.shader->info.mesh.max_primitives_out = 1;
+   b.shader->info.mesh.primitive_type = MESA_PRIM_TRIANGLES;
+   b.shader->info.outputs_written =
+      VARYING_BIT_POS | VARYING_BIT_PRIMITIVE_INDICES;
+   b.shader->info.per_primitive_outputs = VARYING_BIT_PRIMITIVE_INDICES;
+
+   nir_def *lane = nir_load_local_invocation_index(&b);
+   nir_set_vertex_and_primitive_count(
+      &b, nir_imm_int(&b, 3), nir_imm_int(&b, 1), nir_imm_int(&b, 0));
+   nir_store_per_vertex_output(
+      &b, nir_vec4(&b, nir_i2f32(&b, lane), nir_imm_float(&b, 0.0f),
+                   nir_imm_float(&b, 0.0f), nir_imm_float(&b, 1.0f)),
+      lane, nir_imm_int(&b, 0), .write_mask = 0xf,
+      .src_type = nir_type_float32,
+      .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+   nir_push_if(&b, nir_ieq_imm(&b, lane, 0));
+   nir_store_per_primitive_output(
+      &b, nir_imm_ivec3(&b, 0, 1, 2), nir_imm_int(&b, 0),
+      nir_imm_int(&b, 0), .write_mask = 0x7,
+      .src_type = nir_type_uint32,
+      .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES,
+                       .num_slots = 1});
+   nir_pop_if(&b, NULL);
+   nir_shader_gather_info(b.shader, b.impl);
+   return b.shader;
+}
+
+static void
+check_uploaded_pair(const struct hk_api_shader *obj)
+{
+   assert(obj->vk.stage == MESA_SHADER_MESH);
+   assert(hk_api_num_variants(obj) == HK_MESH_VARIANTS);
+
+   const struct hk_shader *main = &obj->variants[HK_MESH_VARIANT_MAIN];
+   const struct hk_shader *rast = &obj->variants[HK_MESH_VARIANT_RAST];
+   const struct hk_shader *predicated =
+      &obj->variants[HK_MESH_VARIANT_PREDICATED_OBJECT];
+
+   assert(main->compiled && rast->compiled && !predicated->compiled);
+   assert(main->info.stage == MESA_SHADER_MESH);
+   assert(rast->info.stage == MESA_SHADER_MESH);
+   assert(main->b.info.stage == MESA_SHADER_COMPUTE);
+   assert(rast->b.info.stage == MESA_SHADER_VERTEX);
+   assert(main->code_ptr && main->code_size && main->only_linked);
+   assert(rast->code_ptr && rast->code_size && rast->only_linked);
+   assert(main->only_linked->b.bo && rast->only_linked->b.bo);
+   assert(!predicated->code_ptr && !predicated->only_linked);
+}
+
+static struct hk_api_shader *
+deserialize(struct hk_device *dev, const void *data, size_t size)
+{
+   struct blob_reader reader;
+   blob_reader_init(&reader, data, size);
+   struct vk_shader *shader = NULL;
+   CHECK(dev->vk.shader_ops->deserialize(
+      &dev->vk, &reader, hk_shader_binary_version(dev->dev.chip), NULL,
+      &shader));
+   assert(reader.current == reader.end);
+   return container_of(shader, struct hk_api_shader, vk);
+}
+
+int
+main(void)
+{
+   setbuf(stdout, NULL);
+   assert(getenv("ASAHI_SHIM_CHIP") && getenv("LD_PRELOAD"));
+
+   VkApplicationInfo app = {
+      .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+      .apiVersion = VK_API_VERSION_1_3,
+   };
+   VkInstanceCreateInfo ici = {
+      .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+      .pApplicationInfo = &app,
+   };
+   VkInstance instance;
+   CHECK(vkCreateInstance(&ici, NULL, &instance));
+
+   uint32_t count = 1;
+   VkPhysicalDevice physical;
+   CHECK(vkEnumeratePhysicalDevices(instance, &count, &physical));
+   assert(count == 1);
+
+   float priority = 1.0f;
+   VkDeviceQueueCreateInfo queue = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+      .queueFamilyIndex = 0,
+      .queueCount = 1,
+      .pQueuePriorities = &priority,
+   };
+   VkDeviceCreateInfo dci = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+      .queueCreateInfoCount = 1,
+      .pQueueCreateInfos = &queue,
+   };
+   VkDevice device;
+   CHECK(vkCreateDevice(physical, &dci, NULL, &device));
+   struct hk_device *dev = (void *)vk_device_from_handle(device);
+   assert(dev->dev.chip == AGX_CHIP_G13X ||
+          dev->dev.chip == AGX_CHIP_G13G);
+
+   struct vk_shader_compile_info info = {
+      .stage = MESA_SHADER_MESH,
+      .next_stage_mask = VK_SHADER_STAGE_FRAGMENT_BIT,
+      .nir = triangle_mesh(),
+      .robustness = &vk_robustness_disabled,
+   };
+   struct vk_shader *compiled_vk = NULL;
+   CHECK(dev->vk.shader_ops->compile(&dev->vk, 1, &info, NULL, NULL, NULL,
+                                     &compiled_vk));
+   struct hk_api_shader *compiled =
+      container_of(compiled_vk, struct hk_api_shader, vk);
+   check_uploaded_pair(compiled);
+
+   struct blob blob;
+   blob_init(&blob);
+   assert(compiled->vk.ops->serialize(&dev->vk, &compiled->vk, &blob));
+   assert(!blob.out_of_memory && blob.size > 0);
+
+   unsigned cache_entries = 0;
+   for (unsigned i = 0; i < HK_SHADER_BINARY_CACHE_MAX; ++i)
+      cache_entries += dev->shader_binary_cache.entries[i] != NULL;
+   assert(cache_entries < HK_SHADER_BINARY_CACHE_MAX);
+
+   struct hk_api_shader *first = deserialize(dev, blob.data, blob.size);
+   struct hk_api_shader *second = deserialize(dev, blob.data, blob.size);
+   check_uploaded_pair(first);
+   check_uploaded_pair(second);
+
+   /* Both wrappers borrow one immutable CPU payload from the device cache,
+    * but own separate mutable linked uploads and remain independently valid. */
+   assert(first != second);
+   assert(first->binary_cache_entry);
+   assert(first->binary_cache_entry == second->binary_cache_entry);
+   assert(hk_main_mesh_variant(first)->code_ptr ==
+          hk_main_mesh_variant(second)->code_ptr);
+   assert(hk_rast_mesh_variant(first)->code_ptr ==
+          hk_rast_mesh_variant(second)->code_ptr);
+   assert(hk_main_mesh_variant(first)->only_linked !=
+          hk_main_mesh_variant(second)->only_linked);
+   assert(hk_rast_mesh_variant(first)->only_linked !=
+          hk_rast_mesh_variant(second)->only_linked);
+
+   const uint32_t producer_size = hk_main_mesh_variant(compiled)->code_size;
+   const uint32_t pull_vs_size = hk_rast_mesh_variant(compiled)->code_size;
+   compiled->vk.ops->destroy(&dev->vk, &compiled->vk, NULL);
+   first->vk.ops->destroy(&dev->vk, &first->vk, NULL);
+   /* The cache and second wrapper still own the shared bytes. */
+   assert(hk_main_mesh_variant(second)->code_ptr);
+   assert(hk_rast_mesh_variant(second)->code_ptr);
+   second->vk.ops->destroy(&dev->vk, &second->vk, NULL);
+
+   blob_finish(&blob);
+   vkDestroyDevice(device, NULL);
+   vkDestroyInstance(instance, NULL);
+
+   printf("G13 mesh device/cache: uploaded MAIN %u B, RAST %u B, "
+          "binary cache hit PASS\n",
+          producer_size, pull_vs_size);
+   return 0;
+}

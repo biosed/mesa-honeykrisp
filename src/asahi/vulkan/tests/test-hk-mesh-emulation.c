@@ -126,7 +126,9 @@ test_triangle(void)
    assert(b.shader->info.shared_size == layout.shared_size);
    assert(offsetof(struct hk_mesh_emulation_params, vertex_buffer) == 0);
    assert(offsetof(struct hk_mesh_emulation_params, index_buffer) == 8);
-   assert(sizeof(struct hk_mesh_emulation_params) == 16);
+   assert(offsetof(struct hk_mesh_emulation_params, group_count) == 16);
+   assert(offsetof(struct hk_mesh_emulation_params, abi_version) == 28);
+   assert(sizeof(struct hk_mesh_emulation_params) == 32);
 
    unsigned geometry_params = 0;
    unsigned global_constants = 0;
@@ -161,7 +163,7 @@ test_triangle(void)
    }
 
    assert(geometry_params == 1);
-   assert(global_constants == 2);
+   assert(global_constants == 4);
    assert(global_stores == 4);
    assert(barriers >= 3);
    assert(mesh_intrinsics == 0);

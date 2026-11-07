@@ -784,6 +784,17 @@ if with_tests and ld_args_gc_sections.length() > 0
 endif
 
 if with_tests
+  hk_mesh_emulation_device_test = executable(
+    'hk_mesh_emulation_device_test',
+    files('tests/test-hk-mesh-emulation-device.c'),
+    include_directories : [
+      include_directories('.'), inc_gallium, inc_gallium_aux, inc_include,
+      inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm,
+    ],
+    dependencies : [hk_deps, cc.find_library('vulkan')],
+    gnu_symbol_visibility : 'hidden',
+  )
+
   hk_dual_source_gpl_test = executable(
     'hk-dual-source-gpl',
     files('tests/hk_dual_source_gpl.c'),

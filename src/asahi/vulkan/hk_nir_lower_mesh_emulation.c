@@ -17,7 +17,7 @@
 
 #define HK_MESH_EMULATION_MAX_VERTICES   256
 #define HK_MESH_EMULATION_MAX_PRIMITIVES 256
-#define HK_MESH_EMULATION_ADMISSION_VERSION 1
+#define HK_MESH_EMULATION_ADMISSION_VERSION HK_MESH_EMULATION_ABI_VERSION
 
 struct hk_mesh_emulation_admission {
    uint32_t refcount;
@@ -202,10 +202,9 @@ lower_output(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 }
 
 static nir_def *
-linear_workgroup_id(nir_builder *b)
+linear_workgroup_id(nir_builder *b, nir_def *count)
 {
    nir_def *id = nir_load_workgroup_id(b);
-   nir_def *count = nir_load_num_workgroups(b);
    nir_def *yz = nir_iadd(
       b, nir_channel(b, id, 1),
       nir_imul(b, nir_channel(b, count, 1), nir_channel(b, id, 2)));
@@ -219,6 +218,16 @@ load_param(nir_builder *b, nir_def *params, unsigned offset)
 {
    return nir_load_global_constant(b, 1, 64, nir_iadd_imm(b, params, offset),
                                    .align_mul = 8,
+                                   .access = ACCESS_CAN_SPECULATE);
+}
+
+static nir_def *
+load_param_u32(nir_builder *b, nir_def *params, unsigned offset,
+               unsigned components)
+{
+   return nir_load_global_constant(b, components, 32,
+                                   nir_iadd_imm(b, params, offset),
+                                   .align_mul = 4,
                                    .access = ACCESS_CAN_SPECULATE);
 }
 
@@ -283,8 +292,18 @@ export_scratch(nir_builder *b,
    nir_def *index_buffer =
       load_param(b, params,
                  offsetof(struct hk_mesh_emulation_params, index_buffer));
+   nir_def *group_count =
+      load_param_u32(b, params,
+                     offsetof(struct hk_mesh_emulation_params, group_count),
+                     3);
+   nir_def *abi_version =
+      load_param_u32(b, params,
+                     offsetof(struct hk_mesh_emulation_params, abi_version),
+                     1);
+   nir_push_if(b, nir_ieq_imm(b, abi_version,
+                              HK_MESH_EMULATION_ABI_VERSION));
    nir_def *lane = nir_load_local_invocation_index(b);
-   nir_def *group = linear_workgroup_id(b);
+   nir_def *group = linear_workgroup_id(b, group_count);
    nir_def *vertex_base =
       nir_imul_imm(b, group, layout->vertices_per_group);
    nir_def *primitive_base =
@@ -337,6 +356,7 @@ export_scratch(nir_builder *b,
                .memory_scope = SCOPE_DEVICE,
                .memory_semantics = NIR_MEMORY_RELEASE,
                .memory_modes = nir_var_mem_global);
+   nir_pop_if(b, NULL);
 }
 
 bool
