@@ -45,8 +45,10 @@ triangle_mesh(void)
    b.shader->info.mesh.max_primitives_out = 1;
    b.shader->info.mesh.primitive_type = MESA_PRIM_TRIANGLES;
    b.shader->info.outputs_written =
-      VARYING_BIT_POS | VARYING_BIT_PRIMITIVE_INDICES;
-   b.shader->info.per_primitive_outputs = VARYING_BIT_PRIMITIVE_INDICES;
+      VARYING_BIT_POS | VARYING_BIT_PRIMITIVE_INDICES |
+      VARYING_BIT_VAR(0) | VARYING_BIT_VAR(1);
+   b.shader->info.per_primitive_outputs =
+      VARYING_BIT_PRIMITIVE_INDICES | VARYING_BIT_VAR(1);
 
    nir_def *lane = nir_load_local_invocation_index(&b);
    nir_set_vertex_and_primitive_count(
@@ -57,6 +59,12 @@ triangle_mesh(void)
       lane, nir_imm_int(&b, 0), .write_mask = 0xf,
       .src_type = nir_type_float32,
       .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+   nir_store_per_vertex_output(
+      &b, nir_vec4(&b, nir_i2f32(&b, lane), nir_imm_float(&b, 0.25f),
+                   nir_imm_float(&b, 0.75f), nir_imm_float(&b, 1.0f)),
+      lane, nir_imm_int(&b, 0), .write_mask = 0xf,
+      .src_type = nir_type_float32,
+      .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
    nir_push_if(&b, nir_ieq_imm(&b, lane, 0));
    nir_store_per_primitive_output(
       &b, nir_imm_ivec3(&b, 0, 1, 2), nir_imm_int(&b, 0),
@@ -64,6 +72,11 @@ triangle_mesh(void)
       .src_type = nir_type_uint32,
       .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES,
                        .num_slots = 1});
+   nir_store_per_primitive_output(
+      &b, nir_imm_vec4(&b, 1.0f, 0.0f, 0.0f, 1.0f),
+      nir_imm_int(&b, 0), nir_imm_int(&b, 0), .write_mask = 0xf,
+      .src_type = nir_type_float32,
+      .io_semantics = {.location = VARYING_SLOT_VAR1, .num_slots = 1});
    nir_pop_if(&b, NULL);
    nir_shader_gather_info(b.shader, b.impl);
    return b.shader;
@@ -90,6 +103,13 @@ check_uploaded_pair(const struct hk_api_shader *obj)
    assert(rast->linked.ht || rast->linked.lazy_ht);
    assert(main->only_linked->b.bo);
    assert(!predicated->code_ptr && !predicated->only_linked);
+   assert(main->info.mesh.vertex_stride_B == 32);
+   assert(main->info.mesh.primitive_stride_B == 32);
+   assert(rast->info.mesh.vertex_stride_B == 48);
+   assert(main->info.mesh.vertex_outputs ==
+          (VARYING_BIT_POS | VARYING_BIT_VAR(0)));
+   assert(main->info.mesh.primitive_outputs ==
+          (VARYING_BIT_PRIMITIVE_INDICES | VARYING_BIT_VAR(1)));
 }
 
 static struct hk_api_shader *
@@ -169,15 +189,18 @@ main(void)
    assert(hk_mesh_emulation_direct_plan_init(
       dev->dev.chip, compiled, direct_grid, UINT64_C(0x100000), 4096,
       UINT64_C(0x200000), 4096, UINT64_C(0x300000), 4096,
-      UINT64_C(0x400000), 4096, &direct));
+      UINT64_C(0x400000), 4096, UINT64_C(0x500000), 4096,
+      UINT64_C(0x600000), 4096, &direct));
    assert(direct.producer == hk_main_mesh_variant(compiled));
    assert(direct.raster == hk_rast_mesh_variant(compiled));
    assert(direct.params.abi_version == HK_MESH_EMULATION_ABI_VERSION);
    assert(direct.params.mesh_grid[0] == 2 &&
           direct.params.mesh_grid[1] == 1 &&
           direct.params.mesh_grid[2] == 1);
-   assert(direct.params.primitive_records == 0);
+   assert(direct.params.primitive_records == UINT64_C(0x200000));
+   assert(direct.params.expanded_records == UINT64_C(0x300000));
    assert(direct.params.task_records == 0);
+   assert(direct.params.flags == HK_MESH_EMULATION_FLAG_DEINDEXED);
    assert(direct.producer_grid.mode == AGX_CDM_MODE_DIRECT);
    assert(direct.producer_grid.count[0] == 6 &&
           direct.producer_grid.count[1] == 1 &&
@@ -188,10 +211,14 @@ main(void)
    assert(direct.barrier == (AGX_BARRIER_ALL | AGX_PREGFX));
    assert(direct.draw.indexed && agx_is_indirect(direct.draw.b));
    assert(direct.draw.index_size == AGX_INDEX_SIZE_U32);
-   assert(direct.draw.b.ptr == UINT64_C(0x400000));
-   assert(direct.vertex_records_size_B == 96);
+   assert(direct.draw.b.ptr == UINT64_C(0x600000));
+   assert(direct.vertex_records_size_B == 192);
+   assert(direct.primitive_records_size_B == 64);
+   assert(direct.expanded_records_size_B == 288);
    assert(direct.index_buffer_size_B == 24);
    assert(direct.group_records_size_B == 64);
+   assert(direct.draw_params_size_B == 40);
+   assert(direct.scratch_size_B == 752);
    const uint32_t max_host_grid[3] = {
       HK_G13_MESH_MAX_GROUP_TOTAL, 1, 1,
    };
@@ -209,14 +236,32 @@ main(void)
    const uint32_t thread_overflow_grid[3] = {UINT32_MAX, 1, 1};
    assert(!hk_mesh_emulation_direct_requirements(
       dev->dev.chip, compiled, thread_overflow_grid, &direct));
+
+   struct hk_shader *mutable_main = hk_main_mesh_variant(compiled);
+   struct hk_shader *mutable_rast = hk_rast_mesh_variant(compiled);
+   const struct hk_mesh_info saved_info = mutable_main->info.mesh;
+   const uint32_t saved_rast_stride =
+      mutable_rast->info.mesh.vertex_stride_B;
+   mutable_main->info.mesh.max_vertices = 256;
+   mutable_main->info.mesh.max_primitives = 256;
+   mutable_main->info.mesh.vertex_stride_B = 528;
+   mutable_main->info.mesh.primitive_stride_B = 528;
+   mutable_rast->info.mesh.vertex_stride_B = 528;
+   assert(!hk_mesh_emulation_direct_requirements(
+      dev->dev.chip, compiled, max_host_grid, &direct));
+   mutable_main->info.mesh = saved_info;
+   mutable_rast->info.mesh.vertex_stride_B = saved_rast_stride;
+
    assert(!hk_mesh_emulation_direct_plan_init(
       dev->dev.chip, compiled, direct_grid, UINT64_C(0x100000), 95,
       UINT64_C(0x200000), 4096, UINT64_C(0x300000), 4096,
-      UINT64_C(0x400000), 4096, &direct));
+      UINT64_C(0x400000), 4096, UINT64_C(0x500000), 4096,
+      UINT64_C(0x600000), 4096, &direct));
    assert(!hk_mesh_emulation_direct_plan_init(
       AGX_CHIP_G14X, compiled, direct_grid, UINT64_C(0x100000), 4096,
       UINT64_C(0x200000), 4096, UINT64_C(0x300000), 4096,
-      UINT64_C(0x400000), 4096, &direct));
+      UINT64_C(0x400000), 4096, UINT64_C(0x500000), 4096,
+      UINT64_C(0x600000), 4096, &direct));
 
    struct blob blob;
    blob_init(&blob);

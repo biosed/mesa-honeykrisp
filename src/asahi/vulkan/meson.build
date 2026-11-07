@@ -804,10 +804,21 @@ if with_tests
       ],
       depfile : 'g13_mesh_public_triangle.spv.h.d',
     )
+    g13_mesh_public_triangle_frag_spv = custom_target(
+      'g13_mesh_public_triangle.frag.spv.h',
+      input : 'tests/g13_mesh_public_triangle.frag',
+      output : 'g13_mesh_public_triangle.frag.spv.h',
+      command : [
+        prog_glslang, '-V', '--target-env', 'vulkan1.3', '-S', 'frag',
+        '-x', '-o', '@OUTPUT@', '@INPUT@', glslang_quiet, glslang_depfile,
+      ],
+      depfile : 'g13_mesh_public_triangle.frag.spv.h.d',
+    )
     hk_mesh_public_api_test = executable(
       'hk_mesh_public_api_test',
       files('tests/test-hk-mesh-public-api.c'),
       g13_mesh_public_triangle_spv,
+      g13_mesh_public_triangle_frag_spv,
       include_directories : [
         include_directories('tests'), inc_include,
       ],

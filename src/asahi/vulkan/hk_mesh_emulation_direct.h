@@ -27,9 +27,15 @@ struct hk_shader;
 #define HK_G13_MESH_MAX_WORKGROUP_Z HK_MESH_EMULATION_MAX_WORKGROUP_Z
 #define HK_G13_MESH_MAX_VERTICES           256u
 #define HK_G13_MESH_MAX_PRIMITIVES         256u
-#define HK_G13_MESH_MAX_OUTPUT_COMPONENTS  4u
-#define HK_G13_MESH_MAX_SHARED_SIZE        (24u * 1024u)
-#define HK_G13_MESH_MAX_OUTPUT_SIZE         8192u
+#define HK_G13_MESH_MAX_OUTPUT_COMPONENTS 128u
+#define HK_G13_MESH_MAX_SHARED_SIZE        (28u * 1024u)
+#define HK_G13_MESH_MAX_OUTPUT_SIZE        (48u * 1024u)
+/* Command-owned scratch is currently materialized for the complete direct
+ * grid.  Bound the aggregate, not only its individually 32-bit-addressed
+ * regions, so a legal large grid cannot turn six modest allocations into a
+ * multi-gigabyte recorder stall.  256 MiB leaves hundreds of worst observed
+ * title-profile groups while GPU-side dynamic consumption is unfinished. */
+#define HK_G13_MESH_MAX_SCRATCH_SIZE (UINT64_C(256) * 1024 * 1024)
 
 static inline bool
 hk_g13_software_mesh_supported(enum agx_chip chip)
@@ -57,9 +63,12 @@ struct hk_mesh_emulation_direct_plan {
    enum agx_barrier barrier;
    struct agx_draw draw;
    uint64_t vertex_records_size_B;
+   uint64_t primitive_records_size_B;
+   uint64_t expanded_records_size_B;
    uint64_t index_buffer_size_B;
    uint64_t group_records_size_B;
    uint64_t draw_params_size_B;
+   uint64_t scratch_size_B;
    uint32_t draw_count;
    uint32_t draw_stride_B;
 };
@@ -72,7 +81,9 @@ bool hk_mesh_emulation_direct_requirements(
 bool hk_mesh_emulation_direct_plan_init(
    enum agx_chip chip, const struct hk_api_shader *api,
    const uint32_t group_count[3], uint64_t vertex_records,
-   uint64_t vertex_records_size_B, uint64_t index_buffer,
+   uint64_t vertex_records_size_B, uint64_t primitive_records,
+   uint64_t primitive_records_size_B, uint64_t expanded_records,
+   uint64_t expanded_records_size_B, uint64_t index_buffer,
    uint64_t index_buffer_size_B, uint64_t group_records,
    uint64_t group_records_size_B, uint64_t draw_params,
    uint64_t draw_params_size_B,

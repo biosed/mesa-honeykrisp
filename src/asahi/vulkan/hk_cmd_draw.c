@@ -13077,6 +13077,8 @@ hk_cmd_draw_mesh_g13_direct(struct hk_cmd_buffer *cmd,
    if (!hk_mesh_emulation_direct_requirements(
           dev->dev.chip, mesh, group_count, &requirements) ||
        requirements.vertex_records_size_B > UINT32_MAX ||
+       requirements.primitive_records_size_B > UINT32_MAX ||
+       requirements.expanded_records_size_B > UINT32_MAX ||
        requirements.index_buffer_size_B > UINT32_MAX ||
        requirements.group_records_size_B > UINT32_MAX ||
        requirements.draw_params_size_B > UINT32_MAX ||
@@ -13088,13 +13090,18 @@ hk_cmd_draw_mesh_g13_direct(struct hk_cmd_buffer *cmd,
 
    struct agx_ptr vertex_records = hk_pool_alloc(
       cmd, requirements.vertex_records_size_B, 16);
+   struct agx_ptr primitive_records = hk_pool_alloc(
+      cmd, requirements.primitive_records_size_B, 16);
+   struct agx_ptr expanded_records = hk_pool_alloc(
+      cmd, requirements.expanded_records_size_B, 16);
    struct agx_ptr index_buffer = hk_pool_alloc(
       cmd, requirements.index_buffer_size_B, 4);
    struct agx_ptr group_records = hk_pool_alloc(
       cmd, requirements.group_records_size_B, 32);
    struct agx_ptr draw_params = hk_pool_alloc(
       cmd, requirements.draw_params_size_B, 4);
-   if (!vertex_records.cpu || !index_buffer.cpu || !group_records.cpu ||
+   if (!vertex_records.cpu || !primitive_records.cpu ||
+       !expanded_records.cpu || !index_buffer.cpu || !group_records.cpu ||
        !draw_params.cpu) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       return false;
@@ -13104,6 +13111,10 @@ hk_cmd_draw_mesh_g13_direct(struct hk_cmd_buffer *cmd,
     * recording completes. Zero every consumer-visible byte here, including
     * reserved group fields and VkDrawIndexedIndirectCommand::firstInstance. */
    memset(vertex_records.cpu, 0, requirements.vertex_records_size_B);
+   memset(primitive_records.cpu, 0,
+          requirements.primitive_records_size_B);
+   memset(expanded_records.cpu, 0,
+          requirements.expanded_records_size_B);
    memset(index_buffer.cpu, 0, requirements.index_buffer_size_B);
    memset(group_records.cpu, 0, requirements.group_records_size_B);
    memset(draw_params.cpu, 0, requirements.draw_params_size_B);
@@ -13112,6 +13123,8 @@ hk_cmd_draw_mesh_g13_direct(struct hk_cmd_buffer *cmd,
    if (!hk_mesh_emulation_direct_plan_init(
           dev->dev.chip, mesh, group_count,
           vertex_records.gpu, requirements.vertex_records_size_B,
+          primitive_records.gpu, requirements.primitive_records_size_B,
+          expanded_records.gpu, requirements.expanded_records_size_B,
           index_buffer.gpu, requirements.index_buffer_size_B,
           group_records.gpu, requirements.group_records_size_B,
           draw_params.gpu, requirements.draw_params_size_B, &plan)) {

@@ -17,10 +17,12 @@
 #include <string.h>
 #include <vulkan/vulkan.h>
 
-#include "g17p_wsi_triangle_frag.h"
-
 static const uint32_t g13_mesh_public_triangle_spv[] = {
 #include "g13_mesh_public_triangle.spv.h"
+};
+
+static const uint32_t g13_mesh_public_triangle_frag_spv[] = {
+#include "g13_mesh_public_triangle.frag.spv.h"
 };
 
 #define CHECK(call)                                                            \
@@ -108,17 +110,17 @@ check_limits(const VkPhysicalDeviceMeshShaderPropertiesEXT *p)
    assert(p->maxMeshWorkGroupSize[1] == 1024);
    assert(p->maxMeshWorkGroupSize[2] == 64);
    assert(p->maxMeshWorkGroupInvocations == 1024);
-   assert(p->maxMeshSharedMemorySize == 24 * 1024);
-   assert(p->maxMeshPayloadAndSharedMemorySize == 24 * 1024);
-   assert(p->maxMeshOutputMemorySize == 8192);
-   assert(p->maxMeshPayloadAndOutputMemorySize == 8192);
-   assert(p->maxMeshOutputComponents == 4);
+   assert(p->maxMeshSharedMemorySize == 28 * 1024);
+   assert(p->maxMeshPayloadAndSharedMemorySize == 28 * 1024);
+   assert(p->maxMeshOutputMemorySize == 48 * 1024);
+   assert(p->maxMeshPayloadAndOutputMemorySize == 48 * 1024);
+   assert(p->maxMeshOutputComponents == 128);
    assert(p->maxMeshOutputVertices == 256);
    assert(p->maxMeshOutputPrimitives == 256);
    assert(p->maxMeshOutputLayers == 1);
    assert(p->maxMeshMultiviewViewCount == 1);
    assert(p->meshOutputPerVertexGranularity == 16);
-   assert(p->meshOutputPerPrimitiveGranularity == 4);
+   assert(p->meshOutputPerPrimitiveGranularity == 16);
    assert(p->maxPreferredTaskWorkGroupInvocations == 0);
    assert(p->maxPreferredMeshWorkGroupInvocations == 32);
 }
@@ -128,8 +130,7 @@ check_required_limit_gaps(
    const VkPhysicalDeviceMeshShaderPropertiesEXT *p)
 {
    /* VK_EXT_mesh_shader Required_Limits. Keep this table executable so the
-    * opt-in profile cannot be mistaken for conformant exposure while the
-    * position-only prototype still falls below it. */
+    * opt-in profile cannot be mistaken for conformant exposure. */
    assert(p->maxMeshWorkGroupTotalCount < (1u << 22));
    for (unsigned i = 0; i < 3; ++i)
       assert(p->maxMeshWorkGroupCount[i] >= 65535);
@@ -137,11 +138,11 @@ check_required_limit_gaps(
    assert(p->maxMeshWorkGroupSize[0] >= 128);
    assert(p->maxMeshWorkGroupSize[1] >= 128);
    assert(p->maxMeshWorkGroupSize[2] < 128);
-   assert(p->maxMeshSharedMemorySize < 28672);
-   assert(p->maxMeshPayloadAndSharedMemorySize < 28672);
-   assert(p->maxMeshOutputMemorySize < 32768);
-   assert(p->maxMeshPayloadAndOutputMemorySize < 48128);
-   assert(p->maxMeshOutputComponents < 128);
+   assert(p->maxMeshSharedMemorySize >= 28672);
+   assert(p->maxMeshPayloadAndSharedMemorySize >= 28672);
+   assert(p->maxMeshOutputMemorySize >= 32768);
+   assert(p->maxMeshPayloadAndOutputMemorySize >= 48128);
+   assert(p->maxMeshOutputComponents >= 128);
    assert(p->maxMeshOutputVertices >= 256);
    assert(p->maxMeshOutputPrimitives >= 256);
    assert(p->maxMeshOutputLayers < 8);
@@ -209,8 +210,8 @@ record_public_triangle(VkDevice device)
       device, g13_mesh_public_triangle_spv,
       sizeof(g13_mesh_public_triangle_spv));
    VkShaderModule fragment = shader_module(
-      device, g17p_wsi_triangle_frag_spv,
-      sizeof(g17p_wsi_triangle_frag_spv));
+      device, g13_mesh_public_triangle_frag_spv,
+      sizeof(g13_mesh_public_triangle_frag_spv));
 
    const VkPipelineLayoutCreateInfo layout_info = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,

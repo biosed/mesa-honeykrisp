@@ -6047,6 +6047,10 @@ hk_compile_g13_mesh_emulation(
    struct hk_shader *main = hk_main_mesh_variant(obj);
    main->info.mesh.max_vertices = layout->vertices_per_group;
    main->info.mesh.max_primitives = layout->primitives_per_group;
+   main->info.mesh.vertex_stride_B = layout->vertex_stride_B;
+   main->info.mesh.primitive_stride_B = layout->primitive_stride_B;
+   main->info.mesh.vertex_outputs = layout->vertex_outputs;
+   main->info.mesh.primitive_outputs = layout->primitive_outputs;
    main->info.mesh.prim = MESA_PRIM_TRIANGLES;
    for (unsigned i = 0; i < 3; ++i)
       main->info.mesh.local_size[i] = producer->info.workgroup_size[i];
@@ -6083,6 +6087,16 @@ hk_compile_g13_mesh_emulation(
    result = hk_compile_nir(
       dev, pAllocator, pull_vs, info->flags, info->robustness, &pull_key,
       features, rast, MESA_SHADER_VERTEX, true, NULL, 0, 0);
+
+   if (result == VK_SUCCESS) {
+      /* The raster variant indexes the primitive-expanded record rather than
+       * the producer's source-vertex record.  This field is serialized with
+       * the ordinary shader variant and therefore also keys scratch sizing
+       * after a pipeline-cache round trip. */
+      rast->info.mesh.vertex_stride_B = layout->expanded_stride_B;
+      rast->info.mesh.vertex_outputs = layout->vertex_outputs |
+                                       layout->primitive_outputs;
+   }
 
    hk_mesh_emulation_admission_unref(admission);
    return result;
@@ -6156,6 +6170,14 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
    }
    /* M5 mesh shaders export per-primitive words on private vertices. */
    if (agx_chip_g17_m5(dev->dev.chip) &&
+       nir->info.stage == MESA_SHADER_FRAGMENT)
+      NIR_PASS(_, nir, agx_nir_lower_m5_mesh_fragment);
+   /* A fragment library or shader object can arrive without its mesh stage,
+    * so repeat the deindexed G13 input rewrite at individual compilation.
+    * Complete pipelines already ran it after interstage matching above; the
+    * pass is idempotent once no per-primitive loads remain. */
+   if ((dev->dev.chip == AGX_CHIP_G13G ||
+        dev->dev.chip == AGX_CHIP_G13X) &&
        nir->info.stage == MESA_SHADER_FRAGMENT)
       NIR_PASS(_, nir, agx_nir_lower_m5_mesh_fragment);
 
@@ -7231,6 +7253,19 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
 
    nir_opt_varyings_bulk(shaders, shader_count, true, UINT32_MAX, UINT32_MAX,
                          nir_opts, NULL);
+
+   /* G13 software mesh deindexes every primitive into private raster vertices.
+    * Rewrite per-primitive fragment loads to ordinary flat vertex inputs after
+    * varying optimization has matched the original mesh/fragment interface.
+    * The producer expansion replicates each primitive value to its three
+    * private corners, so shared source vertices cannot alias flat values. */
+   if ((dev->dev.chip == AGX_CHIP_G13G ||
+        dev->dev.chip == AGX_CHIP_G13X) && has_mesh) {
+      for (uint32_t i = 0; i < shader_count; i++) {
+         if (shaders[i]->info.stage == MESA_SHADER_FRAGMENT)
+            NIR_PASS(_, shaders[i], agx_nir_lower_m5_mesh_fragment);
+      }
+   }
 
    /* A fragment shader compiled together with its mesh shader reads the
     * per-primitive records with that mesh shader's record layout. */

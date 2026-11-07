@@ -17,8 +17,10 @@
  * path will place its address in draw.geometry_params before dispatching the
  * lowered shader.  Keep this ABI independent of Vulkan application memory.
  */
-#define HK_MESH_EMULATION_ABI_VERSION 2u
+#define HK_MESH_EMULATION_ABI_VERSION 3u
 #define HK_MESH_EMULATION_TARGET_G13 13u
+#define HK_MESH_EMULATION_MAX_SLOTS 64u
+#define HK_MESH_EMULATION_FLAG_DEINDEXED UINT32_C(1)
 #define HK_MESH_EMULATION_MAX_WORKGROUP_X 1024u
 #define HK_MESH_EMULATION_MAX_WORKGROUP_Y 1024u
 #define HK_MESH_EMULATION_MAX_WORKGROUP_Z 64u
@@ -27,12 +29,15 @@
 struct hk_mesh_emulation_params {
    uint64_t vertex_records;
    uint64_t primitive_records;
+   uint64_t expanded_records;
    uint64_t index_buffer;
    uint64_t group_records;
    uint64_t task_records;
    uint64_t draw_params;
    uint32_t mesh_grid[3];
    uint32_t abi_version;
+   uint32_t flags;
+   uint32_t reserved;
 };
 
 struct hk_mesh_emulation_group_record {
@@ -46,15 +51,25 @@ struct hk_mesh_emulation_group_record {
 };
 
 struct hk_mesh_emulation_layout {
-   unsigned shared_base;
    unsigned vertex_count;
    unsigned primitive_count;
-   unsigned position;
-   unsigned indices;
    unsigned shared_size;
-
    unsigned vertices_per_group;
    unsigned primitives_per_group;
+   unsigned vertex_stride_B;
+   unsigned primitive_stride_B;
+   unsigned expanded_stride_B;
+   unsigned position_offset_B;
+   unsigned index_offset_B;
+   unsigned output_memory_B;
+   uint64_t vertex_outputs;
+   uint64_t primitive_outputs;
+   uint16_t vertex_offset_B[HK_MESH_EMULATION_MAX_SLOTS];
+   uint16_t primitive_offset_B[HK_MESH_EMULATION_MAX_SLOTS];
+   uint16_t expanded_offset_B[HK_MESH_EMULATION_MAX_SLOTS];
+   uint8_t vertex_components[HK_MESH_EMULATION_MAX_SLOTS];
+   uint8_t primitive_components[HK_MESH_EMULATION_MAX_SLOTS];
+   nir_alu_type output_type[HK_MESH_EMULATION_MAX_SLOTS];
 };
 
 /*
@@ -82,7 +97,8 @@ bool hk_nir_lower_mesh_emulation(
  * its fetched index arrives here as load_vertex_id.
  */
 nir_shader *hk_nir_mesh_emulation_pull_vs(
-   const nir_shader_compiler_options *options);
+   const nir_shader_compiler_options *options,
+   const struct hk_mesh_emulation_layout *layout);
 
 /*
  * Build an immutable producer/pull-VS pair.  The identity covers the contract

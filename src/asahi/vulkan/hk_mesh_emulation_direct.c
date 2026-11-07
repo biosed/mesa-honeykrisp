@@ -10,6 +10,16 @@
 
 #include "hk_shader.h"
 
+static bool
+add_scratch_size(uint64_t *total, uint64_t size)
+{
+   if (size > UINT64_MAX - *total)
+      return false;
+
+   *total += size;
+   return true;
+}
+
 bool
 hk_mesh_emulation_direct_requirements(
    enum agx_chip chip, const struct hk_api_shader *api,
@@ -34,7 +44,10 @@ hk_mesh_emulation_direct_requirements(
        raster->b.info.stage != MESA_SHADER_VERTEX || predicated->compiled ||
        !producer->info.mesh.max_vertices ||
        !producer->info.mesh.max_primitives ||
-       producer->info.mesh.prim != MESA_PRIM_TRIANGLES)
+       producer->info.mesh.prim != MESA_PRIM_TRIANGLES ||
+       !producer->info.mesh.vertex_stride_B ||
+       !producer->info.mesh.primitive_stride_B ||
+       !raster->info.mesh.vertex_stride_B)
       return false;
 
    uint64_t groups = 1;
@@ -65,19 +78,43 @@ hk_mesh_emulation_direct_requirements(
         primitives / groups != producer->info.mesh.max_primitives))
       return false;
 
-   if (vertices > UINT64_MAX / 16 || primitives > UINT32_MAX / 3 ||
+   if (vertices > UINT64_MAX / producer->info.mesh.vertex_stride_B ||
+       primitives > UINT64_MAX / producer->info.mesh.primitive_stride_B ||
+       primitives > UINT64_MAX / 3)
+      return false;
+   const uint64_t expanded_vertices = primitives * 3;
+   if (expanded_vertices >
+          UINT64_MAX / raster->info.mesh.vertex_stride_B ||
+       expanded_vertices > UINT32_MAX ||
        groups > UINT64_MAX / sizeof(struct hk_mesh_emulation_group_record) ||
        groups > UINT64_MAX / sizeof(VkDrawIndexedIndirectCommand) ||
        groups > UINT32_MAX)
       return false;
 
-   const uint64_t vertex_need = vertices * 16;
-   const uint64_t index_count = primitives * 3;
-   const uint64_t index_need = index_count * sizeof(uint32_t);
+   const uint64_t vertex_need =
+      vertices * producer->info.mesh.vertex_stride_B;
+   const uint64_t primitive_need =
+      primitives * producer->info.mesh.primitive_stride_B;
+   const uint64_t expanded_need =
+      expanded_vertices * raster->info.mesh.vertex_stride_B;
+   const uint64_t index_need =
+      expanded_vertices * sizeof(uint32_t);
    const uint64_t group_need =
       groups * sizeof(struct hk_mesh_emulation_group_record);
    const uint64_t draw_need =
       groups * sizeof(VkDrawIndexedIndirectCommand);
+
+   uint64_t scratch_need = sizeof(struct hk_mesh_emulation_params);
+   if (!add_scratch_size(&scratch_need, vertex_need) ||
+       !add_scratch_size(&scratch_need, primitive_need) ||
+       !add_scratch_size(&scratch_need, expanded_need) ||
+       !add_scratch_size(&scratch_need, index_need) ||
+       !add_scratch_size(&scratch_need, group_need) ||
+       !add_scratch_size(&scratch_need, draw_need))
+      return false;
+
+   if (scratch_need > HK_G13_MESH_MAX_SCRATCH_SIZE)
+      return false;
 
    memset(plan, 0, sizeof(*plan));
    plan->producer = producer;
@@ -88,9 +125,12 @@ hk_mesh_emulation_direct_requirements(
       producer->info.mesh.local_size[2]);
    plan->barrier = AGX_BARRIER_ALL | AGX_PREGFX;
    plan->vertex_records_size_B = vertex_need;
+   plan->primitive_records_size_B = primitive_need;
+   plan->expanded_records_size_B = expanded_need;
    plan->index_buffer_size_B = index_need;
    plan->group_records_size_B = group_need;
    plan->draw_params_size_B = draw_need;
+   plan->scratch_size_B = scratch_need;
    plan->draw_count = groups;
    plan->draw_stride_B = sizeof(VkDrawIndexedIndirectCommand);
    return true;
@@ -100,7 +140,9 @@ bool
 hk_mesh_emulation_direct_plan_init(
    enum agx_chip chip, const struct hk_api_shader *api,
    const uint32_t group_count[3], uint64_t vertex_records,
-   uint64_t vertex_records_size_B, uint64_t index_buffer,
+   uint64_t vertex_records_size_B, uint64_t primitive_records,
+   uint64_t primitive_records_size_B, uint64_t expanded_records,
+   uint64_t expanded_records_size_B, uint64_t index_buffer,
    uint64_t index_buffer_size_B, uint64_t group_records,
    uint64_t group_records_size_B, uint64_t draw_params,
    uint64_t draw_params_size_B,
@@ -111,10 +153,14 @@ hk_mesh_emulation_direct_plan_init(
                                                &requirements))
       return false;
 
-   if (!vertex_records || (vertex_records & 15) || !index_buffer ||
+   if (!vertex_records || (vertex_records & 15) || !primitive_records ||
+       (primitive_records & 15) || !expanded_records ||
+       (expanded_records & 15) || !index_buffer ||
        (index_buffer & 3) || !group_records || (group_records & 31) ||
        !draw_params || (draw_params & 3) ||
        requirements.vertex_records_size_B > vertex_records_size_B ||
+       requirements.primitive_records_size_B > primitive_records_size_B ||
+       requirements.expanded_records_size_B > expanded_records_size_B ||
        requirements.index_buffer_size_B > index_buffer_size_B ||
        index_buffer_size_B > UINT32_MAX ||
        requirements.group_records_size_B > group_records_size_B ||
@@ -124,11 +170,14 @@ hk_mesh_emulation_direct_plan_init(
    *plan = requirements;
    plan->params = (struct hk_mesh_emulation_params){
       .vertex_records = vertex_records,
+      .primitive_records = primitive_records,
+      .expanded_records = expanded_records,
       .index_buffer = index_buffer,
       .group_records = group_records,
       .draw_params = draw_params,
       .mesh_grid = {group_count[0], group_count[1], group_count[2]},
       .abi_version = HK_MESH_EMULATION_ABI_VERSION,
+      .flags = HK_MESH_EMULATION_FLAG_DEINDEXED,
    };
    plan->draw = agx_draw_indexed_indirect(
       draw_params, index_buffer, (uint32_t)index_buffer_size_B,

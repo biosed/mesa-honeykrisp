@@ -78,6 +78,26 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
       suite : ['asahi'],
     )
 
+    # The stock G13 path is the environment-unset case, not merely an
+    # explicit opt-out spelling.  Keep it separately executable so a default
+    # change cannot accidentally turn the experimental extension on.
+    test(
+      'hk-g13-unset-mesh-public-api-negative',
+      prog_python,
+      args : [
+        files('../gallium/drivers/asahi/tests/run-shim.py'),
+        libasahi_noop_drm_shim,
+        hk_mesh_public_api_test,
+        'unsupported',
+      ],
+      env : [
+        'ASAHI_SHIM_CHIP=g13x',
+        'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+      ],
+      depends : [_dev_icd, libvulkan_asahi],
+      suite : ['asahi'],
+    )
+
     foreach negative : [
       ['g13-disabled', 'g13x', '0'],
       ['g14', 'g14g', '1'],
