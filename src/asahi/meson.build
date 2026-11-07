@@ -78,6 +78,26 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
       suite : ['asahi'],
     )
 
+    # Record the complete public task/payload/mesh readback fixture against
+    # the no-op G13X shim, but deliberately stop before queue submission.
+    test(
+      'hk-g13-mesh-task-readback-record',
+      prog_python,
+      args : [
+        files('../gallium/drivers/asahi/tests/run-shim.py'),
+        libasahi_noop_drm_shim,
+        hk_mesh_task_readback_test,
+        '--record-only',
+      ],
+      env : [
+        'ASAHI_SHIM_CHIP=g13x',
+        'ASAHI_G13_SOFTWARE_MESH=1',
+        'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+      ],
+      depends : [_dev_icd, libvulkan_asahi],
+      suite : ['asahi'],
+    )
+
     # The stock G13 path is the environment-unset case, not merely an
     # explicit opt-out spelling.  Keep it separately executable so a default
     # change cannot accidentally turn the experimental extension on.

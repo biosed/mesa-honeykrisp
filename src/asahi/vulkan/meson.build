@@ -793,6 +793,7 @@ endif
 
 if with_tests
   hk_mesh_public_api_test = []
+  hk_mesh_task_readback_test = []
   if prog_glslang.found()
     g13_mesh_public_triangle_spv = custom_target(
       'g13_mesh_public_triangle.spv.h',
@@ -822,6 +823,48 @@ if with_tests
       include_directories : [
         include_directories('tests'), inc_include,
       ],
+      dependencies : [cc.find_library('vulkan')],
+      c_args : [c_msvc_compat_args],
+      gnu_symbol_visibility : 'hidden',
+    )
+
+    g13_mesh_task_readback_task_spv = custom_target(
+      'g13_mesh_task_readback.task.spv.h',
+      input : 'tests/g13_mesh_task_readback.task',
+      output : 'g13_mesh_task_readback.task.spv.h',
+      command : [
+        prog_glslang, '-V', '--target-env', 'vulkan1.3', '-S', 'task',
+        '-x', '-o', '@OUTPUT@', '@INPUT@', glslang_quiet, glslang_depfile,
+      ],
+      depfile : 'g13_mesh_task_readback.task.spv.h.d',
+    )
+    g13_mesh_task_readback_mesh_spv = custom_target(
+      'g13_mesh_task_readback.mesh.spv.h',
+      input : 'tests/g13_mesh_task_readback.mesh',
+      output : 'g13_mesh_task_readback.mesh.spv.h',
+      command : [
+        prog_glslang, '-V', '--target-env', 'vulkan1.3', '-S', 'mesh',
+        '-x', '-o', '@OUTPUT@', '@INPUT@', glslang_quiet, glslang_depfile,
+      ],
+      depfile : 'g13_mesh_task_readback.mesh.spv.h.d',
+    )
+    g13_mesh_task_readback_frag_spv = custom_target(
+      'g13_mesh_task_readback.frag.spv.h',
+      input : 'tests/g13_mesh_task_readback.frag',
+      output : 'g13_mesh_task_readback.frag.spv.h',
+      command : [
+        prog_glslang, '-V', '--target-env', 'vulkan1.3', '-S', 'frag',
+        '-x', '-o', '@OUTPUT@', '@INPUT@', glslang_quiet, glslang_depfile,
+      ],
+      depfile : 'g13_mesh_task_readback.frag.spv.h.d',
+    )
+    hk_mesh_task_readback_test = executable(
+      'hk_mesh_task_readback_test',
+      files('tests/test-hk-mesh-task-readback.c'),
+      g13_mesh_task_readback_task_spv,
+      g13_mesh_task_readback_mesh_spv,
+      g13_mesh_task_readback_frag_spv,
+      include_directories : [inc_include],
       dependencies : [cc.find_library('vulkan')],
       c_args : [c_msvc_compat_args],
       gnu_symbol_visibility : 'hidden',

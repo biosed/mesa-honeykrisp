@@ -1,0 +1,25 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+taskPayloadSharedEXT struct TaskPayload {
+   uint task_x;
+   uint task_count_x;
+   uint guard0;
+   uint guard1;
+} payload;
+
+void
+main()
+{
+   if (gl_LocalInvocationIndex == 0) {
+      payload.task_x = gl_WorkGroupID.x;
+      payload.task_count_x = gl_NumWorkGroups.x;
+      payload.guard0 = 0x13579bdfu;
+      payload.guard1 = 0x2468ace0u;
+   }
+
+   barrier();
+   EmitMeshTasksEXT(2, 2, 1);
+}

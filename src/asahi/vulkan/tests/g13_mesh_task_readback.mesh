@@ -1,0 +1,48 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+
+layout(local_size_x = 4, local_size_y = 1, local_size_z = 1) in;
+layout(triangles, max_vertices = 4, max_primitives = 2) out;
+
+taskPayloadSharedEXT struct TaskPayload {
+   uint task_x;
+   uint task_count_x;
+   uint guard0;
+   uint guard1;
+} payload;
+
+layout(location = 0) out vec4 vertex_colour[];
+
+void
+main()
+{
+   const uint lane = gl_LocalInvocationIndex;
+   const uint child_x = gl_WorkGroupID.x;
+   const uint child_y = gl_WorkGroupID.y;
+   const uint columns = payload.task_count_x * 2u;
+   const uint column = payload.task_x * 2u + child_x;
+   const float x0 = -1.0 + 2.0 * float(column) / float(columns);
+   const float x1 = -1.0 + 2.0 * float(column + 1u) / float(columns);
+   const float y0 = -1.0 + float(child_y);
+   const float y1 = y0 + 1.0;
+   const bool right = lane == 1u || lane == 2u;
+   const bool upper = lane >= 2u;
+   const bool payload_ok = payload.guard0 == 0x13579bdfu &&
+                           payload.guard1 == 0x2468ace0u;
+
+   SetMeshOutputsEXT(4, 2);
+   gl_MeshVerticesEXT[lane].gl_Position =
+      vec4(right ? x1 : x0, upper ? y1 : y0, 0.0, 1.0);
+   const vec4 expected_colour = vec4(
+      (float(payload.task_x) + 1.0) * 0.25,
+      child_x == 0u ? 0.25 : 0.75,
+      child_y == 0u ? 0.25 : 0.75,
+      1.0);
+   vertex_colour[lane] = payload_ok
+      ? expected_colour : vec4(1.0, 0.0, 1.0, 1.0);
+
+   if (lane < 2u) {
+      gl_PrimitiveTriangleIndicesEXT[lane] = lane == 0u
+         ? uvec3(0, 1, 2) : uvec3(0, 2, 3);
+   }
+}
