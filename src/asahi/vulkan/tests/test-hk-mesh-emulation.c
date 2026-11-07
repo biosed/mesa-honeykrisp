@@ -14,9 +14,12 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static unsigned producer_binary_size;
 static unsigned pull_vs_binary_size;
+static unsigned admitted_producer_binary_size;
+static unsigned admitted_pull_vs_binary_size;
 
 static bool
 lower_driver_sysvals(nir_builder *b, nir_intrinsic_instr *intr, void *data)
@@ -190,6 +193,14 @@ test_fail_closed(void)
    assert(b.shader->info.outputs_written & VARYING_BIT_VAR(0));
    nir_validate_shader(b.shader, "unsupported mesh shader left unchanged");
    ralloc_free(b.shader);
+
+   nir_builder returning = triangle_builder(false);
+   nir_jump(&returning, nir_jump_return);
+   assert(!hk_nir_lower_mesh_emulation(returning.shader, NULL));
+   assert(returning.shader->info.stage == MESA_SHADER_MESH);
+   nir_validate_shader(returning.shader,
+                       "returning mesh shader left unchanged");
+   ralloc_free(returning.shader);
 }
 
 static void
@@ -255,14 +266,119 @@ test_pull_vs(void)
    ralloc_free(vs);
 }
 
+static unsigned
+compile_producer(nir_shader *producer)
+{
+   NIR_PASS(_, producer, nir_shader_intrinsics_pass, lower_driver_sysvals,
+            nir_metadata_control_flow, NULL);
+   agx_preprocess_nir(producer);
+   struct agx_shader_key key = {
+      .dev.encoding = AGX_ISA_ENCODING_AGX2,
+      .no_preamble = true,
+   };
+   struct agx_shader_part part = {0};
+   assert(agx_compile_shader_nir(producer, &key, &part));
+   assert(part.binary != NULL);
+   assert(part.info.binary_size > 0);
+   unsigned size = part.info.binary_size;
+   free(part.binary);
+   ralloc_free(producer);
+   return size;
+}
+
+static unsigned
+compile_pull_vs(nir_shader *pull_vs)
+{
+   NIR_PASS(_, pull_vs, nir_shader_intrinsics_pass, lower_driver_sysvals,
+            nir_metadata_control_flow, NULL);
+   NIR_PASS(_, pull_vs, nir_shader_intrinsics_pass, lower_pull_vs_output,
+            nir_metadata_control_flow, NULL);
+   agx_preprocess_nir(pull_vs);
+   struct agx_shader_key key = {
+      .dev.encoding = AGX_ISA_ENCODING_AGX2,
+      .no_preamble = true,
+   };
+   struct agx_shader_part part = {0};
+   assert(agx_compile_shader_nir(pull_vs, &key, &part));
+   assert(part.binary != NULL);
+   assert(part.info.binary_size > 0);
+   unsigned size = part.info.binary_size;
+   free(part.binary);
+   ralloc_free(pull_vs);
+   return size;
+}
+
+static void
+test_admission_identity_lifetime(void)
+{
+   static const nir_shader_compiler_options options = {0};
+   nir_builder first = triangle_builder(false);
+   nir_builder same = triangle_builder(false);
+   nir_builder distinct = triangle_builder(false);
+   nir_builder unsupported = triangle_builder(true);
+
+   /* Move the contract's private shared base so the admitted programs and
+    * their cache identity must differ while remaining otherwise supported. */
+   distinct.shader->info.shared_size = 84;
+
+   struct hk_mesh_emulation_admission *a =
+      hk_mesh_emulation_admission_create(first.shader, &options);
+   struct hk_mesh_emulation_admission *b =
+      hk_mesh_emulation_admission_create(same.shader, &options);
+   struct hk_mesh_emulation_admission *c =
+      hk_mesh_emulation_admission_create(distinct.shader, &options);
+   assert(a && b && c);
+   assert(!hk_mesh_emulation_admission_create(unsupported.shader, &options));
+
+   /* Admission clones and lowers; its caller-owned API NIR remains intact. */
+   assert(first.shader->info.stage == MESA_SHADER_MESH);
+   assert(same.shader->info.stage == MESA_SHADER_MESH);
+   assert(distinct.shader->info.stage == MESA_SHADER_MESH);
+   assert(unsupported.shader->info.stage == MESA_SHADER_MESH);
+   assert(unsupported.shader->info.outputs_written & VARYING_BIT_VAR(0));
+
+   assert(memcmp(hk_mesh_emulation_admission_identity(a),
+                 hk_mesh_emulation_admission_identity(b),
+                 BLAKE3_KEY_LEN) == 0);
+   assert(memcmp(hk_mesh_emulation_admission_identity(a),
+                 hk_mesh_emulation_admission_identity(c),
+                 BLAKE3_KEY_LEN) != 0);
+   assert(hk_mesh_emulation_admission_layout(a)->shared_base == 64);
+   assert(hk_mesh_emulation_admission_layout(c)->shared_base == 128);
+
+   nir_shader *producer = hk_mesh_emulation_admission_clone_producer(
+      a, &options);
+   nir_shader *pull_vs = hk_mesh_emulation_admission_clone_pull_vs(a, &options);
+   assert(producer && pull_vs);
+   assert(producer->info.stage == MESA_SHADER_COMPUTE);
+   assert(pull_vs->info.stage == MESA_SHADER_VERTEX);
+   admitted_producer_binary_size = compile_producer(producer);
+   admitted_pull_vs_binary_size = compile_pull_vs(pull_vs);
+
+   /* The immutable pair can be shared by cache users; its buffers disappear
+    * only after the final owner releases it. */
+   assert(hk_mesh_emulation_admission_ref(a) == a);
+   assert(!hk_mesh_emulation_admission_unref(a));
+   assert(hk_mesh_emulation_admission_unref(a));
+   assert(hk_mesh_emulation_admission_unref(b));
+   assert(hk_mesh_emulation_admission_unref(c));
+
+   ralloc_free(first.shader);
+   ralloc_free(same.shader);
+   ralloc_free(distinct.shader);
+   ralloc_free(unsupported.shader);
+}
+
 int
 main(void)
 {
    test_triangle();
    test_fail_closed();
    test_pull_vs();
+   test_admission_identity_lifetime();
    printf("G13 mesh NIR: producer PASS (%u B), pull VS PASS (%u B), "
-          "unsupported PASS\n",
-          producer_binary_size, pull_vs_binary_size);
+          "admission/cache PASS (%u/%u B), unsupported PASS\n",
+          producer_binary_size, pull_vs_binary_size,
+          admitted_producer_binary_size, admitted_pull_vs_binary_size);
    return 0;
 }

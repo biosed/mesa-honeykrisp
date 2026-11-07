@@ -11,6 +11,7 @@
 #include "hk_frame_anatomy.h"
 #include "hk_agx3_ioto_program_core.h"
 #include "hk_nir_lower_gs.h"
+#include "hk_nir_lower_mesh_emulation.h"
 #include "hk_nir_root_size.h"
 #include "hk_nir_lower_tes_rq.h"
 #include "hk_native_write_class.h"
@@ -5987,6 +5988,76 @@ hk_m5_mesh_passthrough_linked(struct hk_shader *object)
    object->only_linked->b.g17p_compiler_d = 1;
 }
 
+/*
+ * Admit the bounded G13 software-mesh pair to the normal API-shader variant
+ * lifetime.  The immutable admission object only supplies private NIR clones;
+ * both variants still run through hk_compile_nir(), including upload, shader
+ * binary serialization and the existing pipeline-cache ownership rules.
+ */
+static VkResult
+hk_compile_g13_mesh_emulation(
+   struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
+   nir_shader *mesh, const struct vk_shader_compile_info *info,
+   enum hk_feature_key features, uint8_t static_set_mask,
+   struct hk_api_shader *obj)
+{
+   assert(mesh->info.stage == MESA_SHADER_MESH);
+   assert(dev->dev.chip == AGX_CHIP_G13G ||
+          dev->dev.chip == AGX_CHIP_G13X);
+
+   struct hk_mesh_emulation_admission *admission =
+      hk_mesh_emulation_admission_create(mesh, &agx_nir_options);
+   ralloc_free(mesh);
+   if (!admission)
+      return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "mesh shader outside the G13 emulation contract");
+
+   nir_shader *producer = hk_mesh_emulation_admission_clone_producer(
+      admission, &agx_nir_options);
+   nir_shader *pull_vs = hk_mesh_emulation_admission_clone_pull_vs(
+      admission, &agx_nir_options);
+   const struct hk_mesh_emulation_layout *layout =
+      hk_mesh_emulation_admission_layout(admission);
+
+   if (!producer || !pull_vs) {
+      ralloc_free(producer);
+      ralloc_free(pull_vs);
+      hk_mesh_emulation_admission_unref(admission);
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+
+   struct hk_shader *main = hk_main_mesh_variant(obj);
+   main->info.mesh.max_vertices = layout->vertices_per_group;
+   main->info.mesh.max_primitives = layout->primitives_per_group;
+   main->info.mesh.prim = MESA_PRIM_TRIANGLES;
+   for (unsigned i = 0; i < 3; ++i)
+      main->info.mesh.local_size[i] = producer->info.workgroup_size[i];
+
+   /* The admission lowering introduces shared/global operations after the
+    * API shader's ordinary preprocessing pass. */
+   agx_preprocess_nir(producer);
+
+   VkResult result = hk_compile_nir(
+      dev, pAllocator, producer, info->flags, info->robustness, NULL, features,
+      main, MESA_SHADER_MESH, true, NULL, info->set_layout_count,
+      static_set_mask);
+   if (result != VK_SUCCESS) {
+      ralloc_free(pull_vs);
+      hk_mesh_emulation_admission_unref(admission);
+      return result;
+   }
+
+   struct hk_shader *rast = hk_rast_mesh_variant(obj);
+   agx_preprocess_nir(pull_vs);
+   hk_lower_hw_vs(pull_vs, rast, false, false, false, false);
+   result = hk_compile_nir(
+      dev, pAllocator, pull_vs, info->flags, info->robustness, NULL, features,
+      rast, MESA_SHADER_MESH, true, NULL, 0, 0);
+
+   hk_mesh_emulation_admission_unref(admission);
+   return result;
+}
+
 static VkResult
 hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *info,
                   const struct vk_graphics_pipeline_state *state,
@@ -6228,7 +6299,16 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
 
 
 
-   if (sw_stage == MESA_SHADER_MESH) {
+   if (sw_stage == MESA_SHADER_MESH &&
+       (dev->dev.chip == AGX_CHIP_G13G ||
+        dev->dev.chip == AGX_CHIP_G13X)) {
+      result = hk_compile_g13_mesh_emulation(
+         dev, pAllocator, nir, info, features, static_set_mask, obj);
+      if (result != VK_SUCCESS) {
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return result;
+      }
+   } else if (sw_stage == MESA_SHADER_MESH) {
       struct hk_shader *shader = hk_main_mesh_variant(obj);
       if ((dev->dev.chip != AGX_CHIP_G17P && dev->dev.chip != AGX_CHIP_G17S) ||
           hk_mesh_mode() != HK_MESH_MODE_NATIVE_PROBE) {

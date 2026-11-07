@@ -5,13 +5,29 @@
 
 #include "hk_nir_lower_mesh_emulation.h"
 
+#include <assert.h>
 #include <stddef.h>
+#include <stdlib.h>
 
 #include "compiler/nir/nir_builder.h"
+#include "nir_serialize.h"
+#include "util/blob.h"
+#include "util/u_atomic.h"
 #include "util/u_math.h"
 
 #define HK_MESH_EMULATION_MAX_VERTICES   256
 #define HK_MESH_EMULATION_MAX_PRIMITIVES 256
+#define HK_MESH_EMULATION_ADMISSION_VERSION 1
+
+struct hk_mesh_emulation_admission {
+   uint32_t refcount;
+   uint8_t identity[BLAKE3_KEY_LEN];
+   struct hk_mesh_emulation_layout layout;
+   void *producer;
+   size_t producer_size;
+   void *pull_vs;
+   size_t pull_vs_size;
+};
 
 static struct hk_mesh_emulation_layout
 mesh_layout(const nir_shader *shader)
@@ -94,6 +110,14 @@ validate_shader(const nir_shader *shader,
    nir_foreach_function_impl(impl, shader) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_jump &&
+                nir_instr_as_jump(instr)->type == nir_jump_return) {
+               /* The appended export contains a workgroup barrier.  Until
+                * the pass lowers returns into structured control flow,
+                * admitting a returning lane could make it non-uniform. */
+               return false;
+            }
+
             if (instr->type != nir_instr_type_intrinsic)
                continue;
 
@@ -382,4 +406,150 @@ hk_nir_mesh_emulation_pull_vs(const nir_shader_compiler_options *options)
    nir_shader_gather_info(b.shader, b.impl);
 
    return b.shader;
+}
+
+static bool
+serialize_nir(const nir_shader *nir, void **data_out, size_t *size_out)
+{
+   struct blob blob;
+   blob_init(&blob);
+   nir_serialize(&blob, nir, false);
+   if (blob.out_of_memory) {
+      blob_finish(&blob);
+      return false;
+   }
+
+   blob_finish_get_buffer(&blob, data_out, size_out);
+   return true;
+}
+
+static nir_shader *
+deserialize_nir(const void *data, size_t size,
+                const nir_shader_compiler_options *options)
+{
+   struct blob_reader reader;
+   blob_reader_init(&reader, data, size);
+   nir_shader *nir = nir_deserialize(NULL, options, &reader);
+   if (!nir || reader.overrun || reader.current != reader.end) {
+      ralloc_free(nir);
+      return NULL;
+   }
+
+   return nir;
+}
+
+struct hk_mesh_emulation_admission *
+hk_mesh_emulation_admission_create(
+   const nir_shader *mesh, const nir_shader_compiler_options *options)
+{
+   nir_shader *producer = nir_shader_clone(NULL, mesh);
+   if (!producer)
+      return NULL;
+
+   struct hk_mesh_emulation_layout layout;
+   if (!hk_nir_lower_mesh_emulation(producer, &layout)) {
+      ralloc_free(producer);
+      return NULL;
+   }
+
+   nir_shader *pull_vs = hk_nir_mesh_emulation_pull_vs(options);
+   if (!pull_vs) {
+      ralloc_free(producer);
+      return NULL;
+   }
+
+   struct hk_mesh_emulation_admission *admission =
+      calloc(1, sizeof(*admission));
+   if (!admission ||
+       !serialize_nir(producer, &admission->producer,
+                      &admission->producer_size) ||
+       !serialize_nir(pull_vs, &admission->pull_vs,
+                      &admission->pull_vs_size)) {
+      if (admission) {
+         free(admission->producer);
+         free(admission->pull_vs);
+      }
+      free(admission);
+      ralloc_free(producer);
+      ralloc_free(pull_vs);
+      return NULL;
+   }
+
+   admission->refcount = 1;
+   admission->layout = layout;
+
+   const uint32_t version = HK_MESH_EMULATION_ADMISSION_VERSION;
+   const uint64_t producer_size = admission->producer_size;
+   const uint64_t pull_vs_size = admission->pull_vs_size;
+   blake3_hasher hasher;
+   _mesa_blake3_init(&hasher);
+   _mesa_blake3_update(&hasher, &version, sizeof(version));
+   _mesa_blake3_update(&hasher, &producer_size, sizeof(producer_size));
+   _mesa_blake3_update(&hasher, admission->producer,
+                       admission->producer_size);
+   _mesa_blake3_update(&hasher, &pull_vs_size, sizeof(pull_vs_size));
+   _mesa_blake3_update(&hasher, admission->pull_vs,
+                       admission->pull_vs_size);
+   _mesa_blake3_final(&hasher, admission->identity);
+
+   ralloc_free(producer);
+   ralloc_free(pull_vs);
+   return admission;
+}
+
+struct hk_mesh_emulation_admission *
+hk_mesh_emulation_admission_ref(struct hk_mesh_emulation_admission *admission)
+{
+   assert(admission && p_atomic_read(&admission->refcount) > 0);
+   p_atomic_inc(&admission->refcount);
+   return admission;
+}
+
+bool
+hk_mesh_emulation_admission_unref(
+   struct hk_mesh_emulation_admission *admission)
+{
+   if (!admission)
+      return false;
+
+   assert(p_atomic_read(&admission->refcount) > 0);
+   if (!p_atomic_dec_zero(&admission->refcount))
+      return false;
+
+   free(admission->producer);
+   free(admission->pull_vs);
+   free(admission);
+   return true;
+}
+
+const uint8_t *
+hk_mesh_emulation_admission_identity(
+   const struct hk_mesh_emulation_admission *admission)
+{
+   return admission->identity;
+}
+
+const struct hk_mesh_emulation_layout *
+hk_mesh_emulation_admission_layout(
+   const struct hk_mesh_emulation_admission *admission)
+{
+   return &admission->layout;
+}
+
+nir_shader *
+hk_mesh_emulation_admission_clone_producer(
+   const struct hk_mesh_emulation_admission *admission,
+   const nir_shader_compiler_options *options)
+{
+   return deserialize_nir(admission->producer, admission->producer_size,
+                          options);
+}
+
+nir_shader *
+hk_mesh_emulation_admission_clone_pull_vs(
+   const struct hk_mesh_emulation_admission *admission,
+   const nir_shader_compiler_options *options)
+{
+   return deserialize_nir(admission->pull_vs, admission->pull_vs_size,
+                          options);
 }
