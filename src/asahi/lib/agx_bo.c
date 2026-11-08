@@ -552,7 +552,13 @@ agx_bo_dump_all(struct agx_device *dev)
 static void
 agx_bo_dump_all_periodic(struct agx_device *dev)
 {
-   if (likely(!(dev->debug & (AGX_DBG_BODUMP | AGX_DBG_BODUMPVERBOSE))))
+   static int dm_dump = -1;
+   if (unlikely(dm_dump < 0)) {
+      const char *e = getenv("DM_HK_BODUMP");
+      dm_dump = e && atoi(e) != 0;
+   }
+   if (likely(!(dev->debug & (AGX_DBG_BODUMP | AGX_DBG_BODUMPVERBOSE)) &&
+              !dm_dump))
       return;
 
    static time_t agx_last_dumped_time = 0;

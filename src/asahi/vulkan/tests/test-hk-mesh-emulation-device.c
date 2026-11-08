@@ -32,7 +32,7 @@
    } while (0)
 
 static nir_shader *
-triangle_mesh(unsigned payload_size_B)
+triangle_mesh(unsigned payload_size_B, bool split_position)
 {
    static const nir_shader_compiler_options options = {0};
    nir_builder b = nir_builder_init_simple_shader(
@@ -54,12 +54,33 @@ triangle_mesh(unsigned payload_size_B)
    nir_def *lane = nir_load_local_invocation_index(&b);
    nir_set_vertex_and_primitive_count(
       &b, nir_imm_int(&b, 3), nir_imm_int(&b, 1), nir_imm_int(&b, 0));
-   nir_store_per_vertex_output(
-      &b, nir_vec4(&b, nir_i2f32(&b, lane), nir_imm_float(&b, 0.0f),
-                   nir_imm_float(&b, 0.0f), nir_imm_float(&b, 1.0f)),
-      lane, nir_imm_int(&b, 0), .write_mask = 0xf,
-      .src_type = nir_type_float32,
-      .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+   nir_def *position[4] = {
+      nir_i2f32(&b, lane), nir_imm_float(&b, 0.0f),
+      nir_imm_float(&b, 0.0f), nir_imm_float(&b, 1.0f),
+   };
+   if (split_position) {
+      /* Two partial stores exercise nonzero component addressing as well as
+       * write masks wider than a scalar. */
+      nir_store_per_vertex_output(
+         &b, nir_vec2(&b, position[0], position[1]), lane,
+         nir_imm_int(&b, 0), .write_mask = 0x3, .component = 0,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_store_per_vertex_output(
+         &b, nir_vec2(&b, position[2], position[3]), lane,
+         nir_imm_int(&b, 0), .write_mask = 0x3, .component = 2,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+   } else {
+      /* Match the title modules: four component-wise Position stores. */
+      for (unsigned c = 0; c < 4; ++c) {
+         nir_store_per_vertex_output(
+            &b, position[c], lane, nir_imm_int(&b, 0), .write_mask = 0x1,
+            .component = c, .src_type = nir_type_float32,
+            .io_semantics = {.location = VARYING_SLOT_POS,
+                             .num_slots = 1});
+      }
+   }
    nir_store_per_vertex_output(
       &b, nir_vec4(&b, nir_i2f32(&b, lane), nir_imm_float(&b, 0.25f),
                    nir_imm_float(&b, 0.75f), nir_imm_float(&b, 1.0f)),
@@ -106,6 +127,33 @@ title_task(void)
    nir_store_task_payload(&b, lane, nir_imul_imm(&b, lane, 4),
                           .align_mul = 4);
    nir_launch_mesh_workgroups(&b, nir_imm_ivec3(&b, 2, 1, 1));
+   nir_shader_gather_info(b.shader, b.impl);
+   return b.shader;
+}
+
+static nir_shader *
+ordinary_vertex(void)
+{
+   static const nir_shader_compiler_options options = {0};
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, &options, "device-cache ordinary vertex");
+   b.shader->info.outputs_written = VARYING_BIT_POS;
+   nir_store_output(
+      &b, nir_imm_vec4(&b, 0.0f, 0.0f, 0.0f, 1.0f), nir_imm_int(&b, 0),
+      .write_mask = 0xf, .src_type = nir_type_float32,
+      .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+   nir_shader_gather_info(b.shader, b.impl);
+   return b.shader;
+}
+
+static nir_shader *
+ordinary_fragment(void)
+{
+   static const nir_shader_compiler_options options = {0};
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &options, "device-cache ordinary fragment");
+   /* A compiled zero-byte fragment main is still a real shader object with a
+    * link table and packed fragment state, unlike an absent variant. */
    nir_shader_gather_info(b.shader, b.impl);
    return b.shader;
 }
@@ -196,7 +244,7 @@ main(void)
    struct vk_shader_compile_info info = {
       .stage = MESA_SHADER_MESH,
       .next_stage_mask = VK_SHADER_STAGE_FRAGMENT_BIT,
-      .nir = triangle_mesh(0),
+      .nir = triangle_mesh(0, false),
       .robustness = &vk_robustness_disabled,
    };
    struct vk_shader *compiled_vk = NULL;
@@ -272,9 +320,12 @@ main(void)
       mutable_rast->info.mesh.vertex_stride_B;
    mutable_main->info.mesh.max_vertices = 256;
    mutable_main->info.mesh.max_primitives = 256;
-   mutable_main->info.mesh.vertex_stride_B = 528;
-   mutable_main->info.mesh.primitive_stride_B = 528;
-   mutable_rast->info.mesh.vertex_stride_B = 528;
+   /* Keep a synthetic aggregate-scratch rejection case after lowering the
+    * experimental group cap. These deliberately impossible strides isolate
+    * the recorder's 256-MiB aggregate guard from ordinary shader admission. */
+   mutable_main->info.mesh.vertex_stride_B = 4096;
+   mutable_main->info.mesh.primitive_stride_B = 4096;
+   mutable_rast->info.mesh.vertex_stride_B = 4096;
    assert(!hk_mesh_emulation_direct_requirements(
       dev->dev.chip, compiled, max_host_grid, &direct));
    mutable_main->info.mesh = saved_info;
@@ -312,7 +363,7 @@ main(void)
    struct vk_shader_compile_info payload_mesh_info = {
       .stage = MESA_SHADER_MESH,
       .next_stage_mask = VK_SHADER_STAGE_FRAGMENT_BIT,
-      .nir = triangle_mesh(256),
+      .nir = triangle_mesh(256, true),
       .robustness = &vk_robustness_disabled,
    };
    struct vk_shader *payload_mesh_vk = NULL;
@@ -373,9 +424,8 @@ main(void)
 
    /* Title-wide paired extrema (key 1515d800ca824dec): 64V/126P,
     * 52 per-vertex components, strides 224/16/224 and 3200-byte task
-    * payload.  2048 emitted groups is the largest power-of-two cap that
-    * keeps this exact 102616-byte/group layout under the 256-MiB recorder
-    * budget while retaining 4096 input task groups. */
+    * payload. Verify that the coherent experimental child cap bounds every
+    * group-sized region while retaining 4096 input task groups. */
    struct hk_shader *task_variant = &task->variants[0];
    struct hk_shader *payload_main = hk_main_mesh_variant(payload_mesh);
    struct hk_shader *payload_rast = hk_rast_mesh_variant(payload_mesh);
@@ -410,8 +460,9 @@ main(void)
    assert(group_dependent % title_plan.draw_count == 0);
    assert(group_dependent / title_plan.draw_count == 102616);
    assert(title_plan.scratch_size_B <= HK_G13_MESH_MAX_SCRATCH_SIZE);
-   assert(title_plan.scratch_size_B + group_dependent >
-          HK_G13_MESH_MAX_SCRATCH_SIZE);
+   assert(title_plan.scratch_size_B ==
+          group_dependent + title_plan.task_records_size_B +
+             sizeof(struct hk_mesh_emulation_params));
    const uint32_t too_many_input_task_groups[3] = {
       HK_G13_TASK_MAX_GROUP_TOTAL + 1, 1, 1,
    };
@@ -480,8 +531,114 @@ main(void)
    assert(!hk_rast_mesh_variant(second)->only_linked);
    assert(hk_rast_mesh_variant(first)->linked.lazy_ht);
    assert(hk_rast_mesh_variant(second)->linked.lazy_ht);
+   assert(hk_rast_mesh_variant(first)->b.info.has_preamble);
+   assert(hk_rast_mesh_variant(second)->b.info.has_preamble);
+   assert(hk_rast_mesh_variant(first)->bo);
+   assert(hk_rast_mesh_variant(second)->bo);
+   assert(hk_rast_mesh_variant(first)->preamble_addr >=
+          dev->dev.shader_base);
+   assert(hk_rast_mesh_variant(second)->preamble_addr >=
+          dev->dev.shader_base);
+   assert(hk_rast_mesh_variant(first)->preamble_addr ==
+          hk_shader_code_va(hk_rast_mesh_variant(first)) +
+             hk_rast_mesh_variant(first)->b.info.preamble_offset);
+   assert(hk_rast_mesh_variant(second)->preamble_addr ==
+          hk_shader_code_va(hk_rast_mesh_variant(second)) +
+             hk_rast_mesh_variant(second)->b.info.preamble_offset);
    assert(&hk_rast_mesh_variant(first)->linked !=
           &hk_rast_mesh_variant(second)->linked);
+
+   /* A cacheable ordinary stage must remain lazy. This is the exact mixed
+    * shader-binary case exercised after the game-wide warm cache is loaded:
+    * it must not enter the G13 mesh producer's eager-upload path. */
+   struct vk_shader_compile_info vertex_info = {
+      .stage = MESA_SHADER_VERTEX,
+      .next_stage_mask = VK_SHADER_STAGE_FRAGMENT_BIT,
+      .nir = ordinary_vertex(),
+      .robustness = &vk_robustness_disabled,
+   };
+   struct vk_shader *vertex_vk = NULL;
+   CHECK(dev->vk.shader_ops->compile(&dev->vk, 1, &vertex_info, NULL, NULL,
+                                     NULL, &vertex_vk));
+   struct hk_api_shader *vertex =
+      container_of(vertex_vk, struct hk_api_shader, vk);
+   struct blob vertex_blob;
+   blob_init(&vertex_blob);
+   assert(vertex->vk.ops->serialize(&dev->vk, &vertex->vk, &vertex_blob));
+   assert(!vertex_blob.out_of_memory && vertex_blob.size > 0);
+
+   struct hk_api_shader *vertex_first =
+      deserialize(dev, vertex_blob.data, vertex_blob.size);
+   struct hk_api_shader *vertex_second =
+      deserialize(dev, vertex_blob.data, vertex_blob.size);
+   assert(vertex_first->vk.stage == MESA_SHADER_VERTEX);
+   assert(vertex_first->binary_cache_entry);
+   assert(vertex_first->binary_cache_entry ==
+          vertex_second->binary_cache_entry);
+   struct hk_shader *vertex_first_hw =
+      &vertex_first->variants[HK_VS_VARIANT_HW];
+   struct hk_shader *vertex_second_hw =
+      &vertex_second->variants[HK_VS_VARIANT_HW];
+   struct hk_shader *vertex_hw = &vertex->variants[HK_VS_VARIANT_HW];
+   assert(vertex_first_hw->compiled && vertex_second_hw->compiled);
+   assert(vertex_first_hw->linked.lazy_ht &&
+          vertex_second_hw->linked.lazy_ht);
+   assert(!vertex_first_hw->bo && !vertex_second_hw->bo);
+   assert(!vertex_first_hw->only_linked &&
+          !vertex_second_hw->only_linked);
+   assert(memcmp(&vertex_first_hw->counts, &vertex_hw->counts,
+                 sizeof(vertex_hw->counts)) == 0);
+   assert(memcmp(&vertex_second_hw->counts, &vertex_hw->counts,
+                 sizeof(vertex_hw->counts)) == 0);
+   assert(vertex_first_hw->constant_data_id ==
+          vertex_second_hw->constant_data_id);
+   /* Re-enter the mesh cache after an ordinary-stage hit: stage-local clone
+    * policy must not affect cache identity or the producer's private upload. */
+   struct hk_api_shader *third = deserialize(dev, blob.data, blob.size);
+   check_uploaded_pair(third);
+   assert(third->binary_cache_entry == first->binary_cache_entry);
+
+   struct vk_shader_compile_info fragment_info = {
+      .stage = MESA_SHADER_FRAGMENT,
+      .nir = ordinary_fragment(),
+      .robustness = &vk_robustness_disabled,
+   };
+   struct vk_shader *fragment_vk = NULL;
+   CHECK(dev->vk.shader_ops->compile(&dev->vk, 1, &fragment_info, NULL, NULL,
+                                     NULL, &fragment_vk));
+   struct hk_api_shader *fragment =
+      container_of(fragment_vk, struct hk_api_shader, vk);
+   struct blob fragment_blob;
+   blob_init(&fragment_blob);
+   assert(fragment->vk.ops->serialize(&dev->vk, &fragment->vk,
+                                      &fragment_blob));
+   assert(!fragment_blob.out_of_memory && fragment_blob.size > 0);
+
+   struct hk_api_shader *fragment_first =
+      deserialize(dev, fragment_blob.data, fragment_blob.size);
+   struct hk_api_shader *fragment_second =
+      deserialize(dev, fragment_blob.data, fragment_blob.size);
+   assert(fragment_first->vk.stage == MESA_SHADER_FRAGMENT);
+   assert(fragment_first->binary_cache_entry);
+   assert(fragment_first->binary_cache_entry ==
+          fragment_second->binary_cache_entry);
+   struct hk_shader *fragment_main = &fragment->variants[0];
+   struct hk_shader *fragment_first_main = &fragment_first->variants[0];
+   struct hk_shader *fragment_second_main = &fragment_second->variants[0];
+   assert(fragment_first_main->compiled && fragment_second_main->compiled);
+   assert(fragment_first_main->linked.lazy_ht &&
+          fragment_second_main->linked.lazy_ht);
+   assert(!fragment_first_main->bo && !fragment_second_main->bo);
+   assert(!fragment_first_main->only_linked &&
+          !fragment_second_main->only_linked);
+   assert(memcmp(&fragment_first_main->counts, &fragment_main->counts,
+                 sizeof(fragment_main->counts)) == 0);
+   assert(memcmp(&fragment_second_main->counts, &fragment_main->counts,
+                 sizeof(fragment_main->counts)) == 0);
+   assert(memcmp(&fragment_first_main->frag_face, &fragment_main->frag_face,
+                 sizeof(fragment_main->frag_face)) == 0);
+   assert(memcmp(&fragment_second_main->frag_face, &fragment_main->frag_face,
+                 sizeof(fragment_main->frag_face)) == 0);
 
    const uint32_t producer_size = hk_main_mesh_variant(compiled)->code_size;
    const uint32_t pull_vs_size = hk_rast_mesh_variant(compiled)->code_size;
@@ -491,12 +648,21 @@ main(void)
    assert(hk_main_mesh_variant(second)->code_ptr);
    assert(hk_rast_mesh_variant(second)->code_ptr);
    second->vk.ops->destroy(&dev->vk, &second->vk, NULL);
+   third->vk.ops->destroy(&dev->vk, &third->vk, NULL);
    task->vk.ops->destroy(&dev->vk, &task->vk, NULL);
    task_clone->vk.ops->destroy(&dev->vk, &task_clone->vk, NULL);
    payload_mesh->vk.ops->destroy(&dev->vk, &payload_mesh->vk, NULL);
+   vertex->vk.ops->destroy(&dev->vk, &vertex->vk, NULL);
+   vertex_first->vk.ops->destroy(&dev->vk, &vertex_first->vk, NULL);
+   vertex_second->vk.ops->destroy(&dev->vk, &vertex_second->vk, NULL);
+   fragment->vk.ops->destroy(&dev->vk, &fragment->vk, NULL);
+   fragment_first->vk.ops->destroy(&dev->vk, &fragment_first->vk, NULL);
+   fragment_second->vk.ops->destroy(&dev->vk, &fragment_second->vk, NULL);
 
    blob_finish(&task_blob);
    blob_finish(&blob);
+   blob_finish(&vertex_blob);
+   blob_finish(&fragment_blob);
    vkDestroyDevice(device, NULL);
    vkDestroyInstance(instance, NULL);
 

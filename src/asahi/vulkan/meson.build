@@ -858,12 +858,36 @@ if with_tests
       ],
       depfile : 'g13_mesh_task_readback.frag.spv.h.d',
     )
+    g13_mesh_task_position_only_mesh_spv = custom_target(
+      'g13_mesh_task_position_only.mesh.spv.h',
+      input : 'tests/g13_mesh_task_position_only.mesh',
+      output : 'g13_mesh_task_position_only.mesh.spv.h',
+      command : [
+        prog_glslang, '-V', '--target-env', 'vulkan1.3', '-S', 'mesh',
+        '-x', '-o', '@OUTPUT@', '@INPUT@', glslang_quiet, glslang_depfile,
+      ],
+      depfile : 'g13_mesh_task_position_only.mesh.spv.h.d',
+    )
+    g13_mesh_task_position_only_frag_spv = custom_target(
+      'g13_mesh_task_position_only.frag.spv.h',
+      input : 'tests/g13_mesh_task_position_only.frag',
+      output : 'g13_mesh_task_position_only.frag.spv.h',
+      command : [
+        prog_glslang, '-V', '--target-env', 'vulkan1.3', '-S', 'frag',
+        '-x', '-o', '@OUTPUT@', '@INPUT@', glslang_quiet, glslang_depfile,
+      ],
+      depfile : 'g13_mesh_task_position_only.frag.spv.h.d',
+    )
     hk_mesh_task_readback_test = executable(
       'hk_mesh_task_readback_test',
       files('tests/test-hk-mesh-task-readback.c'),
       g13_mesh_task_readback_task_spv,
       g13_mesh_task_readback_mesh_spv,
       g13_mesh_task_readback_frag_spv,
+      g13_mesh_task_position_only_mesh_spv,
+      g13_mesh_task_position_only_frag_spv,
+      g13_mesh_public_triangle_spv,
+      g13_mesh_public_triangle_frag_spv,
       include_directories : [inc_include],
       dependencies : [cc.find_library('vulkan'), dep_dl],
       c_args : [c_msvc_compat_args],

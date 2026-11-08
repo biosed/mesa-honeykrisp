@@ -65,13 +65,18 @@ record_output(struct hk_mesh_emulation_layout *layout,
    const nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
    const unsigned slot = sem.location + nir_src_as_uint(intr->src[2]);
    const unsigned component = nir_intrinsic_component(intr);
-   const unsigned components = component +
-      util_last_bit(nir_intrinsic_write_mask(intr));
+   const unsigned write_mask = nir_intrinsic_write_mask(intr);
+   const unsigned written_components = util_last_bit(write_mask);
+   const unsigned components = component + written_components;
 
    if (!primitive && slot == VARYING_SLOT_POS) {
-      return sem.num_slots == 1 && component == 0 && components == 4 &&
-             nir_intrinsic_write_mask(intr) == 0xf &&
-             intr->src[0].ssa->num_components == 4 &&
+      /* SPIR-V frontends commonly scalarize gl_Position into four stores.
+       * The lowering below already writes every enabled channel at
+       * position_offset_B + 4 * (component + channel), so admit any bounded
+       * float32 slice here and verify complete x/y/z/w coverage over the
+       * whole shader in validate_shader(). */
+      return sem.num_slots == 1 && write_mask != 0 && components <= 4 &&
+             written_components <= intr->src[0].ssa->num_components &&
              nir_intrinsic_src_type(intr) == nir_type_float32;
    }
 
@@ -158,7 +163,7 @@ validate_shader(const nir_shader *shader,
       return false;
 
    bool counts = false;
-   bool position = false;
+   uint8_t position_mask = 0;
    bool indices = false;
    nir_foreach_function_impl(impl, shader) {
       nir_foreach_block(block, impl) {
@@ -189,11 +194,14 @@ validate_shader(const nir_shader *shader,
                       intr->intrinsic ==
                          nir_intrinsic_store_per_primitive_output))
                   return false;
-               position |= intr->intrinsic ==
-                              nir_intrinsic_store_per_vertex_output &&
-                           nir_intrinsic_io_semantics(intr).location +
-                                 nir_src_as_uint(intr->src[2]) ==
-                              VARYING_SLOT_POS;
+               if (intr->intrinsic ==
+                      nir_intrinsic_store_per_vertex_output &&
+                   nir_intrinsic_io_semantics(intr).location +
+                         nir_src_as_uint(intr->src[2]) ==
+                      VARYING_SLOT_POS) {
+                  position_mask |= nir_intrinsic_write_mask(intr) <<
+                                   nir_intrinsic_component(intr);
+               }
                indices |= intr->intrinsic ==
                              nir_intrinsic_store_per_primitive_output &&
                           nir_intrinsic_io_semantics(intr).location +
@@ -219,7 +227,7 @@ validate_shader(const nir_shader *shader,
       }
    }
 
-   if (!counts || !position || !indices)
+   if (!counts || position_mask != 0xf || !indices)
       return false;
 
    layout->vertices_per_group = shader->info.mesh.max_vertices_out;
@@ -1133,10 +1141,12 @@ hk_nir_lower_mesh_emulation(
 
    /* SPIR-V frontends retain the mesh output variables after nir_lower_io().
     * The emulation pass has replaced every output intrinsic above, so these
-    * variables are dead.  Drop them before changing the API stage to compute:
+    * variables and their now-unused derefs are dead.  Drop the derefs first,
+    * then the variables, before changing the API stage to compute:
     * nir_shader_gather_info() correctly rejects per-primitive output variables
     * on a compute shader.  Hand-built unit NIR did not carry these variables,
     * which is why the public-pipeline fixture is the regression test here. */
+   nir_remove_dead_derefs(shader);
    nir_remove_dead_variables(shader,
                              nir_var_shader_out | nir_var_mem_task_payload,
                              NULL);

@@ -17,7 +17,7 @@
  * path will place its address in draw.geometry_params before dispatching the
  * lowered shader.  Keep this ABI independent of Vulkan application memory.
  */
-#define HK_MESH_EMULATION_ABI_VERSION 4u
+#define HK_MESH_EMULATION_ABI_VERSION 5u
 #define HK_MESH_EMULATION_PARAMS_SIZE 128u
 #define HK_MESH_EMULATION_TARGET_G13 13u
 #define HK_MESH_EMULATION_MAX_SLOTS 64u
@@ -29,7 +29,13 @@
 #define HK_MESH_EMULATION_MAX_TASK_PAYLOAD (4u * 1024u)
 #define HK_MESH_EMULATION_TASK_RECORD_HEADER_SIZE 16u
 #define HK_MESH_EMULATION_MAX_TASK_GROUPS 4096u
-#define HK_MESH_EMULATION_MAX_EMITTED_GROUPS 2048u
+/* The current G13 software path records and retains one raster consumer plus
+ * worst-case scratch for every possible child.  Keep this experimental limit
+ * coherent in task lowering, allocation, predicate and advertised limits.
+ * The first title task pair emits at most 32 children per input group (64 for
+ * its direct count of two); larger emissions fail closed through task_overflow
+ * instead of producing a partial draw. */
+#define HK_MESH_EMULATION_MAX_EMITTED_GROUPS 64u
 #define HK_MESH_EMULATION_FLAG_TASK UINT32_C(2)
 
 struct hk_mesh_emulation_params {

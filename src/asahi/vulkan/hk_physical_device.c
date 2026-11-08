@@ -1860,6 +1860,23 @@ hk_physical_device_init_pipeline_cache(struct hk_physical_device *pdev)
    memcpy(pdev->vk.properties.pipelineCacheUUID, blake3, VK_UUID_SIZE);
    memcpy(pdev->vk.properties.shaderBinaryUUID, blake3, VK_UUID_SIZE);
 
+   /* G13 software mesh is an explicitly selected development profile.  Its
+    * command-recording cap and telemetry are being iterated independently of
+    * the shader compiler/lowering ABI; hashing every such C-only edit into
+    * shaderBinaryUUID needlessly invalidates the title's ~4,000 serialized
+    * shader objects.  Pin this experimental profile to the established
+    * F6/G1 compiler contract and bump the UUID only when that contract or a
+    * shader rewrite changes. */
+   if (hk_g13_software_mesh_supported(pdev->dev.chip) &&
+       debug_get_bool_option("ASAHI_G13_SOFTWARE_MESH", false)) {
+      static const uint8_t g13_swmesh_shader_uuid[VK_UUID_SIZE] = {
+         0x1d, 0xbe, 0xb6, 0xea, 0x98, 0x37, 0x91, 0x57,
+         0xbc, 0x8b, 0xd5, 0xec, 0x4a, 0x82, 0x01, 0x68,
+      };
+      memcpy(pdev->vk.properties.shaderBinaryUUID,
+             g13_swmesh_shader_uuid, VK_UUID_SIZE);
+   }
+
 #ifdef ENABLE_SHADER_CACHE
    char renderer[10];
    ASSERTED int len =

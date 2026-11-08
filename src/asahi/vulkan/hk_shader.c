@@ -3477,11 +3477,11 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             nir_opt_if_optimize_phi_true_false | nir_opt_if_avoid_64bit_phis);
 }
 
-/* Report a failed executable-preamble upload, so the caller's error path
- * destroys the half-built shader instead of keeping one with preamble_addr
- * 0. */
-static VkResult
-hk_upload_shader(struct hk_device *dev, struct hk_shader *shader)
+/* Build the immutable CPU-side hardware words kept with a shader payload.
+ * Cache templates never upload or link, but their wrappers still consume
+ * these words directly at draw time. */
+static void
+hk_shader_pack_hw_words(struct hk_shader *shader)
 {
    /* Allocator addresses can be recycled after a shader is destroyed while
     * earlier commands still own an upload of its constants. Do not key those
@@ -3489,6 +3489,27 @@ hk_upload_shader(struct hk_device *dev, struct hk_shader *shader)
    static uint64_t next_constant_data_id;
    if (shader->data_size && !shader->constant_data_id)
       shader->constant_data_id = p_atomic_inc_return(&next_constant_data_id);
+
+   if (shader->info.stage == MESA_SHADER_FRAGMENT) {
+      agx_pack_fragment_face_2(&shader->frag_face, 0, &shader->b.info);
+   }
+
+   agx_pack(&shader->counts, COUNTS, cfg) {
+      cfg.uniform_register_count = shader->b.info.push_count;
+      cfg.preshader_register_count = shader->b.info.nr_preamble_gprs;
+      cfg.sampler_state_register_count = agx_translate_sampler_state_count(
+         shader->b.info.sampler_state_count, false);
+      cfg.texture_state_register_count = shader->b.info.texture_state_count;
+   }
+}
+
+/* Report a failed executable-preamble upload, so the caller's error path
+ * destroys the half-built shader instead of keeping one with preamble_addr
+ * 0. */
+static VkResult
+hk_upload_shader(struct hk_device *dev, struct hk_shader *shader)
+{
+   hk_shader_pack_hw_words(shader);
 
    if (shader->b.info.has_preamble || shader->b.info.rodata.size_16) {
       /* TODO: Do we wnat to compact? Revisit when we rework prolog/epilogs. */
@@ -3506,23 +3527,11 @@ hk_upload_shader(struct hk_device *dev, struct hk_shader *shader)
          hk_shader_code_va(shader) + shader->b.info.preamble_offset;
    }
 
-   if (!shader->linked.ht) {
+   if (!shader->linked.ht && !shader->linked.lazy_ht) {
       /* If we only have a single variant, link now. */
       shader->only_linked = hk_fast_link(dev, false, shader, NULL, NULL, 0);
       if (!shader->only_linked)
          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-   }
-
-   if (shader->info.stage == MESA_SHADER_FRAGMENT) {
-      agx_pack_fragment_face_2(&shader->frag_face, 0, &shader->b.info);
-   }
-
-   agx_pack(&shader->counts, COUNTS, cfg) {
-      cfg.uniform_register_count = shader->b.info.push_count;
-      cfg.preshader_register_count = shader->b.info.nr_preamble_gprs;
-      cfg.sampler_state_register_count = agx_translate_sampler_state_count(
-         shader->b.info.sampler_state_count, false);
-      cfg.texture_state_register_count = shader->b.info.texture_state_count;
    }
 
    return VK_SUCCESS;
@@ -7543,7 +7552,9 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
       /* A cache template owns immutable CPU payload only. Dynamic
        * vertex/fragment link tables, including the G13 pull VS, are created
        * lazily by wrappers. The G13 producer instead gets an eager private
-       * upload in hk_shader_binary_cache_clone(). */
+       * upload in hk_shader_binary_cache_clone(). Pack the CPU-side words
+       * now because every wrapper consumes them even without an upload. */
+      hk_shader_pack_hw_words(shader);
       shader->compiled = true;
       return VK_SUCCESS;
    }
@@ -7881,22 +7892,27 @@ hk_shader_binary_cache_clone(struct hk_device *dev,
    }
 
    /* Initialize every mutex before an upload can fail: object destruction
-    * always walks all variants. The G13 mesh producer has one fixed linked
-    * executable, so each wrapper uploads its own while borrowing only the
-    * immutable payload. Its pull VS uses the normal dynamic vertex table. */
-   for (unsigned i = 0; i < hk_api_num_variants(src_obj); ++i) {
-      struct hk_shader *dst = &obj->variants[i];
-      const struct hk_shader *src = &src_obj->variants[i];
-      if (!src->compiled || src->linked.ht)
-         continue;
+    * always walks all variants. Only the G13 mesh producer has a fixed
+    * linked executable that must be uploaded for each wrapper. Ordinary
+    * stages retain their per-clone lazy link state and upload on first use;
+    * eagerly uploading them here would incorrectly treat every cacheable
+    * shader-binary payload as a mesh shader. */
+   const bool g13_mesh_single_link =
+      src_obj->vk.stage == MESA_SHADER_MESH &&
+      (dev->dev.chip == AGX_CHIP_G13G ||
+       dev->dev.chip == AGX_CHIP_G13X);
+   if (g13_mesh_single_link) {
+      for (unsigned i = 0; i < hk_api_num_variants(src_obj); ++i) {
+         struct hk_shader *dst = &obj->variants[i];
+         const struct hk_shader *src = &src_obj->variants[i];
+         if (!src->compiled)
+            continue;
 
-      assert(src_obj->vk.stage == MESA_SHADER_MESH);
-      assert(dev->dev.chip == AGX_CHIP_G13G ||
-             dev->dev.chip == AGX_CHIP_G13X);
-      VkResult result = hk_upload_shader(dev, dst);
-      if (result != VK_SUCCESS) {
-         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
-         return vk_error(dev, result);
+         VkResult result = hk_upload_shader(dev, dst);
+         if (result != VK_SUCCESS) {
+            hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+            return vk_error(dev, result);
+         }
       }
    }
 

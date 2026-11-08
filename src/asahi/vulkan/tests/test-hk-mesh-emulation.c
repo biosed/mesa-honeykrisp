@@ -691,9 +691,10 @@ test_task_producer(void)
    task_producer_binary_size = compile_producer(b.shader);
 
    /* A huge child grid takes the cap+1 failure sentinel.  Its generated map
-    * loop has zero iterations on that arm and remains bounded at 2048 for
+    * loop has zero iterations on that arm and remains bounded at the cap for
     * every admitted launch; lowering and AGX2 compile must terminate. */
-   nir_builder first_overflow = task_builder(2049, 1, 1);
+   nir_builder first_overflow =
+      task_builder(HK_MESH_EMULATION_MAX_EMITTED_GROUPS + 1, 1, 1);
    assert(hk_nir_lower_task_emulation(first_overflow.shader, NULL));
    assert(compile_producer(first_overflow.shader) > 0);
 
@@ -701,11 +702,12 @@ test_task_producer(void)
    assert(hk_nir_lower_task_emulation(former_cap_overflow.shader, NULL));
    assert(compile_producer(former_cap_overflow.shader) > 0);
 
-   /* Two task workgroups emitting 1200 children each exercise the aggregate
+   /* Two task workgroups each emitting just over half the cap exercise the aggregate
     * overflow arm at execution time.  Lowering is independent of the parent
     * grid and must keep the same bounded sentinel/map loop; the command test
     * records its post-task overflow sanitizer before the indirect mesh kick. */
-   nir_builder aggregate_overflow = task_builder(1200, 1, 1);
+   nir_builder aggregate_overflow =
+      task_builder(HK_MESH_EMULATION_MAX_EMITTED_GROUPS / 2 + 1, 1, 1);
    assert(hk_nir_lower_task_emulation(aggregate_overflow.shader, NULL));
    assert(compile_producer(aggregate_overflow.shader) > 0);
 

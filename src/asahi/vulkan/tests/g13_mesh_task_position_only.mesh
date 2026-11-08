@@ -1,0 +1,47 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+
+layout(local_size_x = 4, local_size_y = 1, local_size_z = 1) in;
+layout(triangles, max_vertices = 4, max_primitives = 2) out;
+
+taskPayloadSharedEXT struct TaskPayload {
+   uint task_x;
+   uint task_count_x;
+   uint guard0;
+   uint guard1;
+} payload;
+
+void
+main()
+{
+   const uint lane = gl_LocalInvocationIndex;
+   const bool payload_ok = payload.guard0 == 0x13579bdfu &&
+                           payload.guard1 == 0x2468ace0u;
+
+   SetMeshOutputsEXT(payload_ok ? 4u : 0u, payload_ok ? 2u : 0u);
+   if (!payload_ok)
+      return;
+
+   const uint child_x = gl_WorkGroupID.x;
+   const uint child_y = gl_WorkGroupID.y;
+   const uint columns = payload.task_count_x * 2u;
+   const uint column = payload.task_x * 2u + child_x;
+   const float x0 = -1.0 + 2.0 * float(column) / float(columns);
+   const float x1 = -1.0 + 2.0 * float(column + 1u) / float(columns);
+   const float y0 = -1.0 + float(child_y);
+   const float y1 = y0 + 1.0;
+   const bool right = lane == 1u || lane == 2u;
+   const bool upper = lane >= 2u;
+
+   /* Deliberately component-wise: the title's canonical MeshEXT modules use
+    * this store shape, so the public record/readback fixture covers it. */
+   gl_MeshVerticesEXT[lane].gl_Position.x = right ? x1 : x0;
+   gl_MeshVerticesEXT[lane].gl_Position.y = upper ? y1 : y0;
+   gl_MeshVerticesEXT[lane].gl_Position.z = 0.0;
+   gl_MeshVerticesEXT[lane].gl_Position.w = 1.0;
+
+   if (lane < 2u) {
+      gl_PrimitiveTriangleIndicesEXT[lane] = lane == 0u
+         ? uvec3(0, 1, 2) : uvec3(0, 2, 3);
+   }
+}

@@ -112,6 +112,9 @@ DEBUG_GET_ONCE_BOOL_OPTION(mesh_native_m5_wclamp,
 DEBUG_GET_ONCE_BOOL_OPTION(mesh_native_raster_enable,
                            "ASAHI_MESH_NATIVE_RASTER_ENABLE_DIAGNOSTIC", false)
 DEBUG_GET_ONCE_BOOL_OPTION(mesh_pp_tail0, "ASAHI_MESH_PP_TAIL0", false)
+DEBUG_GET_ONCE_NUM_OPTION(g13_mesh_indirect_cap,
+                          "ASAHI_G13_SOFTWARE_MESH_INDIRECT_CAP",
+                          16)
 
 #define IS_DIRTY(bit) BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_##bit)
 
@@ -11694,9 +11697,11 @@ hk_needs_index_robustness(struct hk_cmd_buffer *cmd, struct agx_draw *draw,
    if (!draw->indexed)
       return false;
 
-   /* Geometry or tessellation use robust software index buffer fetch anyway */
+   /* Geometry, tessellation, and software mesh generate their index buffers
+    * in compute and therefore already perform bounded software fetches. */
    if (gfx->shaders[MESA_SHADER_GEOMETRY] ||
-       gfx->shaders[MESA_SHADER_TESS_EVAL])
+       gfx->shaders[MESA_SHADER_TESS_EVAL] ||
+       gfx->shaders[MESA_SHADER_MESH])
       return false;
 
    /* Soft fault does not cover the hardware index buffer fetch, use the zero
@@ -12844,15 +12849,16 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
          }
 
          if (mesh_draw->dispatch_producer) {
+            if (mesh_draw->task_grid_source) {
+               libagx_g13_task_dispatch(
+                  cmd, agx_1d(1), plan->barrier,
+                  mesh_draw->task_grid_dest,
+                  mesh_draw->task_overflow_addr,
+                  mesh_draw->task_grid_source,
+                  plan->task ? HK_G13_TASK_MAX_GROUP_TOTAL
+                             : plan->draw_count);
+            }
             if (plan->task) {
-               if (mesh_draw->task_grid_source) {
-                  libagx_g13_task_dispatch(
-                     cmd, agx_1d(1), plan->barrier,
-                     mesh_draw->task_grid_dest,
-                     mesh_draw->task_overflow_addr,
-                     mesh_draw->task_grid_source,
-                     HK_G13_TASK_MAX_GROUP_TOTAL);
-               }
                hk_dispatch_with_local_size(
                   cmd, ccs, (struct hk_shader *)plan->task_producer,
                   plan->task_grid, plan->task_local_size);
@@ -13243,10 +13249,11 @@ hk_cmd_draw_mesh_g13_task(struct hk_cmd_buffer *cmd,
    return true;
 }
 
-bool
-hk_cmd_draw_mesh_g13_direct(struct hk_cmd_buffer *cmd,
-                            const uint32_t group_count[3], uint16_t draw_id,
-                            struct hk_mesh_emulation_record_trace *trace)
+static bool
+hk_cmd_draw_mesh_g13(struct hk_cmd_buffer *cmd,
+                     const uint32_t group_count[3], uint64_t indirect_grid,
+                     uint16_t draw_id,
+                     struct hk_mesh_emulation_record_trace *trace)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_graphics_state *gfx = &cmd->state.gfx;
@@ -13256,7 +13263,7 @@ hk_cmd_draw_mesh_g13_direct(struct hk_cmd_buffer *cmd,
 
    if (gfx->shaders[MESA_SHADER_TASK])
       return hk_cmd_draw_mesh_g13_task(
-         cmd, group_count, 0, draw_id, trace);
+         cmd, group_count, indirect_grid, draw_id, trace);
 
    if (!hk_g13_software_mesh_supported(dev->dev.chip) ||
        !mesh ||
@@ -13268,12 +13275,28 @@ hk_cmd_draw_mesh_g13_direct(struct hk_cmd_buffer *cmd,
    /* Vulkan defines a zero in any direct group-count dimension as a no-op.
     * Return before deriving sizes so the recorder never asks the uploader for
     * a zero-byte allocation and mistakes its null pointer for OOM. */
-   if (!group_count[0] || !group_count[1] || !group_count[2])
+   if (!indirect_grid &&
+       (!group_count[0] || !group_count[1] || !group_count[2]))
       return true;
+
+   int64_t requested_cap = debug_get_option_g13_mesh_indirect_cap();
+   /* The renderer's already-explicit title profile is the conservative live
+    * boundary: admit only a single taskless group unless a dedicated driver
+    * cap was supplied for a physical fixture.  This keeps the normal
+    * software-mesh fixture at 16 without adding another title environment
+    * knob. */
+   if (debug_get_bool_option("DM_VK_MESH_TITLE_PROFILE", false) &&
+       !debug_get_option_cached("ASAHI_G13_SOFTWARE_MESH_INDIRECT_CAP", NULL))
+      requested_cap = 1;
+   const uint32_t indirect_cap = CLAMP(requested_cap, 1,
+                                       HK_G13_MESH_MAX_GROUP_TOTAL);
+   const uint32_t indirect_allocation_count[3] = {indirect_cap, 1, 1};
+   const uint32_t *allocation_count = indirect_grid
+      ? indirect_allocation_count : group_count;
 
    struct hk_mesh_emulation_direct_plan requirements;
    if (!hk_mesh_emulation_direct_requirements(
-          dev->dev.chip, mesh, group_count, &requirements) ||
+          dev->dev.chip, mesh, allocation_count, &requirements) ||
        requirements.vertex_records_size_B > UINT32_MAX ||
        requirements.primitive_records_size_B > UINT32_MAX ||
        requirements.expanded_records_size_B > UINT32_MAX ||
@@ -13319,7 +13342,7 @@ hk_cmd_draw_mesh_g13_direct(struct hk_cmd_buffer *cmd,
 
    struct hk_mesh_emulation_direct_plan plan;
    if (!hk_mesh_emulation_direct_plan_init(
-          dev->dev.chip, mesh, group_count,
+          dev->dev.chip, mesh, allocation_count,
           vertex_records.gpu, requirements.vertex_records_size_B,
           primitive_records.gpu, requirements.primitive_records_size_B,
           expanded_records.gpu, requirements.expanded_records_size_B,
@@ -13329,6 +13352,27 @@ hk_cmd_draw_mesh_g13_direct(struct hk_cmd_buffer *cmd,
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return false;
    }
+
+   if (indirect_grid) {
+      static bool logged;
+      if (!logged) {
+         const uint64_t scratch_B =
+            requirements.vertex_records_size_B +
+            requirements.primitive_records_size_B +
+            requirements.expanded_records_size_B +
+            requirements.index_buffer_size_B +
+            requirements.group_records_size_B +
+            requirements.draw_params_size_B + sizeof(plan.params);
+         fprintf(stderr,
+                 "Honeykrisp G13 taskless indirect: cap %u groups, "
+                 "%.2f MiB command scratch per draw (requested %" PRId64 ")\n",
+                 indirect_cap, scratch_B / (1024.0 * 1024.0), requested_cap);
+         logged = true;
+      }
+   }
+
+   if (indirect_grid)
+      memset(plan.params.mesh_grid, 0, sizeof(plan.params.mesh_grid));
 
    const struct agx_ptr params =
       hk_pool_alloc(cmd, sizeof(plan.params), 16);
@@ -13342,6 +13386,12 @@ hk_cmd_draw_mesh_g13_direct(struct hk_cmd_buffer *cmd,
     * this command's own API mesh grid before graphics-root publication. */
    const uint64_t api_grid_addr =
       params.gpu + offsetof(struct hk_mesh_emulation_params, mesh_grid);
+   if (indirect_grid) {
+      plan.producer_grid = agx_grid_indirect(api_grid_addr);
+      hk_xfer_check_draw(
+         cmd, indirect_grid,
+         indirect_grid + sizeof(VkDrawMeshTasksIndirectCommandEXT));
+   }
    gfx->descriptors.root.mesh_grid_addr = api_grid_addr;
    gfx->descriptors.root.draw.geometry_params = params.gpu;
    gfx->descriptors.root_dirty = true;
@@ -13360,6 +13410,11 @@ hk_cmd_draw_mesh_g13_direct(struct hk_cmd_buffer *cmd,
          .plan = &plan,
          .geometry_params = params.gpu,
          .api_mesh_grid_addr = api_grid_addr,
+         .task_grid_source = indirect_grid,
+         .task_grid_dest = api_grid_addr,
+         .task_overflow_addr =
+            params.gpu + offsetof(struct hk_mesh_emulation_params,
+                                  task_overflow),
          .trace = i == 0 ? trace : NULL,
          .dispatch_producer = i == 0,
       };
@@ -13369,6 +13424,14 @@ hk_cmd_draw_mesh_g13_direct(struct hk_cmd_buffer *cmd,
    }
 
    return true;
+}
+
+bool
+hk_cmd_draw_mesh_g13_direct(struct hk_cmd_buffer *cmd,
+                            const uint32_t group_count[3], uint16_t draw_id,
+                            struct hk_mesh_emulation_record_trace *trace)
+{
+   return hk_cmd_draw_mesh_g13(cmd, group_count, 0, draw_id, trace);
 }
 
 static void
@@ -13552,14 +13615,10 @@ hk_CmdDrawMeshTasksIndirectEXT(VkCommandBuffer commandBuffer, VkBuffer buffer,
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    if (hk_g13_software_mesh_supported(hk_cmd_buffer_device(cmd)->dev.chip)) {
       VK_FROM_HANDLE(hk_buffer, src, buffer);
-      if (!cmd->state.gfx.shaders[MESA_SHADER_TASK]) {
-         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-         return;
-      }
       for (unsigned i = 0; i < drawCount; ++i) {
          const uint64_t grid = hk_buffer_address_rw(
             src, offset + (uint64_t)i * stride);
-         hk_cmd_draw_mesh_g13_task(cmd, NULL, grid, i, NULL);
+         hk_cmd_draw_mesh_g13(cmd, NULL, grid, i, NULL);
          if (vk_command_buffer_has_error(&cmd->vk))
             break;
       }

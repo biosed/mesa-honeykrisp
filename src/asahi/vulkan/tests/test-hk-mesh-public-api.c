@@ -117,7 +117,7 @@ check_limits(const VkPhysicalDeviceMeshShaderPropertiesEXT *p)
    assert(p->maxTaskPayloadSize == 4096);
    assert(p->maxTaskSharedMemorySize == 28 * 1024);
    assert(p->maxTaskPayloadAndSharedMemorySize == 32 * 1024);
-   assert(p->maxMeshWorkGroupTotalCount == 2048);
+   assert(p->maxMeshWorkGroupTotalCount == 64);
    for (unsigned i = 0; i < 3; ++i) {
       assert(p->maxMeshWorkGroupCount[i] == 65535);
    }
@@ -347,31 +347,29 @@ record_public_triangle(VkPhysicalDevice physical, VkDevice device, bool task)
 
    VkBuffer indirect = VK_NULL_HANDLE;
    VkDeviceMemory indirect_memory = VK_NULL_HANDLE;
-   if (task) {
-      const VkBufferCreateInfo buffer_info = {
-         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-         .size = sizeof(VkDrawMeshTasksIndirectCommandEXT),
-         .usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
-      };
-      CHECK(vkCreateBuffer(device, &buffer_info, NULL, &indirect));
-      VkMemoryRequirements requirements;
-      vkGetBufferMemoryRequirements(device, indirect, &requirements);
-      const VkMemoryAllocateInfo allocation = {
-         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-         .allocationSize = requirements.size,
-         .memoryTypeIndex = first_memory_type(
-            physical, requirements.memoryTypeBits),
-      };
-      CHECK(vkAllocateMemory(device, &allocation, NULL, &indirect_memory));
-      CHECK(vkBindBufferMemory(device, indirect, indirect_memory, 0));
+   const VkBufferCreateInfo buffer_info = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      .size = sizeof(VkDrawMeshTasksIndirectCommandEXT),
+      .usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+   };
+   CHECK(vkCreateBuffer(device, &buffer_info, NULL, &indirect));
+   VkMemoryRequirements requirements;
+   vkGetBufferMemoryRequirements(device, indirect, &requirements);
+   const VkMemoryAllocateInfo allocation = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = requirements.size,
+      .memoryTypeIndex = first_memory_type(
+         physical, requirements.memoryTypeBits),
+   };
+   CHECK(vkAllocateMemory(device, &allocation, NULL, &indirect_memory));
+   CHECK(vkBindBufferMemory(device, indirect, indirect_memory, 0));
 
-      PFN_vkCmdDrawMeshTasksIndirectEXT draw_indirect =
-         (PFN_vkCmdDrawMeshTasksIndirectEXT)vkGetDeviceProcAddr(
-            device, "vkCmdDrawMeshTasksIndirectEXT");
-      assert(draw_indirect != NULL);
-      draw_indirect(command, indirect, 0, 1,
-                    sizeof(VkDrawMeshTasksIndirectCommandEXT));
-   }
+   PFN_vkCmdDrawMeshTasksIndirectEXT draw_indirect =
+      (PFN_vkCmdDrawMeshTasksIndirectEXT)vkGetDeviceProcAddr(
+         device, "vkCmdDrawMeshTasksIndirectEXT");
+   assert(draw_indirect != NULL);
+   draw_indirect(command, indirect, 0, 1,
+                 sizeof(VkDrawMeshTasksIndirectCommandEXT));
    vkCmdEndRendering(command);
    CHECK(vkEndCommandBuffer(command));
 

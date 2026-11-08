@@ -30,9 +30,25 @@ static const uint32_t fragment_spv[] = {
 #include "g13_mesh_task_readback.frag.spv.h"
 };
 
+static const uint32_t position_only_mesh_spv[] = {
+#include "g13_mesh_task_position_only.mesh.spv.h"
+};
+
+static const uint32_t position_only_fragment_spv[] = {
+#include "g13_mesh_task_position_only.frag.spv.h"
+};
+
+static const uint32_t taskless_mesh_spv[] = {
+#include "g13_mesh_public_triangle.spv.h"
+};
+
+static const uint32_t taskless_fragment_spv[] = {
+#include "g13_mesh_public_triangle.frag.spv.h"
+};
+
 #define WIDTH 64u
 #define HEIGHT 64u
-#define CASE_COUNT 3u
+#define CASE_COUNT 6u
 #define IMAGE_SIZE (WIDTH * HEIGHT * 4u)
 
 #define CHECK(call)                                                            \
@@ -327,10 +343,50 @@ check_black(const uint8_t *pixels)
                pixel[3] != 255;
    }
 
-   printf("aggregate overflow {513,1,1} x child {2,2,1}: "
+   printf("aggregate overflow {17,1,1} x child {2,2,1}: "
           "black=%u wrong=%u %s\n",
           WIDTH * HEIGHT - wrong, wrong, wrong == 0 ? "PASS" : "FAIL");
    return wrong == 0;
+}
+
+static bool
+check_position_only(const uint8_t *pixels)
+{
+   unsigned wrong = 0;
+   for (unsigned i = 0; i < WIDTH * HEIGHT; ++i) {
+      const uint8_t *pixel = pixels + i * 4;
+      wrong += !near_byte(pixel[0], 64) || !near_byte(pixel[1], 128) ||
+               !near_byte(pixel[2], 191) || pixel[3] != 255;
+   }
+
+   const uint8_t *center = pixels +
+      ((HEIGHT / 2) * WIDTH + WIDTH / 2) * 4;
+   printf("position-only direct {2,1,1}: exact=%u wrong=%u "
+          "center=%u,%u,%u,%u %s\n",
+          WIDTH * HEIGHT - wrong, wrong, center[0], center[1], center[2],
+          center[3], wrong == 0 ? "PASS" : "FAIL");
+   return wrong == 0;
+}
+
+static bool
+check_taskless_indirect(const uint8_t *pixels, const char *label)
+{
+   unsigned coloured = 0, alpha_wrong = 0;
+   for (unsigned i = 0; i < WIDTH * HEIGHT; ++i) {
+      const uint8_t *pixel = pixels + i * 4;
+      coloured += pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0;
+      alpha_wrong += pixel[3] != 255;
+   }
+
+   const uint8_t *center = pixels +
+      ((HEIGHT / 2) * WIDTH + WIDTH / 2) * 4;
+   const bool pass = coloured == 48u * 48u && alpha_wrong == 0 &&
+      near_byte(center[2], 191);
+   printf("taskless %s indirect {3,1,1}: coloured=%u "
+          "alpha_wrong=%u center=%u,%u,%u,%u %s\n",
+          label, coloured, alpha_wrong, center[0], center[1], center[2], center[3],
+          pass ? "PASS" : "FAIL");
+   return pass;
 }
 
 int
@@ -431,6 +487,14 @@ main(int argc, char **argv)
    VkShaderModule mesh_module = shader_module(mesh_spv, sizeof(mesh_spv));
    VkShaderModule fragment_module =
       shader_module(fragment_spv, sizeof(fragment_spv));
+   VkShaderModule position_only_mesh_module =
+      shader_module(position_only_mesh_spv, sizeof(position_only_mesh_spv));
+   VkShaderModule position_only_fragment_module = shader_module(
+      position_only_fragment_spv, sizeof(position_only_fragment_spv));
+   VkShaderModule taskless_mesh_module =
+      shader_module(taskless_mesh_spv, sizeof(taskless_mesh_spv));
+   VkShaderModule taskless_fragment_module =
+      shader_module(taskless_fragment_spv, sizeof(taskless_fragment_spv));
    const VkPipelineLayoutCreateInfo layout_info = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
    };
@@ -493,6 +557,43 @@ main(int argc, char **argv)
    VkPipeline pipeline;
    CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_info,
                                    NULL, &pipeline));
+   const VkPipelineShaderStageCreateInfo position_only_stages[] = {
+      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+       .stage = VK_SHADER_STAGE_TASK_BIT_EXT,
+       .module = task_module,
+       .pName = "main"},
+      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+       .stage = VK_SHADER_STAGE_MESH_BIT_EXT,
+       .module = position_only_mesh_module,
+       .pName = "main"},
+      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+       .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+       .module = position_only_fragment_module,
+       .pName = "main"},
+   };
+   VkGraphicsPipelineCreateInfo position_only_pipeline_info = pipeline_info;
+   position_only_pipeline_info.pStages = position_only_stages;
+   VkPipeline position_only_pipeline;
+   CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
+                                   &position_only_pipeline_info, NULL,
+                                   &position_only_pipeline));
+   const VkPipelineShaderStageCreateInfo taskless_stages[] = {
+      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+       .stage = VK_SHADER_STAGE_MESH_BIT_EXT,
+       .module = taskless_mesh_module,
+       .pName = "main"},
+      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+       .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+       .module = taskless_fragment_module,
+       .pName = "main"},
+   };
+   VkGraphicsPipelineCreateInfo taskless_pipeline_info = pipeline_info;
+   taskless_pipeline_info.stageCount = 2;
+   taskless_pipeline_info.pStages = taskless_stages;
+   VkPipeline taskless_pipeline;
+   CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
+                                   &taskless_pipeline_info, NULL,
+                                   &taskless_pipeline));
 
    struct target targets[CASE_COUNT];
    for (unsigned i = 0; i < CASE_COUNT; ++i)
@@ -505,6 +606,16 @@ main(int argc, char **argv)
    memset(readback.map, 0xcd, CASE_COUNT * IMAGE_SIZE);
    struct buffer indirect = create_buffer(
       2 * sizeof(VkDrawMeshTasksIndirectCommandEXT),
+      VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false);
+   struct buffer ring_source = create_buffer(
+      sizeof(uint32_t), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+      true);
+   *(uint32_t *)ring_source.map = 3;
+   struct buffer ring_indirect = create_buffer(
+      sizeof(VkDrawMeshTasksIndirectCommandEXT),
       VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false);
 
@@ -530,10 +641,10 @@ main(int argc, char **argv)
 
    const VkDrawMeshTasksIndirectCommandEXT indirect_record = {3, 1, 1};
    /* Each task's four-child EmitMeshTasksEXT is below the advertised
-    * per-workgroup total.  513 task groups produce 2052 aggregate children,
-    * exercising the experimental whole-draw 2048-cap sanitizer with an
+    * per-workgroup total.  17 task groups produce 68 aggregate children,
+    * exercising the experimental whole-draw 64-cap sanitizer with an
     * otherwise API-valid draw. */
-   const VkDrawMeshTasksIndirectCommandEXT overflow_record = {513, 1, 1};
+   const VkDrawMeshTasksIndirectCommandEXT overflow_record = {17, 1, 1};
    vkCmdUpdateBuffer(command, indirect.buffer, 0, sizeof(indirect_record),
                      &indirect_record);
    vkCmdUpdateBuffer(command, indirect.buffer, sizeof(indirect_record),
@@ -575,6 +686,63 @@ main(int argc, char **argv)
       assert(mesh_grid_addr[2] != mesh_grid_addr[1]);
    }
    end_target(command, &targets[2], readback.buffer, 2 * IMAGE_SIZE);
+
+   begin_target(command, &targets[3], position_only_pipeline);
+   draw_mesh(command, 2, 1, 1);
+   if (root_snapshot) {
+      assert(root_snapshot(command, true, &geometry_params[3],
+                           &mesh_grid_addr[3]));
+      assert(geometry_params[3] != geometry_params[2]);
+      assert(mesh_grid_addr[3] != mesh_grid_addr[2]);
+   }
+   end_target(command, &targets[3], readback.buffer, 3 * IMAGE_SIZE);
+
+   begin_target(command, &targets[4], taskless_pipeline);
+   draw_mesh_indirect(command, indirect.buffer, 0, 1,
+                      sizeof(VkDrawMeshTasksIndirectCommandEXT));
+   if (root_snapshot) {
+      assert(root_snapshot(command, false, &geometry_params[4],
+                           &mesh_grid_addr[4]));
+      assert(geometry_params[4] != geometry_params[3]);
+      assert(mesh_grid_addr[4] != mesh_grid_addr[3]);
+   }
+   end_target(command, &targets[4], readback.buffer, 4 * IMAGE_SIZE);
+
+   /* Match the title bridge exactly: transfer-write Y/Z and copy X into a
+    * fresh device-local ring record immediately before a taskless indirect
+    * draw, then use the legacy TRANSFER -> DRAW_INDIRECT|MESH_SHADER barrier.
+    * Unlike the earlier case, this leaves a pending transfer for the
+    * taskless driver's internal pre-gfx sanitizer to order itself. */
+   const uint32_t yz[2] = {1, 1};
+   vkCmdUpdateBuffer(command, ring_indirect.buffer, sizeof(uint32_t),
+                     sizeof(yz), yz);
+   const VkBufferCopy copy = {0, 0, sizeof(uint32_t)};
+   vkCmdCopyBuffer(command, ring_source.buffer, ring_indirect.buffer, 1,
+                   &copy);
+   const VkBufferMemoryBarrier ring_barrier = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+      .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+      .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .buffer = ring_indirect.buffer,
+      .offset = 0,
+      .size = sizeof(VkDrawMeshTasksIndirectCommandEXT),
+   };
+   vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
+                           VK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT,
+                        0, 0, NULL, 1, &ring_barrier, 0, NULL);
+   begin_target(command, &targets[5], taskless_pipeline);
+   draw_mesh_indirect(command, ring_indirect.buffer, 0, 1,
+                      sizeof(VkDrawMeshTasksIndirectCommandEXT));
+   if (root_snapshot) {
+      assert(root_snapshot(command, false, &geometry_params[5],
+                           &mesh_grid_addr[5]));
+      assert(geometry_params[5] != geometry_params[4]);
+      assert(mesh_grid_addr[5] != mesh_grid_addr[4]);
+   }
+   end_target(command, &targets[5], readback.buffer, 5 * IMAGE_SIZE);
    buffer_barrier(command, readback.buffer,
                   VK_PIPELINE_STAGE_2_COPY_BIT,
                   VK_ACCESS_2_TRANSFER_WRITE_BIT,
@@ -604,11 +772,21 @@ main(int argc, char **argv)
       pass &= check_grid(pixels + IMAGE_SIZE, 3,
                          "GPU-written indirect {3,1,1}");
       pass &= check_black(pixels + 2 * IMAGE_SIZE);
+      pass &= check_position_only(pixels + 3 * IMAGE_SIZE);
+      pass &= check_taskless_indirect(pixels + 4 * IMAGE_SIZE,
+                                      "GPU-written");
+      pass &= check_taskless_indirect(pixels + 5 * IMAGE_SIZE,
+                                      "transfer-ring");
    }
 
    vkDestroyCommandPool(device, pool, NULL);
    vkDestroyBuffer(device, indirect.buffer, NULL);
    vkFreeMemory(device, indirect.memory, NULL);
+   vkDestroyBuffer(device, ring_indirect.buffer, NULL);
+   vkFreeMemory(device, ring_indirect.memory, NULL);
+   vkUnmapMemory(device, ring_source.memory);
+   vkDestroyBuffer(device, ring_source.buffer, NULL);
+   vkFreeMemory(device, ring_source.memory, NULL);
    vkUnmapMemory(device, readback.memory);
    vkDestroyBuffer(device, readback.buffer, NULL);
    vkFreeMemory(device, readback.memory, NULL);
@@ -618,7 +796,13 @@ main(int argc, char **argv)
       vkFreeMemory(device, targets[i].memory, NULL);
    }
    vkDestroyPipeline(device, pipeline, NULL);
+   vkDestroyPipeline(device, position_only_pipeline, NULL);
+   vkDestroyPipeline(device, taskless_pipeline, NULL);
    vkDestroyPipelineLayout(device, layout, NULL);
+   vkDestroyShaderModule(device, position_only_fragment_module, NULL);
+   vkDestroyShaderModule(device, position_only_mesh_module, NULL);
+   vkDestroyShaderModule(device, taskless_fragment_module, NULL);
+   vkDestroyShaderModule(device, taskless_mesh_module, NULL);
    vkDestroyShaderModule(device, fragment_module, NULL);
    vkDestroyShaderModule(device, mesh_module, NULL);
    vkDestroyShaderModule(device, task_module, NULL);
