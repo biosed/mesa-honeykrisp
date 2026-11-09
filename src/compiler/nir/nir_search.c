@@ -672,20 +672,29 @@ add_uses_to_worklist(nir_instr *instr,
    }
 }
 
+/* The automaton states of the instructions whose source was just rewritten
+ * from a replaced instruction to its replacement, and of their uses while
+ * states keep changing.  Only those instructions can change state: every
+ * other user of the replacement value still reads the same value it did.
+ *
+ * Walking all uses of the replacement value instead made a replacement by an
+ * existing value cost one automaton evaluation per use of that value.  A
+ * shader whose constants have tens of thousands of uses (a 7 MB unrolled
+ * matrix kernel) spent 40 of its 58 s of compile time there.
+ */
 static void
-nir_algebraic_update_automaton(nir_instr *new_instr,
+nir_algebraic_update_automaton(struct util_dynarray *rewritten,
                                nir_instr_worklist *algebraic_worklist,
                                struct util_dynarray *states,
                                const struct per_op_table *pass_op_table)
 {
-
    nir_instr_worklist automaton_worklist;
    nir_instr_worklist_init(&automaton_worklist);
 
-   /* Walk through the tree of uses of our new instruction's SSA value,
-    * recursively updating the automaton state until it stabilizes.
-    */
-   add_uses_to_worklist(new_instr, &automaton_worklist, states, pass_op_table);
+   util_dynarray_foreach(rewritten, nir_instr *, use_instr) {
+      if (nir_algebraic_automaton(*use_instr, states, pass_op_table))
+         nir_instr_worklist_push_tail(&automaton_worklist, *use_instr);
+   }
 
    nir_instr *instr;
    while ((instr = nir_instr_worklist_pop_head(&automaton_worklist))) {
@@ -806,6 +815,14 @@ nir_replace_instr(nir_builder *build, nir_alu_instr *instr,
                                      instr->def.bit_size,
                                      &state, &instr->instr);
 
+   /* The instructions about to read the replacement instead of instr: the
+    * only ones whose automaton state can change.
+    */
+   struct util_dynarray rewritten;
+   util_dynarray_init(&rewritten, NULL);
+   nir_foreach_use(use_src, &instr->def)
+      util_dynarray_append_typed(&rewritten, nir_instr *, nir_src_use_instr(use_src));
+
    /* Note that NIR builder will elide the MOV if it's a no-op, which may
     * allow more work to be done in a single pass through algebraic.
     */
@@ -816,9 +833,10 @@ nir_replace_instr(nir_builder *build, nir_alu_instr *instr,
       nir_algebraic_automaton(nir_def_instr(mov), states, table->pass_op_table);
    }
 
-   /* Recurse through the uses updating the automaton's state. */
-   nir_algebraic_update_automaton(nir_def_instr(val.src.ssa), algebraic_worklist,
+   /* Recurse through the rewritten uses updating the automaton's state. */
+   nir_algebraic_update_automaton(&rewritten, algebraic_worklist,
                                   states, table->pass_op_table);
+   util_dynarray_fini(&rewritten);
 
    /* Nothing uses the instr any more, so drop it out of the program.  Note
     * that the instr may be in the worklist still, so we can't free it
