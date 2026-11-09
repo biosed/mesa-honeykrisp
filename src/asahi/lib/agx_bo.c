@@ -619,8 +619,10 @@ agx_bo_create(struct agx_device *dev, size_t size, unsigned align,
    size = ALIGN_POT(size, AIL_PAGESIZE);
    align = MAX2(align, AIL_PAGESIZE);
 
-   /* See if we have a BO already in the cache */
-   bo = agx_bo_cache_fetch(dev, size, align, flags, true);
+   /* See if we have a BO already in the cache. A BO that will not return to
+    * the cache does not take from it either: its caller wants a fresh kernel
+    * allocation (the fallback below still may, when the kernel has none). */
+   bo = (flags & AGX_BO_NO_CACHE) ? NULL : agx_bo_cache_fetch(dev, size, align, flags, true);
    reused = bo != NULL;
 
    /* Update stats based on the first attempt to fetch */

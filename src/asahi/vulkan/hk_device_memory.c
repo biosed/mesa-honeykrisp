@@ -243,6 +243,15 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
          flags |= AGX_BO_NO_CACHE;
       if (type->propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
          flags |= AGX_BO_WRITEBACK;
+      /* VK_EXT_zero_initialize_device_memory: a fresh kernel allocation is
+       * demand-zero, so it is zero without committing a page. Skip the
+       * userspace cache for it; if the kernel cannot allocate and a cached BO
+       * is taken after all, that one is cleared before it is returned. Image
+       * layout transitions move no data in this driver, so an image bound to
+       * such memory reads zero from VK_IMAGE_LAYOUT_ZERO_INITIALIZED_EXT.
+       */
+      if (mem->vk.alloc_flags & VK_MEMORY_ALLOCATE_ZERO_INITIALIZE_BIT_EXT)
+         flags |= AGX_BO_NO_CACHE | AGX_BO_ZERO_ON_REUSE;
 
       /* D3D12 promises 64 KiB alignment for heap addresses, and this costs
        * only virtual address space. */
