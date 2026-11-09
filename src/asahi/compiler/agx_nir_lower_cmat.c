@@ -6,8 +6,14 @@
 
 
 #include "agx_nir.h"
+#include "agx_cmat_layout.h"
 #include "compiler/nir/nir_builder.h"
 #include "util/hash_table.h"
+
+enum agx_cmat_lowering {
+   AGX_CMAT_LOWER_NATIVE,
+   AGX_CMAT_LOWER_G13_SOFTWARE,
+};
 
 static const struct glsl_type *
 remap_matrix_type(struct hash_table *mapping, const struct glsl_type *orig)
@@ -125,6 +131,58 @@ matrix_col(nir_builder *b, nir_def *lane,
                          element);
 }
 
+/* Inverse of the 8x8 matrix_row/matrix_col layout. */
+static nir_def *
+matrix_lane_8x8(nir_builder *b, nir_def *row, nir_def *col)
+{
+   return nir_ior(
+      b,
+      nir_ior(b, nir_ishl_imm(b, nir_iand_imm(b, row, 3), 1),
+              nir_iand_imm(b, nir_ushr_imm(b, col, 1), 1)),
+      nir_ior(b, nir_ishl_imm(b, nir_iand_imm(b, col, 4), 1),
+              nir_ishl_imm(b, nir_iand_imm(b, row, 4), 2)));
+}
+
+/*
+ * G13 has subgroup shuffles but no matrix instruction.  Lower one truthful
+ * 8x8x8 FP16 -> FP32 tile by broadcasting the two source elements owned by
+ * each lane.  HMMA.16816 can later be expressed as four of these tiles: two
+ * M=8 result tiles, each accumulated over two K=8 steps.
+ */
+static nir_def *
+software_muladd_8x8(nir_builder *b, nir_def *a, nir_def *bb, nir_def *c)
+{
+   nir_def *lane = nir_load_subgroup_invocation(b);
+   nir_def *result[2];
+
+   for (unsigned element = 0; element < 2; ++element) {
+      nir_def *row = matrix_row(b, lane,
+         (struct glsl_cmat_description){.rows = 8, .cols = 8}, element);
+      nir_def *col = matrix_col(b, lane,
+         (struct glsl_cmat_description){.rows = 8, .cols = 8}, element);
+      nir_def *accum = nir_channel(b, c, element);
+
+      for (unsigned k = 0; k < 8; ++k) {
+         nir_def *a_lane = matrix_lane_8x8(b, row, nir_imm_int(b, k));
+         nir_def *b_lane = matrix_lane_8x8(b, nir_imm_int(b, k), col);
+         /* The source lane differs within a quad.  Keep this as the generic
+          * shuffle intrinsic so agx_nir_lower_subgroups can expand the
+          * low-bit selection required by G13's broadcast instruction. */
+         nir_def *a_value = nir_shuffle(
+            b, nir_channel(b, a, k & 1), a_lane);
+         nir_def *b_value = nir_shuffle(
+            b, nir_channel(b, bb, element), b_lane);
+
+         accum = nir_ffma(b, nir_f2f32(b, a_value),
+                          nir_f2f32(b, b_value), accum);
+      }
+
+      result[element] = accum;
+   }
+
+   return nir_vec(b, result, ARRAY_SIZE(result));
+}
+
 static nir_deref_instr *
 matrix_memory(nir_builder *b, nir_intrinsic_instr *intr, unsigned element)
 {
@@ -172,7 +230,8 @@ convert_matrix_value(nir_builder *b, nir_def *value,
 }
 
 static bool
-lower_matrix_instr(nir_builder *b, nir_instr *instr, struct hash_table *types)
+lower_matrix_instr(nir_builder *b, nir_instr *instr, struct hash_table *types,
+                   enum agx_cmat_lowering lowering)
 {
    if (instr->type == nir_instr_type_deref) {
       nir_deref_instr *deref = nir_instr_as_deref(instr);
@@ -247,11 +306,20 @@ lower_matrix_instr(nir_builder *b, nir_instr *instr, struct hash_table *types)
       nir_def *bb = load_matrix(b, intr->src[2]);
       nir_def *c = convert_matrix_value(b, load_matrix(b, intr->src[3]),
                                          accum, GLSL_TYPE_FLOAT);
-      nir_def *value = nir_cmat_muladd_agx(b, a, bb, c, .src_type =
-         input == GLSL_TYPE_BFLOAT16 ? nir_type_uint16 :
-         input == GLSL_TYPE_FLOAT ? nir_type_float32 : nir_type_float16,
-         .src_type2 = input_b == GLSL_TYPE_BFLOAT16 ? nir_type_uint16 :
-         input_b == GLSL_TYPE_FLOAT ? nir_type_float32 : nir_type_float16);
+      nir_def *value;
+      if (lowering == AGX_CMAT_LOWER_G13_SOFTWARE) {
+         assert(matrix_desc(intr->src[1]).rows == 8 &&
+                input == GLSL_TYPE_FLOAT16 &&
+                input_b == GLSL_TYPE_FLOAT16 &&
+                accum == GLSL_TYPE_FLOAT);
+         value = software_muladd_8x8(b, a, bb, c);
+      } else {
+         value = nir_cmat_muladd_agx(b, a, bb, c, .src_type =
+            input == GLSL_TYPE_BFLOAT16 ? nir_type_uint16 :
+            input == GLSL_TYPE_FLOAT ? nir_type_float32 : nir_type_float16,
+            .src_type2 = input_b == GLSL_TYPE_BFLOAT16 ? nir_type_uint16 :
+            input_b == GLSL_TYPE_FLOAT ? nir_type_float32 : nir_type_float16);
+      }
       store_matrix(b, intr->src[0], convert_matrix_value(b, value,
                                                       GLSL_TYPE_FLOAT, result));
       break;
@@ -310,11 +378,149 @@ lower_matrix_instr(nir_builder *b, nir_instr *instr, struct hash_table *types)
    return true;
 }
 
-bool
-agx_nir_lower_cmat(nir_shader *nir)
+static bool
+cmat_g13_type_supported(const struct glsl_type *type)
+{
+   if (glsl_type_is_cmat(type)) {
+      const struct glsl_cmat_description *desc =
+         glsl_get_cmat_description(type);
+
+      return desc->scope == SCOPE_SUBGROUP && desc->rows == 8 &&
+             desc->cols == 8 &&
+             ((desc->use == GLSL_CMAT_USE_A ||
+               desc->use == GLSL_CMAT_USE_B)
+                 ? desc->element_type == GLSL_TYPE_FLOAT16
+                 : desc->use == GLSL_CMAT_USE_ACCUMULATOR &&
+                      desc->element_type == GLSL_TYPE_FLOAT);
+   }
+
+   if (glsl_type_is_array(type))
+      return cmat_g13_type_supported(glsl_get_array_element(type));
+
+   if (glsl_type_is_struct(type)) {
+      for (unsigned i = 0; i < type->length; ++i) {
+         if (!cmat_g13_type_supported(glsl_get_struct_field(type, i)))
+            return false;
+      }
+   }
+
+   return true;
+}
+
+static bool
+type_contains_cmat(const struct glsl_type *type)
+{
+   if (glsl_type_is_cmat(type))
+      return true;
+
+   if (glsl_type_is_array(type))
+      return type_contains_cmat(glsl_get_array_element(type));
+
+   if (glsl_type_is_struct(type)) {
+      for (unsigned i = 0; i < type->length; ++i) {
+         if (type_contains_cmat(glsl_get_struct_field(type, i)))
+            return true;
+      }
+   }
+
+   return false;
+}
+
+static bool
+intrinsic_references_cmat(const nir_intrinsic_instr *intr)
+{
+   if (nir_intrinsic_has_cmat_desc(intr) ||
+       nir_intrinsic_has_dst_cmat_desc(intr) ||
+       nir_intrinsic_has_src_cmat_desc(intr))
+      return true;
+
+   const nir_intrinsic_info *info = &nir_intrinsic_infos[intr->intrinsic];
+   for (unsigned i = 0; i < info->num_srcs; ++i) {
+      nir_instr *parent = nir_def_instr(intr->src[i].ssa);
+      if (parent->type == nir_instr_type_deref &&
+          type_contains_cmat(nir_instr_as_deref(parent)->type))
+         return true;
+   }
+
+   return false;
+}
+
+static bool
+cmat_g13_intrinsic_supported(const nir_intrinsic_instr *intr)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_cmat_construct:
+   case nir_intrinsic_cmat_load:
+   case nir_intrinsic_cmat_store:
+   case nir_intrinsic_cmat_length:
+   case nir_intrinsic_cmat_unary_op:
+   case nir_intrinsic_cmat_binary_op:
+   case nir_intrinsic_cmat_scalar_op:
+   case nir_intrinsic_cmat_bitcast:
+   case nir_intrinsic_cmat_extract:
+   case nir_intrinsic_cmat_insert:
+   case nir_intrinsic_cmat_copy:
+      return true;
+
+   case nir_intrinsic_cmat_muladd:
+   case nir_intrinsic_cmat_convert:
+      return !nir_intrinsic_saturate(intr);
+
+   case nir_intrinsic_cmat_transpose:
+   case nir_intrinsic_cmat_get_coordinate:
+   case nir_intrinsic_cmat_muladd_agx:
+      return false;
+
+   default:
+      /* Ordinary intrinsics are unrelated to the matrix type.  Any intrinsic
+       * that carries a matrix description or deref must be explicitly added
+       * above only after the software lowering implements all its semantics. */
+      return !intrinsic_references_cmat(intr);
+   }
+}
+
+static bool
+cmat_g13_shader_supported(nir_shader *nir)
+{
+   nir_foreach_variable_with_modes(var, nir, nir_var_shader_temp) {
+      if (!cmat_g13_type_supported(var->type))
+         return false;
+   }
+
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_function_temp_variable(var, impl) {
+         if (!cmat_g13_type_supported(var->type))
+            return false;
+      }
+
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_cmat_call)
+               return false;
+
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (!cmat_g13_intrinsic_supported(intr))
+               return false;
+         }
+      }
+   }
+
+   return true;
+}
+
+static bool
+lower_cmat(nir_shader *nir, enum agx_cmat_lowering lowering)
 {
    if (nir->info.stage != MESA_SHADER_COMPUTE || !nir->info.cs.has_cooperative_matrix)
       return false;
+
+   if (lowering == AGX_CMAT_LOWER_G13_SOFTWARE &&
+       !cmat_g13_shader_supported(nir))
+      return false;
+
    struct hash_table *types = _mesa_pointer_hash_table_create(NULL);
    nir_foreach_variable_with_modes(var, nir, nir_var_shader_temp)
       var->type = remap_matrix_type(types, var->type);
@@ -324,10 +530,22 @@ agx_nir_lower_cmat(nir_shader *nir)
       nir_builder b = nir_builder_create(impl);
       nir_foreach_block_reverse_safe(block, impl) {
          nir_foreach_instr_reverse_safe(instr, block)
-            lower_matrix_instr(&b, instr, types);
+            lower_matrix_instr(&b, instr, types, lowering);
       }
       nir_progress(true, impl, nir_metadata_control_flow);
    }
    _mesa_hash_table_destroy(types, NULL);
    return true;
+}
+
+bool
+agx_nir_lower_cmat(nir_shader *nir)
+{
+   return lower_cmat(nir, AGX_CMAT_LOWER_NATIVE);
+}
+
+bool
+agx_nir_lower_cmat_g13(nir_shader *nir)
+{
+   return lower_cmat(nir, AGX_CMAT_LOWER_G13_SOFTWARE);
 }

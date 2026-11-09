@@ -275,6 +275,12 @@ struct nir_def *agx_nir_fma_rte_fixup(struct nir_builder *b, struct nir_def *a,
                                     struct nir_def *c, struct nir_def *z,
                                     struct nir_def *native);
 bool agx_nir_lower_cmat(struct nir_shader *s);
+/*
+ * Lower the composable 8x8x8 FP16 -> FP32 cooperative-matrix tile to G13
+ * subgroup shuffles and scalar FMA.  This deliberately does not imply that
+ * VK_KHR_cooperative_matrix is advertised by the Vulkan driver.
+ */
+bool agx_nir_lower_cmat_g13(struct nir_shader *s);
 
 bool agx_nir_lower_texture_early_with_2d_robustness(struct nir_shader *s,
                                                     bool support_lod_bias,
