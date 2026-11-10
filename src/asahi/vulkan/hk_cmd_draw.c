@@ -13260,9 +13260,44 @@ hk_cmd_draw_mesh_g13_task(struct hk_cmd_buffer *cmd,
    assert(plan.producer->b.info.stage == MESA_SHADER_COMPUTE);
    assert(plan.barrier == (AGX_BARRIER_ALL | AGX_PREGFX));
 
+   const bool allow_fast_subdraw =
+      !agx_native_graphics(&dev->dev) &&
+      !agx_chip_g17_m5(dev->dev.chip) &&
+      !(dev->dev.debug & AGX_DBG_DIRTY) &&
+      !dev->frame_anatomy &&
+      !gfx->render.view_mask &&
+      !hk_conditional_render_is_active(&cmd->state.conditional, cmd->in_meta,
+                                       cmd->conditional_meta) &&
+      !hk_prims_generated_addr(cmd, 0) &&
+      !hk_stat_enabled(hk_pipeline_stat_addr(
+         cmd, VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT)) &&
+      !hk_stat_enabled(hk_pipeline_stat_addr(
+         cmd, VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_PRIMITIVES_BIT)) &&
+      !hk_stat_enabled(hk_pipeline_stat_addr(
+         cmd, VK_QUERY_PIPELINE_STATISTIC_VERTEX_SHADER_INVOCATIONS_BIT)) &&
+      !hk_stat_enabled(hk_pipeline_stat_addr(
+         cmd, VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT)) &&
+      !hk_stat_enabled(hk_pipeline_stat_addr(
+         cmd, VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT));
+
    for (uint32_t i = 0; i < plan.draw_count; ++i) {
       struct agx_draw draw = plan.draw;
       draw.b.ptr += (uint64_t)i * plan.draw_stride_B;
+      if (likely(i > 0 && allow_fast_subdraw && cmd->current_cs.gfx &&
+                 cmd->current_cs.gfx->current + HK_GFX_DRAW_RESERVATION <=
+                    cmd->current_cs.gfx->end)) {
+         struct hk_cs *cs = cmd->current_cs.gfx;
+         draw.restart = false;
+         draw.index_size = AGX_INDEX_SIZE_U32;
+         cs->stats.calls++;
+         hk_upload_stat(cmd, draws, 1);
+         cs->current = (void *)agx_vdm_draw(
+            (uint32_t *)cs->current,
+            agx_vdm_index_list_record_chip(dev->dev.chip), draw,
+            gfx->topology, 0);
+         cs->stats.cmds++;
+         continue;
+      }
       const struct hk_g13_mesh_draw mesh_draw = {
          .plan = &plan,
          .geometry_params = params.gpu,
@@ -13432,9 +13467,45 @@ hk_cmd_draw_mesh_g13(struct hk_cmd_buffer *cmd,
     * later record consumes another GPU-written group draw without re-running
     * the producer. The pre-gfx barrier orders the whole render stream. */
    assert(plan.barrier == (AGX_BARRIER_ALL | AGX_PREGFX));
+
+   const bool allow_fast_subdraw =
+      !agx_native_graphics(&dev->dev) &&
+      !agx_chip_g17_m5(dev->dev.chip) &&
+      !(dev->dev.debug & AGX_DBG_DIRTY) &&
+      !dev->frame_anatomy &&
+      !gfx->render.view_mask &&
+      !hk_conditional_render_is_active(&cmd->state.conditional, cmd->in_meta,
+                                       cmd->conditional_meta) &&
+      !hk_prims_generated_addr(cmd, 0) &&
+      !hk_stat_enabled(hk_pipeline_stat_addr(
+         cmd, VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT)) &&
+      !hk_stat_enabled(hk_pipeline_stat_addr(
+         cmd, VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_PRIMITIVES_BIT)) &&
+      !hk_stat_enabled(hk_pipeline_stat_addr(
+         cmd, VK_QUERY_PIPELINE_STATISTIC_VERTEX_SHADER_INVOCATIONS_BIT)) &&
+      !hk_stat_enabled(hk_pipeline_stat_addr(
+         cmd, VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT)) &&
+      !hk_stat_enabled(hk_pipeline_stat_addr(
+         cmd, VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT));
+
    for (uint32_t i = 0; i < plan.draw_count; ++i) {
       struct agx_draw draw = plan.draw;
       draw.b.ptr += (uint64_t)i * plan.draw_stride_B;
+      if (likely(i > 0 && allow_fast_subdraw && cmd->current_cs.gfx &&
+                 cmd->current_cs.gfx->current + HK_GFX_DRAW_RESERVATION <=
+                    cmd->current_cs.gfx->end)) {
+         struct hk_cs *cs = cmd->current_cs.gfx;
+         draw.restart = false;
+         draw.index_size = AGX_INDEX_SIZE_U32;
+         cs->stats.calls++;
+         hk_upload_stat(cmd, draws, 1);
+         cs->current = (void *)agx_vdm_draw(
+            (uint32_t *)cs->current,
+            agx_vdm_index_list_record_chip(dev->dev.chip), draw,
+            gfx->topology, 0);
+         cs->stats.cmds++;
+         continue;
+      }
       const struct hk_g13_mesh_draw mesh_draw = {
          .plan = &plan,
          .geometry_params = params.gpu,
