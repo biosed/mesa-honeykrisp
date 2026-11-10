@@ -1199,7 +1199,35 @@ lower_tg4_offsets(nir_builder *b, nir_tex_instr *tex)
 
    nir_scalar dest[5] = { 0 };
    nir_def *residency = NULL;
-   for (unsigned i = 0; i < 4; ++i) {
+
+   /* When all four offsets fall within a single 2x2 texel square
+    * [x0, x0 + 1] x [y0, y0 + 1] with x0, y0 in [-8, 7], a single tg4 at
+    * offset (x0, y0) already gathers all four texels:
+    *   .x (0) = (x0,     y0 + 1)
+    *   .y (1) = (x0 + 1, y0 + 1)
+    *   .z (2) = (x0 + 1, y0)
+    *   .w (3) = (x0,     y0)
+    */
+   int8_t x0 = tex->tg4_offsets[0][0];
+   int8_t y0 = tex->tg4_offsets[0][1];
+   for (unsigned i = 1; i < 4; ++i) {
+      x0 = MIN2(x0, tex->tg4_offsets[i][0]);
+      y0 = MIN2(y0, tex->tg4_offsets[i][1]);
+   }
+   bool is_2x2_square = x0 >= -8 && x0 <= 7 && y0 >= -8 && y0 <= 7;
+   unsigned swiz[4] = { 3, 3, 3, 3 };
+   static const unsigned comp_for_dxy[4] = { 3, 2, 0, 1 };
+   for (unsigned i = 0; i < 4 && is_2x2_square; ++i) {
+      int dx = (int)tex->tg4_offsets[i][0] - (int)x0;
+      int dy = (int)tex->tg4_offsets[i][1] - (int)y0;
+      if ((unsigned)dx <= 1u && (unsigned)dy <= 1u)
+         swiz[i] = comp_for_dxy[(dy << 1) | dx];
+      else
+         is_2x2_square = false;
+   }
+
+   unsigned count = is_2x2_square ? 1 : 4;
+   for (unsigned i = 0; i < count; ++i) {
       nir_tex_instr *tex_copy = nir_tex_instr_create(b->shader, tex->num_srcs + 1);
       tex_copy->op = tex->op;
       tex_copy->coord_components = tex->coord_components;
@@ -1224,8 +1252,10 @@ lower_tg4_offsets(nir_builder *b, nir_tex_instr *tex)
          tex_copy->src[j].src_type = tex->src[j].src_type;
       }
 
-      nir_def *offset = nir_imm_ivec2(b, tex->tg4_offsets[i][0],
-                                      tex->tg4_offsets[i][1]);
+      nir_def *offset = is_2x2_square
+                           ? nir_imm_ivec2(b, x0, y0)
+                           : nir_imm_ivec2(b, tex->tg4_offsets[i][0],
+                                           tex->tg4_offsets[i][1]);
       nir_tex_src src = nir_tex_src_for_ssa(nir_tex_src_offset, offset);
       tex_copy->src[tex_copy->num_srcs - 1] = src;
 
@@ -1234,7 +1264,12 @@ lower_tg4_offsets(nir_builder *b, nir_tex_instr *tex)
 
       nir_builder_instr_insert(b, &tex_copy->instr);
 
-      dest[i] = nir_get_scalar(&tex_copy->def, 3);
+      if (is_2x2_square) {
+         for (unsigned k = 0; k < 4; ++k)
+            dest[k] = nir_get_scalar(&tex_copy->def, swiz[k]);
+      } else {
+         dest[i] = nir_get_scalar(&tex_copy->def, 3);
+      }
       if (tex->is_sparse) {
          nir_def *code = nir_channel(b, &tex_copy->def, 4);
          if (residency)
