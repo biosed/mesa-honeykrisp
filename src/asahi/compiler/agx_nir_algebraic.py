@@ -64,10 +64,11 @@ def f2f16_rtz(x):
             ('isub', ('f2f16_rtne', x), 1), ('f2f16_rtne', x))
 
 lower_pack = [
-    # The hardware converts with RTNE; D3D's f32tof16 (and AMD's packHalf)
-    # truncate, and GLSL leaves the rounding to the implementation.
+    # The hardware converts with RTNE; GLSL leaves packHalf2x16 rounding to
+    # the implementation (and Switch 2 NVIDIA shaders expect RTNE). Explicit
+    # RTZ uses pack_half_2x16_rtz_split.
     (('pack_half_2x16_split', a, b),
-     ('pack_32_2x16_split', f2f16_rtz(a), f2f16_rtz(b))),
+     ('pack_32_2x16_split', ('f2f16', a), ('f2f16', b))),
     (('pack_half_2x16_rtz_split', a, b),
      ('pack_32_2x16_split', f2f16_rtz(a), f2f16_rtz(b))),
 
