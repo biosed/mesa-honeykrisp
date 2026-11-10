@@ -736,7 +736,13 @@ export_scratch(nir_builder *b,
    for (unsigned base = 0; base < layout->primitives_per_group;
         base += threads) {
       nir_def *primitive = nir_iadd_imm(b, lane, base);
-      nir_push_if(b, nir_ult(b, primitive, primitive_count));
+      /* Every slot of the group is written: the draw covers the whole group,
+       * so a slot past this group's primitive count must become a degenerate
+       * triangle rather than keep a stale entry from an earlier group or draw.
+       */
+      nir_push_if(b,
+                  nir_ult_imm(b, primitive, layout->primitives_per_group));
+      nir_def *active = nir_ult(b, primitive, primitive_count);
       nir_def *primitive_index = nir_iadd(b, primitive_base, primitive);
       nir_def *primitive_record = record_address(
          b, primitive_records, primitive_index,
@@ -751,9 +757,9 @@ export_scratch(nir_builder *b,
          nir_def *v1 = nir_channel(b, indices, 1);
          nir_def *v2 = nir_channel(b, indices, 2);
          nir_def *tri_valid = nir_iand(
-            b, nir_ult(b, v0, vertex_count),
+            b, active, nir_iand(b, nir_ult(b, v0, vertex_count),
             nir_iand(b, nir_ult(b, v1, vertex_count),
-                     nir_ult(b, v2, vertex_count)));
+                     nir_ult(b, v2, vertex_count))));
          nir_def *base_vec = nir_replicate(b, vertex_base, 3);
          nir_def *idx_vec = nir_bcsel(
             b, tri_valid, nir_iadd(b, indices, base_vec), base_vec);
@@ -765,7 +771,8 @@ export_scratch(nir_builder *b,
       } else {
          for (unsigned c = 0; c < 3; ++c) {
             nir_def *source_vertex = nir_channel(b, indices, c);
-            nir_def *source_valid = nir_ult(b, source_vertex, vertex_count);
+            nir_def *source_valid = nir_iand(
+               b, active, nir_ult(b, source_vertex, vertex_count));
             nir_def *safe_vertex = nir_umin(
                b, source_vertex,
                nir_imm_int(b, layout->vertices_per_group - 1));
