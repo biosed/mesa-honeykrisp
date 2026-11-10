@@ -1512,6 +1512,10 @@ optimizations.extend([
    (('ult', ('ior', a, b), a), False),
    (('uge', a, ('iand', b, a)), True),
    (('uge', ('ior', a, b), a), True),
+   (('ult', ('ior', a, 3), ('ior', a, 1)), False),
+   (('ult', ('ior', a, 3), ('ior', a, 2)), False),
+   (('uge', ('ior', a, 3), ('ior', a, 1)), True),
+   (('uge', ('ior', a, 3), ('ior', a, 2)), True),
 
    (('ilt', '#a', ('imax', '#b', c)), ('ior', ('ilt', a, b), ('ilt', a, c))),
    (('ilt', ('imin', '#a', b), '#c'), ('ior', ('ilt', a, c), ('ilt', b, c))),
