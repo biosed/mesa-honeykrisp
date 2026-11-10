@@ -242,7 +242,8 @@ opt_uub_cmp(nir_builder *b, nir_alu_instr *alu, opt_uub_state *state)
       op = op == nir_op_ilt ? nir_op_ult : nir_op_uge;
    }
 
-   if (src_uub >= nir_scalar_as_uint(cmp))
+   if (const_src_idx == 0 ? src_uub > nir_scalar_as_uint(cmp)
+                          : src_uub >= nir_scalar_as_uint(cmp))
       return false;
 
    /* Replace ult with true, uge with false. */
