@@ -4219,11 +4219,12 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
    }
 
    case nir_intrinsic_read_invocation: {
-      /* TODO: Check if we're actually inside divergent control flow */
-      b->shader->any_quad_divergent_shuffle |= b->shader->any_cf;
-
       /* Lane ID guaranteed to be uniform */
       agx_index lane = agx_src_index(&instr->src[1]);
+
+      /* TODO: Check if we're actually inside divergent control flow */
+      if (lane.type != AGX_INDEX_IMMEDIATE)
+         b->shader->any_quad_divergent_shuffle |= b->shader->any_cf;
 
       /*
        * AGX3's immediate-lane broadcast puts the lane in a seven-bit field,
@@ -4254,11 +4255,12 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
    }
 
    case nir_intrinsic_quad_broadcast: {
-      /* TODO: Check if we're actually inside divergent control flow */
-      b->shader->any_quad_divergent_shuffle |= b->shader->any_cf;
-
       const agx_index data = agx_src_index(&instr->src[0]);
       const agx_index lane = agx_src_index(&instr->src[1]);
+
+      /* TODO: Check if we're actually inside divergent control flow */
+      if (lane.type != AGX_INDEX_IMMEDIATE)
+         b->shader->any_quad_divergent_shuffle |= b->shader->any_cf;
 
       /*
        * A 16-bit quad shuffle is encodable only from an IMMEDIATE lane. That
@@ -9541,6 +9543,8 @@ agx_optimize_loop_nir(nir_shader *nir, bool m5, bool g17p)
          NIR_PASS(progress, nir, agx_nir_fold_d3d_float_to_int);
       NIR_PASS(progress, nir, nir_opt_algebraic);
       NIR_PASS(progress, nir, nir_opt_constant_folding);
+      NIR_PASS(progress, nir, nir_opt_uub, &(nir_opt_uub_options){0});
+      NIR_PASS(progress, nir, nir_opt_if_merge);
       NIR_PASS(progress, nir, nir_opt_undef);
       NIR_PASS(progress, nir, nir_opt_loop_unroll);
    } while (progress);
@@ -13496,6 +13500,10 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
    if (!nir)
       return;
 
+   nir->info.max_subgroup_size = 32;
+   nir->info.min_subgroup_size = 32;
+   nir->info.api_subgroup_size = 32;
+
    if (g17p)
       agx_preserve_quad_control(nir);
 
@@ -13600,6 +13608,7 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
 
    NIR_PASS(_, nir, nir_opt_sink, move_all);
    NIR_PASS(_, nir, nir_opt_move, move_all);
+   NIR_PASS(_, nir, nir_opt_if_merge);
    /* Local-memory offsets are narrowed before the key-dependent optimizer so
     * conversion lowering and cleanup remain part of the normal pipeline.
     * G17P ordinary loads/stores use scalar-element indices; atomics retain

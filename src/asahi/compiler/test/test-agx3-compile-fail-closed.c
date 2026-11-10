@@ -707,7 +707,9 @@ check_active_count_lowering(bool g17p)
 {
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_COMPUTE, &agx_nir_options, "active subgroup count");
-   b.shader->info.workgroup_size[0] = 32;
+   /* A partial subgroup: with a multiple of 32 lanes, a top-level
+    * ballot(true) folds to a constant before this lowering sees it. */
+   b.shader->info.workgroup_size[0] = 16;
    b.shader->info.workgroup_size[1] = 1;
    b.shader->info.workgroup_size[2] = 1;
 
