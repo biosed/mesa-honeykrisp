@@ -33,6 +33,7 @@
 #include "hk_private.h"
 #include "hk_barrier.h"
 #include "hk_conditional_render_core.h"
+#include "hk_nir_lower_mesh_emulation.h"
 #include "hk_shader.h"
 #include "hk_sync.h"
 
@@ -1790,6 +1791,11 @@ struct hk_cmd_buffer {
     * large_bos, so it dies with the recording like every other program
     * reference. */
    struct hk_ioto_arena ioto;
+
+   /* Per-command-buffer G13 software-mesh scratch pool. Slots are busy for
+    * the duration of an open graphics pass and become reusable across later
+    * passes once hk_cmd_buffer_end_graphics() flushes the VDM stream. */
+   struct hk_mesh_emulation_scratch_pool g13_mesh_scratch;
 };
 
 /* Transfer entry points bracket their recording so the streams they create
@@ -2430,6 +2436,7 @@ hk_cmd_buffer_end_graphics(struct hk_cmd_buffer *cmd)
       cs->current = hk_cmd_buffer_emit_vdm_terminate(cmd, cs->current);
    }
 
+   hk_mesh_emulation_scratch_pool_end_pass(&cmd->g13_mesh_scratch, cs);
    cmd->current_cs.gfx = NULL;
 
    hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.pre_gfx);

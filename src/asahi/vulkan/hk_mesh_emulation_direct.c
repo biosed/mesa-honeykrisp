@@ -284,6 +284,7 @@ hk_mesh_emulation_task_requirements(
    plan->draw_params_size_B =
       groups * sizeof(VkDrawIndexedIndirectCommand);
    plan->patched_draw_params_size_B = plan->draw_params_size_B;
+   plan->task_count = tasks;
    plan->draw_count = groups;
    plan->draw_stride_B = sizeof(VkDrawIndexedIndirectCommand);
    plan->task = true;

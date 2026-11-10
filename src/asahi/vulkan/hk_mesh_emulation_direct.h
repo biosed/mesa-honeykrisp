@@ -77,10 +77,25 @@ struct hk_mesh_emulation_direct_plan {
    uint64_t task_records_size_B;
    uint64_t group_to_task_size_B;
    uint64_t scratch_size_B;
+   uint32_t task_count;
    uint32_t draw_count;
    uint32_t draw_stride_B;
    bool task;
 };
+
+static inline bool
+hk_mesh_emulation_plan_pack_scratch(
+   const struct hk_mesh_emulation_direct_plan *req,
+   struct hk_mesh_emulation_scratch_offsets *offsets)
+{
+   return req && hk_mesh_emulation_pack_scratch_offsets(
+      req->vertex_records_size_B, req->primitive_records_size_B,
+      req->expanded_records_size_B, req->index_buffer_size_B,
+      req->group_records_size_B, req->task_records_size_B,
+      req->group_to_task_size_B, req->draw_params_size_B,
+      req->patched_draw_params_size_B, req->task,
+      HK_G13_MESH_MAX_SCRATCH_SIZE, offsets);
+}
 
 bool hk_mesh_emulation_direct_requirements(
    enum agx_chip chip, const struct hk_api_shader *api,

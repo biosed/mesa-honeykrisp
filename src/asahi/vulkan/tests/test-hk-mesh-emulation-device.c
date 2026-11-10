@@ -379,6 +379,7 @@ main(void)
    assert(hk_mesh_emulation_task_requirements(
       dev->dev.chip, task, payload_mesh, task_grid, &task_plan));
    assert(task_plan.task &&
+          task_plan.task_count == 1 &&
           task_plan.draw_count == HK_G13_MESH_MAX_GROUP_TOTAL);
    assert(task_plan.task_records_size_B == 272);
    assert(task_plan.group_to_task_size_B ==
@@ -447,7 +448,33 @@ main(void)
    struct hk_mesh_emulation_direct_plan title_plan;
    assert(hk_mesh_emulation_task_requirements(
       dev->dev.chip, task, payload_mesh, max_task_grid, &title_plan));
+   assert(title_plan.task_count == HK_G13_TASK_MAX_GROUP_TOTAL);
    assert(title_plan.draw_count == HK_G13_MESH_MAX_GROUP_TOTAL);
+   struct hk_mesh_emulation_scratch_offsets title_offsets;
+   assert(hk_mesh_emulation_plan_pack_scratch(&title_plan, &title_offsets));
+   const uint64_t packed_base = UINT64_C(0x200000000);
+   struct hk_mesh_emulation_direct_plan packed_plan;
+   assert(hk_mesh_emulation_task_plan_init(
+      dev->dev.chip, task, payload_mesh, max_task_grid,
+      packed_base + title_offsets.vertex_records_offset_B,
+      title_plan.vertex_records_size_B,
+      packed_base + title_offsets.primitive_records_offset_B,
+      title_plan.primitive_records_size_B,
+      packed_base + title_offsets.expanded_records_offset_B,
+      title_plan.expanded_records_size_B,
+      packed_base + title_offsets.index_buffer_offset_B,
+      title_plan.index_buffer_size_B,
+      packed_base + title_offsets.group_records_offset_B,
+      title_plan.group_records_size_B,
+      packed_base + title_offsets.task_records_offset_B,
+      title_plan.task_records_size_B,
+      packed_base + title_offsets.group_to_task_offset_B,
+      title_plan.group_to_task_size_B,
+      packed_base + title_offsets.draw_params_offset_B,
+      title_plan.draw_params_size_B,
+      packed_base + title_offsets.patched_draw_params_offset_B,
+      title_plan.patched_draw_params_size_B,
+      UINT64_C(0x300000000), &packed_plan));
    const uint64_t group_dependent =
       title_plan.vertex_records_size_B +
       title_plan.primitive_records_size_B +

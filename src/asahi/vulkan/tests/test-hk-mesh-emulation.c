@@ -775,6 +775,76 @@ test_task_mesh_interface(void)
    task_mesh_binary_size = compile_producer(b.shader);
 }
 
+static void
+test_scratch_packing_and_reuse(void)
+{
+   assert(hk_mesh_emulation_indirect_task_cap(4096) == 4096);
+   assert(hk_mesh_emulation_indirect_task_cap(64) == 64);
+   assert(hk_mesh_emulation_indirect_task_cap(128) == 128);
+   assert(hk_mesh_emulation_indirect_task_cap(0) == 1);
+   assert(hk_mesh_emulation_indirect_task_cap(99999) ==
+          HK_MESH_EMULATION_MAX_TASK_GROUPS);
+
+   struct hk_mesh_emulation_scratch_offsets offsets;
+   assert(hk_mesh_emulation_pack_scratch_offsets(
+      262144, 131072, 1966080, 98304, 2048, 864, 512, 1280, 1280, true,
+      UINT64_C(256) * 1024 * 1024, &offsets));
+   assert((offsets.group_records_offset_B & 31) == 0);
+   assert((offsets.vertex_records_offset_B & 15) == 0);
+   assert((offsets.primitive_records_offset_B & 15) == 0);
+   assert((offsets.expanded_records_offset_B & 15) == 0);
+   assert((offsets.task_records_offset_B & 15) == 0);
+   assert((offsets.group_to_task_offset_B & 7) == 0);
+   assert((offsets.index_buffer_offset_B & 3) == 0);
+   assert((offsets.draw_params_offset_B & 3) == 0);
+   assert((offsets.patched_draw_params_offset_B & 3) == 0);
+   assert((offsets.total_size_B & 31) == 0);
+   assert(offsets.patched_draw_params_offset_B + 1280 <= offsets.total_size_B);
+
+   struct hk_mesh_emulation_scratch_pool pool;
+   hk_mesh_emulation_scratch_pool_reset(&pool);
+   void *cpu = NULL;
+   uint64_t gpu = 0;
+   struct hk_cs *wait_cs = NULL;
+   struct hk_cs *pass1_cs = (struct hk_cs *)(uintptr_t)0x1111;
+   struct hk_cs *pass2_cs = (struct hk_cs *)(uintptr_t)0x2222;
+
+   /* First draw in pass 1 misses and inserts slot 0. */
+   assert(!hk_mesh_emulation_scratch_pool_acquire(
+      &pool, 4096, &cpu, &gpu, &wait_cs));
+   hk_mesh_emulation_scratch_pool_insert(
+      &pool, (void *)(uintptr_t)0x1000, UINT64_C(0x100000), 4096);
+
+   /* Second draw in the same open pass must not alias busy slot 0. */
+   assert(!hk_mesh_emulation_scratch_pool_acquire(
+      &pool, 4096, &cpu, &gpu, &wait_cs));
+   hk_mesh_emulation_scratch_pool_insert(
+      &pool, (void *)(uintptr_t)0x2000, UINT64_C(0x200000), 8192);
+   assert(pool.count == 2);
+
+   /* Ending pass 1 marks both slots reusable and records pass1_cs. */
+   hk_mesh_emulation_scratch_pool_end_pass(&pool, pass1_cs);
+
+   /* Pass 2 draw needing 4096 B picks the best-fit 4096 B slot 0 and receives
+    * pass1_cs as the VDM consumer stream its pre_gfx producer must wait on. */
+   assert(hk_mesh_emulation_scratch_pool_acquire(
+      &pool, 4096, &cpu, &gpu, &wait_cs));
+   assert(gpu == UINT64_C(0x100000));
+   assert(wait_cs == pass1_cs);
+
+   /* A second draw in pass 2 needing 6000 B acquires slot 1 (8192 B). */
+   assert(hk_mesh_emulation_scratch_pool_acquire(
+      &pool, 6000, &cpu, &gpu, &wait_cs));
+   assert(gpu == UINT64_C(0x200000));
+   assert(wait_cs == pass1_cs);
+
+   hk_mesh_emulation_scratch_pool_end_pass(&pool, pass2_cs);
+   assert(hk_mesh_emulation_scratch_pool_acquire(
+      &pool, 4096, &cpu, &gpu, &wait_cs));
+   assert(gpu == UINT64_C(0x100000));
+   assert(wait_cs == pass2_cs);
+}
+
 int
 main(void)
 {
@@ -787,6 +857,7 @@ main(void)
    test_admission_identity_lifetime();
    test_task_producer();
    test_task_mesh_interface();
+   test_scratch_packing_and_reuse();
    printf("G13 mesh NIR: producer PASS (%u B), pull VS PASS (%u B), "
           "56-component PASS (%u/%u B), limits PASS (%u/%u B), "
           "admission/cache PASS (%u/%u B), task PASS (%u/%u B), "

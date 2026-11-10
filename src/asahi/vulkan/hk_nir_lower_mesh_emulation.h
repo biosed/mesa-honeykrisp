@@ -175,3 +175,190 @@ nir_shader *hk_mesh_emulation_admission_clone_producer(
 nir_shader *hk_mesh_emulation_admission_clone_pull_vs(
    const struct hk_mesh_emulation_admission *admission,
    const nir_shader_compiler_options *options);
+
+/* Bound indirect task-group allocation via ASAHI_G13_SOFTWARE_TASK_INDIRECT_CAP
+ * (defaulting to HK_MESH_EMULATION_MAX_TASK_GROUPS = 4096 when unset). */
+static inline uint32_t
+hk_mesh_emulation_indirect_task_cap(int64_t requested_cap)
+{
+   if (requested_cap < 1)
+      return 1u;
+   if (requested_cap > (int64_t)HK_MESH_EMULATION_MAX_TASK_GROUPS)
+      return HK_MESH_EMULATION_MAX_TASK_GROUPS;
+   return (uint32_t)requested_cap;
+}
+
+struct hk_mesh_emulation_scratch_offsets {
+   uint64_t vertex_records_offset_B;
+   uint64_t primitive_records_offset_B;
+   uint64_t expanded_records_offset_B;
+   uint64_t index_buffer_offset_B;
+   uint64_t group_records_offset_B;
+   uint64_t task_records_offset_B;
+   uint64_t group_to_task_offset_B;
+   uint64_t draw_params_offset_B;
+   uint64_t patched_draw_params_offset_B;
+   uint64_t total_size_B;
+};
+
+static inline bool
+hk_mesh_emulation_align_add_u64(uint64_t *cursor, uint64_t size_B,
+                                uint64_t align_B, uint64_t *offset_out)
+{
+   const uint64_t mask = align_B - 1;
+   if (align_B == 0 || (align_B & mask) != 0 || *cursor > UINT64_MAX - mask)
+      return false;
+   const uint64_t aligned = (*cursor + mask) & ~mask;
+   if (size_B > UINT64_MAX - aligned)
+      return false;
+   *offset_out = aligned;
+   *cursor = aligned + size_B;
+   return true;
+}
+
+/* Pack the six (taskless) or nine (task+mesh) scratch regions of a software
+ * mesh draw into a single 32-byte-aligned allocation so each active slot uses
+ * one BO instead of 4-5 separate large_bos allocations. */
+static inline bool
+hk_mesh_emulation_pack_scratch_offsets(
+   uint64_t vertex_records_size_B, uint64_t primitive_records_size_B,
+   uint64_t expanded_records_size_B, uint64_t index_buffer_size_B,
+   uint64_t group_records_size_B, uint64_t task_records_size_B,
+   uint64_t group_to_task_size_B, uint64_t draw_params_size_B,
+   uint64_t patched_draw_params_size_B, bool task, uint64_t max_scratch_B,
+   struct hk_mesh_emulation_scratch_offsets *out)
+{
+   if (!out || !vertex_records_size_B || !primitive_records_size_B ||
+       !expanded_records_size_B || !index_buffer_size_B ||
+       !group_records_size_B || !draw_params_size_B ||
+       (task && (!task_records_size_B || !group_to_task_size_B ||
+                 !patched_draw_params_size_B)))
+      return false;
+
+   memset(out, 0, sizeof(*out));
+   uint64_t cursor = 0;
+   uint64_t dummy = 0;
+   if (!hk_mesh_emulation_align_add_u64(
+          &cursor, group_records_size_B, 32, &out->group_records_offset_B) ||
+       !hk_mesh_emulation_align_add_u64(
+          &cursor, vertex_records_size_B, 16, &out->vertex_records_offset_B) ||
+       !hk_mesh_emulation_align_add_u64(
+          &cursor, primitive_records_size_B, 16,
+          &out->primitive_records_offset_B) ||
+       !hk_mesh_emulation_align_add_u64(
+          &cursor, expanded_records_size_B, 16,
+          &out->expanded_records_offset_B) ||
+       (task &&
+        !hk_mesh_emulation_align_add_u64(
+           &cursor, task_records_size_B, 16, &out->task_records_offset_B)) ||
+       (task &&
+        !hk_mesh_emulation_align_add_u64(
+           &cursor, group_to_task_size_B, 8, &out->group_to_task_offset_B)) ||
+       !hk_mesh_emulation_align_add_u64(
+          &cursor, index_buffer_size_B, 4, &out->index_buffer_offset_B) ||
+       !hk_mesh_emulation_align_add_u64(
+          &cursor, draw_params_size_B, 4, &out->draw_params_offset_B) ||
+       (task &&
+        !hk_mesh_emulation_align_add_u64(
+           &cursor, patched_draw_params_size_B, 4,
+           &out->patched_draw_params_offset_B)) ||
+       !hk_mesh_emulation_align_add_u64(&cursor, 0, 32, &dummy))
+      return false;
+
+   if (cursor == 0 || cursor > UINT32_MAX || cursor > max_scratch_B)
+      return false;
+
+   out->total_size_B = cursor;
+   return true;
+}
+
+#define HK_G13_MESH_SCRATCH_POOL_SLOTS 16u
+
+struct hk_cs;
+
+struct hk_mesh_emulation_scratch_slot {
+   void *cpu;
+   uint64_t gpu;
+   uint32_t capacity_B;
+   bool busy_in_pass;
+   struct hk_cs *last_gfx_cs;
+};
+
+struct hk_mesh_emulation_scratch_pool {
+   struct hk_mesh_emulation_scratch_slot
+      slots[HK_G13_MESH_SCRATCH_POOL_SLOTS];
+   uint32_t count;
+};
+
+static inline void
+hk_mesh_emulation_scratch_pool_reset(
+   struct hk_mesh_emulation_scratch_pool *pool)
+{
+   memset(pool, 0, sizeof(*pool));
+}
+
+static inline void
+hk_mesh_emulation_scratch_pool_end_pass(
+   struct hk_mesh_emulation_scratch_pool *pool, struct hk_cs *gfx_cs)
+{
+   for (uint32_t i = 0; i < pool->count; ++i) {
+      if (pool->slots[i].busy_in_pass) {
+         pool->slots[i].busy_in_pass = false;
+         if (gfx_cs)
+            pool->slots[i].last_gfx_cs = gfx_cs;
+      }
+   }
+}
+
+static inline bool
+hk_mesh_emulation_scratch_pool_acquire(
+   struct hk_mesh_emulation_scratch_pool *pool, uint32_t needed_B,
+   void **cpu_out, uint64_t *gpu_out, struct hk_cs **wait_gfx_cs_out)
+{
+   uint32_t best = UINT32_MAX;
+   for (uint32_t i = 0; i < pool->count; ++i) {
+      const struct hk_mesh_emulation_scratch_slot *s = &pool->slots[i];
+      if (s->busy_in_pass || s->capacity_B < needed_B)
+         continue;
+      if (best == UINT32_MAX || s->capacity_B < pool->slots[best].capacity_B)
+         best = i;
+   }
+   if (best == UINT32_MAX)
+      return false;
+
+   struct hk_mesh_emulation_scratch_slot *s = &pool->slots[best];
+   s->busy_in_pass = true;
+   *cpu_out = s->cpu;
+   *gpu_out = s->gpu;
+   *wait_gfx_cs_out = s->last_gfx_cs;
+   s->last_gfx_cs = NULL;
+   return true;
+}
+
+static inline void
+hk_mesh_emulation_scratch_pool_insert(
+   struct hk_mesh_emulation_scratch_pool *pool, void *cpu, uint64_t gpu,
+   uint32_t capacity_B)
+{
+   uint32_t target = pool->count < HK_G13_MESH_SCRATCH_POOL_SLOTS
+                        ? pool->count++
+                        : UINT32_MAX;
+   if (target == UINT32_MAX) {
+      for (uint32_t i = 0; i < pool->count; ++i) {
+         if (!pool->slots[i].busy_in_pass &&
+             pool->slots[i].capacity_B < capacity_B &&
+             (target == UINT32_MAX ||
+              pool->slots[i].capacity_B < pool->slots[target].capacity_B))
+            target = i;
+      }
+   }
+   if (target < HK_G13_MESH_SCRATCH_POOL_SLOTS) {
+      pool->slots[target] = (struct hk_mesh_emulation_scratch_slot){
+         .cpu = cpu,
+         .gpu = gpu,
+         .capacity_B = capacity_B,
+         .busy_in_pass = true,
+         .last_gfx_cs = NULL,
+      };
+   }
+}

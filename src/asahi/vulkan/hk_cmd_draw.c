@@ -115,6 +115,9 @@ DEBUG_GET_ONCE_BOOL_OPTION(mesh_pp_tail0, "ASAHI_MESH_PP_TAIL0", false)
 DEBUG_GET_ONCE_NUM_OPTION(g13_mesh_indirect_cap,
                           "ASAHI_G13_SOFTWARE_MESH_INDIRECT_CAP",
                           16)
+DEBUG_GET_ONCE_NUM_OPTION(g13_task_indirect_cap,
+                          "ASAHI_G13_SOFTWARE_TASK_INDIRECT_CAP",
+                          HK_G13_TASK_MAX_GROUP_TOTAL)
 
 #define IS_DIRTY(bit) BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_##bit)
 
@@ -12607,6 +12610,7 @@ struct hk_g13_mesh_draw {
    uint64_t task_grid_source;
    uint64_t task_grid_dest;
    uint64_t task_overflow_addr;
+   struct hk_cs *wait_gfx_cs;
    struct hk_mesh_emulation_record_trace *trace;
    bool dispatch_producer;
 };
@@ -12849,13 +12853,20 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
          }
 
          if (mesh_draw->dispatch_producer) {
+            if (mesh_draw->wait_gfx_cs &&
+                (!ccs->sync.dep[HK_SYNC_VDM].cut ||
+                 mesh_draw->wait_gfx_cs->sync.seq >
+                    ccs->sync.dep[HK_SYNC_VDM].cut->sync.seq)) {
+               ccs->sync.dep[HK_SYNC_VDM].cut = mesh_draw->wait_gfx_cs;
+               ccs->sync.dep_ta[HK_SYNC_VDM].cut = mesh_draw->wait_gfx_cs;
+            }
             if (mesh_draw->task_grid_source) {
                libagx_g13_task_dispatch(
                   cmd, agx_1d(1), plan->barrier,
                   mesh_draw->task_grid_dest,
                   mesh_draw->task_overflow_addr,
                   mesh_draw->task_grid_source,
-                  plan->task ? HK_G13_TASK_MAX_GROUP_TOTAL
+                  plan->task ? plan->task_count
                              : plan->draw_count);
             }
             if (plan->task) {
@@ -13119,12 +13130,23 @@ hk_cmd_draw_mesh_g13_task(struct hk_cmd_buffer *cmd,
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct hk_api_shader *task = gfx->shaders[MESA_SHADER_TASK];
    struct hk_api_shader *mesh = gfx->shaders[MESA_SHADER_MESH];
+   if (!indirect_grid &&
+       (!task_group_count || !task_group_count[0] || !task_group_count[1] ||
+        !task_group_count[2]))
+      return true;
+
+   const uint32_t indirect_cap = hk_mesh_emulation_indirect_task_cap(
+      debug_get_option_g13_task_indirect_cap());
    const uint32_t indirect_allocation_count[3] = {
-      HK_G13_TASK_MAX_GROUP_TOTAL, 1, 1,
+      indirect_cap, 1, 1,
    };
-   const uint32_t *allocation_count = indirect_grid
-      ? indirect_allocation_count : task_group_count;
+   const uint32_t *allocation_count =
+      (indirect_grid && (!task_group_count || !task_group_count[0] ||
+                         !task_group_count[1] || !task_group_count[2]))
+         ? indirect_allocation_count
+         : task_group_count;
    struct hk_mesh_emulation_direct_plan req;
+   struct hk_mesh_emulation_scratch_offsets offsets;
    if (!task || !mesh || gfx->render.view_mask ||
        !hk_bound_mesh_is_software(gfx) ||
        !hk_mesh_emulation_task_requirements(
@@ -13137,16 +13159,10 @@ hk_cmd_draw_mesh_g13_task(struct hk_cmd_buffer *cmd,
        req.task_records_size_B > UINT32_MAX ||
        req.group_to_task_size_B > UINT32_MAX ||
        req.draw_params_size_B > UINT32_MAX ||
-       req.patched_draw_params_size_B > UINT32_MAX) {
+       req.patched_draw_params_size_B > UINT32_MAX ||
+       !hk_mesh_emulation_plan_pack_scratch(&req, &offsets)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return false;
-   }
-
-#define ALLOC_SCRATCH(name, size, alignment)                                  \
-   struct agx_ptr name = hk_pool_alloc(cmd, (size), (alignment));             \
-   if (!name.cpu) {                                                            \
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);   \
-      return false;                                                            \
    }
 
    /* Do not CPU-clear tens of MiB of GPU-owned scratch per task draw.  Task
@@ -13155,17 +13171,29 @@ hk_cmd_draw_mesh_g13_task(struct hk_cmd_buffer *cmd,
     * Vulkan when the application did not write them.  Mesh writes every
     * consumed expanded vertex, U32 index and all five source draw dwords; the
     * predicate writes all five dwords of every patched draw record. Overflow
-    * sanitization prevents any unmapped record from reaching mesh/raster. */
-   ALLOC_SCRATCH(vertex_records, req.vertex_records_size_B, 16);
-   ALLOC_SCRATCH(primitive_records, req.primitive_records_size_B, 16);
-   ALLOC_SCRATCH(expanded_records, req.expanded_records_size_B, 16);
-   ALLOC_SCRATCH(index_buffer, req.index_buffer_size_B, 4);
-   ALLOC_SCRATCH(group_records, req.group_records_size_B, 32);
-   ALLOC_SCRATCH(task_records, req.task_records_size_B, 16);
-   ALLOC_SCRATCH(group_to_task, req.group_to_task_size_B, 8);
-   ALLOC_SCRATCH(draw_params, req.draw_params_size_B, 4);
-   ALLOC_SCRATCH(patched_draw_params, req.patched_draw_params_size_B, 4);
-#undef ALLOC_SCRATCH
+    * sanitization prevents any unmapped record from reaching mesh/raster.
+    *
+    * Sub-allocate all nine GPU-written regions from one 32-byte-aligned
+    * scratch block and reuse idle blocks from earlier flushed render passes in
+    * the same command buffer. */
+   void *scratch_cpu = NULL;
+   uint64_t scratch_gpu = 0;
+   struct hk_cs *wait_gfx_cs = NULL;
+   if (!hk_mesh_emulation_scratch_pool_acquire(
+          &cmd->g13_mesh_scratch, (uint32_t)offsets.total_size_B,
+          &scratch_cpu, &scratch_gpu, &wait_gfx_cs)) {
+      struct agx_ptr scratch =
+         hk_pool_alloc(cmd, (uint32_t)offsets.total_size_B, 32);
+      if (!scratch.cpu) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         return false;
+      }
+      scratch_cpu = scratch.cpu;
+      scratch_gpu = scratch.gpu;
+      hk_mesh_emulation_scratch_pool_insert(
+         &cmd->g13_mesh_scratch, scratch_cpu, scratch_gpu,
+         (uint32_t)offsets.total_size_B);
+   }
 
    const struct agx_ptr params =
       hk_pool_alloc(cmd, sizeof(struct hk_mesh_emulation_params), 16);
@@ -13174,18 +13202,29 @@ hk_cmd_draw_mesh_g13_task(struct hk_cmd_buffer *cmd,
       return false;
    }
 
+   const uint64_t draw_params_gpu =
+      scratch_gpu + offsets.draw_params_offset_B;
+   const uint64_t patched_draw_params_gpu =
+      scratch_gpu + offsets.patched_draw_params_offset_B;
    struct hk_mesh_emulation_direct_plan plan;
    if (!hk_mesh_emulation_task_plan_init(
           dev->dev.chip, task, mesh, allocation_count,
-          vertex_records.gpu, req.vertex_records_size_B,
-          primitive_records.gpu, req.primitive_records_size_B,
-          expanded_records.gpu, req.expanded_records_size_B,
-          index_buffer.gpu, req.index_buffer_size_B,
-          group_records.gpu, req.group_records_size_B,
-          task_records.gpu, req.task_records_size_B,
-          group_to_task.gpu, req.group_to_task_size_B,
-          draw_params.gpu, req.draw_params_size_B,
-          patched_draw_params.gpu, req.patched_draw_params_size_B,
+          scratch_gpu + offsets.vertex_records_offset_B,
+          req.vertex_records_size_B,
+          scratch_gpu + offsets.primitive_records_offset_B,
+          req.primitive_records_size_B,
+          scratch_gpu + offsets.expanded_records_offset_B,
+          req.expanded_records_size_B,
+          scratch_gpu + offsets.index_buffer_offset_B,
+          req.index_buffer_size_B,
+          scratch_gpu + offsets.group_records_offset_B,
+          req.group_records_size_B,
+          scratch_gpu + offsets.task_records_offset_B,
+          req.task_records_size_B,
+          scratch_gpu + offsets.group_to_task_offset_B,
+          req.group_to_task_size_B,
+          draw_params_gpu, req.draw_params_size_B,
+          patched_draw_params_gpu, req.patched_draw_params_size_B,
           params.gpu, &plan)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return false;
@@ -13228,8 +13267,8 @@ hk_cmd_draw_mesh_g13_task(struct hk_cmd_buffer *cmd,
          .plan = &plan,
          .geometry_params = params.gpu,
          .api_mesh_grid_addr = api_grid_addr,
-         .source_draw_params = draw_params.gpu,
-         .patched_draw_params = patched_draw_params.gpu,
+         .source_draw_params = draw_params_gpu,
+         .patched_draw_params = patched_draw_params_gpu,
          .draw_count_addr =
             params.gpu + offsetof(struct hk_mesh_emulation_params, mesh_grid),
          .task_grid_source = indirect_grid,
@@ -13238,6 +13277,7 @@ hk_cmd_draw_mesh_g13_task(struct hk_cmd_buffer *cmd,
          .task_overflow_addr =
             params.gpu + offsetof(struct hk_mesh_emulation_params,
                                   task_overflow),
+         .wait_gfx_cs = i == 0 ? wait_gfx_cs : NULL,
          .trace = i == 0 ? trace : NULL,
          .dispatch_producer = i == 0,
       };
@@ -13295,6 +13335,7 @@ hk_cmd_draw_mesh_g13(struct hk_cmd_buffer *cmd,
       ? indirect_allocation_count : group_count;
 
    struct hk_mesh_emulation_direct_plan requirements;
+   struct hk_mesh_emulation_scratch_offsets offsets;
    if (!hk_mesh_emulation_direct_requirements(
           dev->dev.chip, mesh, allocation_count, &requirements) ||
        requirements.vertex_records_size_B > UINT32_MAX ||
@@ -13304,26 +13345,15 @@ hk_cmd_draw_mesh_g13(struct hk_cmd_buffer *cmd,
        requirements.group_records_size_B > UINT32_MAX ||
        requirements.draw_params_size_B > UINT32_MAX ||
        requirements.draw_count > HK_G13_MESH_MAX_GROUP_TOTAL ||
-       gfx->render.view_mask) {
+       gfx->render.view_mask ||
+       !hk_mesh_emulation_plan_pack_scratch(&requirements, &offsets)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return false;
    }
 
-   struct agx_ptr vertex_records = hk_pool_alloc(
-      cmd, requirements.vertex_records_size_B, 16);
-   struct agx_ptr primitive_records = hk_pool_alloc(
-      cmd, requirements.primitive_records_size_B, 16);
-   struct agx_ptr expanded_records = hk_pool_alloc(
-      cmd, requirements.expanded_records_size_B, 16);
-   struct agx_ptr index_buffer = hk_pool_alloc(
-      cmd, requirements.index_buffer_size_B, 4);
-   struct agx_ptr group_records = hk_pool_alloc(
-      cmd, requirements.group_records_size_B, 32);
-   struct agx_ptr draw_params = hk_pool_alloc(
-      cmd, requirements.draw_params_size_B, 4);
-   if (!vertex_records.cpu || !primitive_records.cpu ||
-       !expanded_records.cpu || !index_buffer.cpu || !group_records.cpu ||
-       !draw_params.cpu) {
+   struct agx_ptr scratch =
+      hk_pool_alloc(cmd, (uint32_t)offsets.total_size_B, 32);
+   if (!scratch.cpu) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       return false;
    }
@@ -13331,24 +13361,23 @@ hk_cmd_draw_mesh_g13(struct hk_cmd_buffer *cmd,
    /* Command-owned uploader memory is CPU mapped and submitted only after
     * recording completes. Zero every consumer-visible byte here, including
     * reserved group fields and VkDrawIndexedIndirectCommand::firstInstance. */
-   memset(vertex_records.cpu, 0, requirements.vertex_records_size_B);
-   memset(primitive_records.cpu, 0,
-          requirements.primitive_records_size_B);
-   memset(expanded_records.cpu, 0,
-          requirements.expanded_records_size_B);
-   memset(index_buffer.cpu, 0, requirements.index_buffer_size_B);
-   memset(group_records.cpu, 0, requirements.group_records_size_B);
-   memset(draw_params.cpu, 0, requirements.draw_params_size_B);
+   memset(scratch.cpu, 0, offsets.total_size_B);
 
    struct hk_mesh_emulation_direct_plan plan;
    if (!hk_mesh_emulation_direct_plan_init(
           dev->dev.chip, mesh, allocation_count,
-          vertex_records.gpu, requirements.vertex_records_size_B,
-          primitive_records.gpu, requirements.primitive_records_size_B,
-          expanded_records.gpu, requirements.expanded_records_size_B,
-          index_buffer.gpu, requirements.index_buffer_size_B,
-          group_records.gpu, requirements.group_records_size_B,
-          draw_params.gpu, requirements.draw_params_size_B, &plan)) {
+          scratch.gpu + offsets.vertex_records_offset_B,
+          requirements.vertex_records_size_B,
+          scratch.gpu + offsets.primitive_records_offset_B,
+          requirements.primitive_records_size_B,
+          scratch.gpu + offsets.expanded_records_offset_B,
+          requirements.expanded_records_size_B,
+          scratch.gpu + offsets.index_buffer_offset_B,
+          requirements.index_buffer_size_B,
+          scratch.gpu + offsets.group_records_offset_B,
+          requirements.group_records_size_B,
+          scratch.gpu + offsets.draw_params_offset_B,
+          requirements.draw_params_size_B, &plan)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return false;
    }

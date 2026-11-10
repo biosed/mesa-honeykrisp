@@ -271,6 +271,7 @@ hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd)
 
    /* The cached span is only valid while this recording owns its leases. */
    cmd->g17p_vdm_last_allocation = NULL;
+   hk_mesh_emulation_scratch_pool_reset(&cmd->g13_mesh_scratch);
 
    hk_descriptor_state_fini(cmd, &cmd->state.gfx.descriptors);
    hk_descriptor_state_fini(cmd, &cmd->state.cs.descriptors);
