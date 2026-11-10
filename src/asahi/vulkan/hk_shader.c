@@ -2984,6 +2984,529 @@ hk_ubo_loads_reorderable(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
+static bool
+hk_match_shared_cas_insert(nir_def *old_val, nir_def *new_val,
+                           nir_def **out_val, nir_def **out_bit_shift,
+                           unsigned *out_bit_size)
+{
+   if (nir_def_instr(new_val)->type != nir_instr_type_alu)
+      return false;
+
+   nir_alu_instr *alu = nir_instr_as_alu(nir_def_instr(new_val));
+   if (alu->op == nir_op_bitfield_insert) {
+      if (alu->src[0].src.ssa != old_val || !nir_src_is_const(alu->src[3].src))
+         return false;
+      unsigned bits = nir_src_as_uint(alu->src[3].src);
+      if (bits != 8 && bits != 16)
+         return false;
+      *out_val = alu->src[1].src.ssa;
+      *out_bit_shift = alu->src[2].src.ssa;
+      *out_bit_size = bits;
+      return true;
+   }
+
+   if (alu->op != nir_op_ior)
+      return false;
+
+   for (unsigned side = 0; side < 2; ++side) {
+      nir_def *keep_def = alu->src[side].src.ssa;
+      nir_def *ins_def = alu->src[1 - side].src.ssa;
+      if (nir_def_instr(keep_def)->type != nir_instr_type_alu ||
+          nir_def_instr(ins_def)->type != nir_instr_type_alu)
+         continue;
+
+      nir_alu_instr *keep = nir_instr_as_alu(nir_def_instr(keep_def));
+      nir_alu_instr *ins = nir_instr_as_alu(nir_def_instr(ins_def));
+      if (keep->op != nir_op_iand || ins->op != nir_op_iand)
+         continue;
+
+      nir_def *inv_mask_def = NULL;
+      if (keep->src[0].src.ssa == old_val)
+         inv_mask_def = keep->src[1].src.ssa;
+      else if (keep->src[1].src.ssa == old_val)
+         inv_mask_def = keep->src[0].src.ssa;
+      else
+         continue;
+
+      if (nir_def_instr(inv_mask_def)->type != nir_instr_type_alu)
+         continue;
+      nir_alu_instr *inv_mask = nir_instr_as_alu(nir_def_instr(inv_mask_def));
+      if (inv_mask->op != nir_op_inot)
+         continue;
+
+      nir_def *shifted_mask_def = inv_mask->src[0].src.ssa;
+      if (nir_def_instr(shifted_mask_def)->type != nir_instr_type_alu)
+         continue;
+      nir_alu_instr *shifted_mask =
+         nir_instr_as_alu(nir_def_instr(shifted_mask_def));
+      if (shifted_mask->op != nir_op_ishl ||
+          !nir_src_is_const(shifted_mask->src[0].src))
+         continue;
+
+      uint64_t mask_const = nir_src_as_uint(shifted_mask->src[0].src);
+      unsigned bits = 0;
+      if (mask_const == 0xffff)
+         bits = 16;
+      else if (mask_const == 0xff)
+         bits = 8;
+      else
+         continue;
+
+      nir_def *bit_shift = shifted_mask->src[1].src.ssa;
+      nir_def *shifted_val_def = NULL;
+      if (ins->src[0].src.ssa == shifted_mask_def)
+         shifted_val_def = ins->src[1].src.ssa;
+      else if (ins->src[1].src.ssa == shifted_mask_def)
+         shifted_val_def = ins->src[0].src.ssa;
+      else
+         continue;
+
+      if (nir_def_instr(shifted_val_def)->type != nir_instr_type_alu)
+         continue;
+      nir_alu_instr *shifted_val =
+         nir_instr_as_alu(nir_def_instr(shifted_val_def));
+      if (shifted_val->op != nir_op_ishl ||
+          shifted_val->src[1].src.ssa != bit_shift)
+         continue;
+
+      *out_val = shifted_val->src[0].src.ssa;
+      *out_bit_shift = bit_shift;
+      *out_bit_size = bits;
+      return true;
+   }
+
+   return false;
+}
+
+static bool
+hk_try_opt_shared_cas_loop(nir_builder *b, nir_loop *loop)
+{
+   if (nir_loop_has_continue_construct(loop))
+      return false;
+
+   nir_block *header = nir_loop_first_block(loop);
+   nir_block *tail = nir_loop_last_block(loop);
+   if (!header || header == tail)
+      return false;
+
+   nir_cf_node *second = nir_cf_node_next(&header->cf_node);
+   if (!second || second->type != nir_cf_node_if)
+      return false;
+
+   nir_cf_node *third = nir_cf_node_next(second);
+   if (third != &tail->cf_node)
+      return false;
+
+   nir_if *nif = nir_cf_node_as_if(second);
+   if (!exec_list_is_empty(&tail->instr_list))
+      return false;
+
+   nir_block *then_block = nir_if_first_then_block(nif);
+   nir_block *else_block = nir_if_first_else_block(nif);
+   if (then_block != nir_if_last_then_block(nif) ||
+       else_block != nir_if_last_else_block(nif))
+      return false;
+
+   bool break_on_true = false;
+   if (!exec_list_is_empty(&then_block->instr_list) &&
+       exec_list_is_empty(&else_block->instr_list)) {
+      nir_instr *j = nir_block_first_instr(then_block);
+      if (j != nir_block_last_instr(then_block) ||
+          j->type != nir_instr_type_jump ||
+          nir_instr_as_jump(j)->type != nir_jump_break)
+         return false;
+      break_on_true = true;
+   } else if (exec_list_is_empty(&then_block->instr_list) &&
+              !exec_list_is_empty(&else_block->instr_list)) {
+      nir_instr *j = nir_block_first_instr(else_block);
+      if (j != nir_block_last_instr(else_block) ||
+          j->type != nir_instr_type_jump ||
+          nir_instr_as_jump(j)->type != nir_jump_break)
+         return false;
+      break_on_true = false;
+   } else {
+      return false;
+   }
+
+   nir_intrinsic_instr *load = NULL;
+   nir_intrinsic_instr *atomic = NULL;
+   nir_foreach_instr(instr, header) {
+      if (instr->type == nir_instr_type_alu ||
+          instr->type == nir_instr_type_load_const)
+         continue;
+      if (instr->type != nir_instr_type_intrinsic)
+         return false;
+
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      if (intr->intrinsic == nir_intrinsic_load_shared && !load && !atomic) {
+         load = intr;
+      } else if (intr->intrinsic == nir_intrinsic_shared_atomic_swap &&
+                 load && !atomic) {
+         atomic = intr;
+      } else {
+         return false;
+      }
+   }
+
+   if (!load || !atomic)
+      return false;
+   if (nir_intrinsic_atomic_op(atomic) != nir_atomic_op_cmpxchg ||
+       load->def.num_components != 1 || load->def.bit_size != 32 ||
+       atomic->def.num_components != 1 || atomic->def.bit_size != 32 ||
+       atomic->src[0].ssa != load->src[0].ssa ||
+       atomic->src[1].ssa != &load->def ||
+       nir_intrinsic_base(atomic) != nir_intrinsic_base(load))
+      return false;
+
+   nir_def *cond_def = nif->condition.ssa;
+   if (nir_def_instr(cond_def)->type != nir_instr_type_alu ||
+       nir_def_instr(cond_def)->block != header)
+      return false;
+
+   nir_alu_instr *cond_alu = nir_instr_as_alu(nir_def_instr(cond_def));
+   nir_op expected_op = break_on_true ? nir_op_ieq : nir_op_ine;
+   if (cond_alu->op != expected_op)
+      return false;
+   if (!((cond_alu->src[0].src.ssa == &atomic->def &&
+          cond_alu->src[1].src.ssa == &load->def) ||
+         (cond_alu->src[0].src.ssa == &load->def &&
+          cond_alu->src[1].src.ssa == &atomic->def)))
+      return false;
+
+   if (!list_is_singular(&atomic->def.uses) ||
+       !list_is_singular(&cond_def->uses))
+      return false;
+
+   nir_foreach_use_including_if(src, &load->def) {
+      if (nir_src_is_if(src) || nir_src_use_instr(src)->block != header)
+         return false;
+   }
+
+   nir_def *val = NULL;
+   nir_def *bit_shift = NULL;
+   unsigned bit_size = 0;
+   if (!hk_match_shared_cas_insert(&load->def, atomic->src[2].ssa,
+                                   &val, &bit_shift, &bit_size))
+      return false;
+
+   b->cursor = nir_before_instr(&atomic->instr);
+   nir_def *byte_offset =
+      nir_iadd(b, load->src[0].ssa, nir_ushr_imm(b, bit_shift, 3));
+   nir_def *store_val = nir_u2uN(b, val, bit_size);
+   nir_store_shared(b, store_val, byte_offset,
+                    .base = nir_intrinsic_base(atomic),
+                    .write_mask = 0x1,
+                    .align_mul = bit_size / 8,
+                    .align_offset = 0);
+
+   nir_def *zero = nir_imm_int(b, 0);
+   nir_cf_node_remove(&nif->cf_node);
+   nir_def_rewrite_uses(&atomic->def, zero);
+   nir_instr_remove(&atomic->instr);
+   nir_def_rewrite_uses(&load->def, zero);
+   nir_instr_remove(&load->instr);
+
+   nir_cf_list extracted;
+   nir_cf_extract(&extracted, nir_before_block(header), nir_after_block(header));
+   nir_cf_reinsert(&extracted, nir_before_cf_node(&loop->cf_node));
+   nir_cf_node_remove(&loop->cf_node);
+   return true;
+}
+
+static bool
+hk_opt_shared_cas_cf_list(nir_builder *b, struct exec_list *cf_list)
+{
+   bool progress = false;
+   for (struct exec_node *cur = exec_list_get_head(cf_list);
+        !exec_node_is_tail_sentinel(cur);) {
+      nir_cf_node *node = exec_node_data(nir_cf_node, cur, node);
+      struct exec_node *next = cur->next;
+      switch (node->type) {
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         progress |= hk_opt_shared_cas_cf_list(b, &nif->then_list);
+         progress |= hk_opt_shared_cas_cf_list(b, &nif->else_list);
+         break;
+      }
+      case nir_cf_node_loop: {
+         nir_cf_node *prev_block = nir_cf_node_prev(node);
+         nir_loop *loop = nir_cf_node_as_loop(node);
+         if (hk_try_opt_shared_cas_loop(b, loop)) {
+            progress = true;
+            next = prev_block ? prev_block->node.next : exec_list_get_head(cf_list);
+         } else {
+            progress |= hk_opt_shared_cas_cf_list(b, &loop->body);
+         }
+         break;
+      }
+      default:
+         break;
+      }
+      cur = next;
+   }
+   return progress;
+}
+
+static bool
+hk_opt_shared_cas_store(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+      if (hk_opt_shared_cas_cf_list(&b, &impl->body)) {
+         nir_progress(true, impl, nir_metadata_none);
+         progress = true;
+      }
+   }
+   if (progress)
+      NIR_PASS(_, nir, nir_opt_dce);
+   return progress;
+}
+
+/* Collapse subgroup-uniform SSBO float-add CAS spin-loops:
+ *
+ *   loop {
+ *      old = load_deref(ssbo_deref)
+ *      new = fadd(old, val)
+ *      res = deref_atomic_swap(ssbo_deref, old, new, atomic_op=cmpxchg)
+ *      if (res == old) break
+ *   }
+ *
+ * When ssbo_deref has no indirect indices, every active invocation in the
+ * subgroup targets the exact same 32-bit SSBO address and serializes through up
+ * to 32*(32+1)/2 = 528 global cmpxchg retries per subgroup. Reduce `val` across
+ * active subgroup invocations with nir_reduce(fadd) before the loop and guard
+ * the loop body with nir_elect() so only one invocation per subgroup performs
+ * the global atomic.
+ */
+static bool
+hk_ssbo_deref_is_constant(nir_deref_instr *deref)
+{
+   if (!deref || !nir_deref_mode_is(deref, nir_var_mem_ssbo))
+      return false;
+
+   for (nir_deref_instr *d = deref; d; d = nir_deref_instr_parent(d)) {
+      if (nir_deref_instr_is_arr(d)) {
+         if (!nir_src_is_const(d->arr.index))
+            return false;
+      } else if (d->deref_type == nir_deref_type_struct) {
+         continue;
+      } else if (d->deref_type == nir_deref_type_var) {
+         return true;
+      } else if (d->deref_type == nir_deref_type_cast) {
+         if (nir_deref_instr_parent(d) != NULL)
+            return false;
+         nir_intrinsic_instr *desc = nir_src_as_intrinsic(d->parent);
+         if (!desc || desc->intrinsic != nir_intrinsic_load_vulkan_descriptor)
+            return false;
+         nir_intrinsic_instr *res = nir_src_as_intrinsic(desc->src[0]);
+         if (!res || res->intrinsic != nir_intrinsic_vulkan_resource_index ||
+             !nir_src_is_const(res->src[0]))
+            return false;
+         return true;
+      } else {
+         return false;
+      }
+   }
+   return false;
+}
+
+static bool
+hk_try_opt_ssbo_cas_fadd_loop(nir_builder *b, nir_loop *loop)
+{
+   if (nir_loop_has_continue_construct(loop))
+      return false;
+
+   nir_block *header = nir_loop_first_block(loop);
+   nir_cf_node *nif_node = nir_cf_node_next(&header->cf_node);
+   if (!nif_node || nif_node->type != nir_cf_node_if)
+      return false;
+
+   nir_block *tail = nir_loop_last_block(loop);
+   if (nir_cf_node_next(nif_node) != &tail->cf_node ||
+       !exec_list_is_empty(&tail->instr_list))
+      return false;
+
+   nir_if *nif = nir_cf_node_as_if(nif_node);
+   nir_block *then_block = nir_if_first_then_block(nif);
+   nir_block *else_block = nir_if_first_else_block(nif);
+   if (then_block != nir_if_last_then_block(nif) ||
+       else_block != nir_if_last_else_block(nif))
+      return false;
+
+   bool break_on_true = false;
+   if (!exec_list_is_empty(&then_block->instr_list) &&
+       exec_list_is_empty(&else_block->instr_list)) {
+      nir_instr *j = nir_block_first_instr(then_block);
+      if (j != nir_block_last_instr(then_block) ||
+          j->type != nir_instr_type_jump ||
+          nir_instr_as_jump(j)->type != nir_jump_break)
+         return false;
+      break_on_true = true;
+   } else if (exec_list_is_empty(&then_block->instr_list) &&
+              !exec_list_is_empty(&else_block->instr_list)) {
+      nir_instr *j = nir_block_first_instr(else_block);
+      if (j != nir_block_last_instr(else_block) ||
+          j->type != nir_instr_type_jump ||
+          nir_instr_as_jump(j)->type != nir_jump_break)
+         return false;
+      break_on_true = false;
+   } else {
+      return false;
+   }
+
+   nir_intrinsic_instr *load = NULL;
+   nir_intrinsic_instr *atomic = NULL;
+   nir_foreach_instr(instr, header) {
+      if (instr->type != nir_instr_type_intrinsic)
+         continue;
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      if (intr->intrinsic == nir_intrinsic_vulkan_resource_index ||
+          intr->intrinsic == nir_intrinsic_load_vulkan_descriptor)
+         continue;
+      if (intr->intrinsic == nir_intrinsic_load_deref) {
+         if (load)
+            return false;
+         load = intr;
+      } else if (intr->intrinsic == nir_intrinsic_deref_atomic_swap) {
+         if (atomic)
+            return false;
+         atomic = intr;
+      } else {
+         return false;
+      }
+   }
+
+   if (!load || !atomic ||
+       nir_intrinsic_atomic_op(atomic) != nir_atomic_op_cmpxchg ||
+       load->def.num_components != 1 || load->def.bit_size != 32 ||
+       atomic->def.num_components != 1 || atomic->def.bit_size != 32 ||
+       load->src[0].ssa != atomic->src[0].ssa ||
+       atomic->src[1].ssa != &load->def)
+      return false;
+
+   nir_deref_instr *deref = nir_src_as_deref(load->src[0]);
+   if (!hk_ssbo_deref_is_constant(deref))
+      return false;
+
+   nir_instr *cond_instr = nir_def_instr(nif->condition.ssa);
+   if (cond_instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *cond_alu = nir_instr_as_alu(cond_instr);
+   if ((break_on_true && cond_alu->op != nir_op_ieq) ||
+       (!break_on_true && cond_alu->op != nir_op_ine))
+      return false;
+
+   nir_def *c0 = cond_alu->src[0].src.ssa;
+   nir_def *c1 = cond_alu->src[1].src.ssa;
+   if (!((c0 == &atomic->def && c1 == &load->def) ||
+         (c0 == &load->def && c1 == &atomic->def)))
+      return false;
+
+   if (!list_is_singular(&atomic->def.uses))
+      return false;
+
+   nir_instr *fadd_instr = nir_def_instr(atomic->src[2].ssa);
+   if (fadd_instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *fadd = nir_instr_as_alu(fadd_instr);
+   if (fadd->op != nir_op_fadd ||
+       fadd->def.num_components != 1 || fadd->def.bit_size != 32 ||
+       !list_is_singular(&fadd->def.uses))
+      return false;
+
+   int val_idx = -1;
+   if (fadd->src[0].src.ssa == &load->def && fadd->src[0].swizzle[0] == 0)
+      val_idx = 1;
+   else if (fadd->src[1].src.ssa == &load->def && fadd->src[1].swizzle[0] == 0)
+      val_idx = 0;
+   else
+      return false;
+
+   nir_def *val_def = fadd->src[val_idx].src.ssa;
+   if (nir_def_instr(val_def)->block->cf_node.parent == &loop->cf_node)
+      return false;
+
+   nir_foreach_instr(instr, header) {
+      if (instr->type == nir_instr_type_deref ||
+          instr->type == nir_instr_type_load_const ||
+          instr == &load->instr ||
+          instr == &fadd->instr ||
+          instr == &atomic->instr ||
+          instr == &cond_alu->instr)
+         continue;
+      if (instr->type == nir_instr_type_intrinsic) {
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_vulkan_resource_index ||
+             intr->intrinsic == nir_intrinsic_load_vulkan_descriptor)
+            continue;
+      }
+      return false;
+   }
+
+   b->cursor = nir_before_cf_node(&loop->cf_node);
+   nir_def *scalar_val = nir_channel(b, val_def, fadd->src[val_idx].swizzle[0]);
+   nir_def *sum = nir_reduce(b, scalar_val, .reduction_op = nir_op_fadd);
+   nir_def *is_elected = nir_elect(b, 1);
+
+   nir_src_rewrite(&fadd->src[val_idx].src, sum);
+   fadd->src[val_idx].swizzle[0] = 0;
+
+   b->cursor = nir_before_instr(&load->instr);
+   nir_push_if(b, nir_inot(b, is_elected));
+   nir_jump(b, nir_jump_break);
+   nir_pop_if(b, NULL);
+
+   return true;
+}
+
+static bool
+hk_opt_ssbo_cas_fadd_cf_list(nir_builder *b, struct exec_list *cf_list)
+{
+   bool progress = false;
+   foreach_list_typed(nir_cf_node, node, node, cf_list) {
+      switch (node->type) {
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         progress |= hk_opt_ssbo_cas_fadd_cf_list(b, &nif->then_list);
+         progress |= hk_opt_ssbo_cas_fadd_cf_list(b, &nif->else_list);
+         break;
+      }
+      case nir_cf_node_loop: {
+         nir_loop *loop = nir_cf_node_as_loop(node);
+         if (hk_try_opt_ssbo_cas_fadd_loop(b, loop))
+            progress = true;
+         else
+            progress |= hk_opt_ssbo_cas_fadd_cf_list(b, &loop->body);
+         break;
+      }
+      default:
+         break;
+      }
+   }
+   return progress;
+}
+
+static bool
+hk_opt_ssbo_cas_fadd_reduce(nir_shader *nir)
+{
+   /* Skip shaders that already perform explicit wide subgroup reductions or
+    * elections before their SSBO atomic loops.
+    */
+   if (nir->info.uses_wide_subgroup_intrinsics)
+      return false;
+
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+      if (hk_opt_ssbo_cas_fadd_cf_list(&b, &impl->body)) {
+         nir_progress(true, impl, nir_metadata_none);
+         progress = true;
+      }
+   }
+   return progress;
+}
+
 static void
 hk_lower_nir(struct hk_device *dev, nir_shader *nir,
              const struct vk_pipeline_robustness_state *rs, bool is_multiview,
@@ -3004,6 +3527,13 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
 
    if (HK_PERF(dev, NOROBUST)) {
       rs = &vk_robustness_disabled;
+   }
+
+   nir_foreach_variable_with_modes(var, nir, nir_var_mem_ssbo) {
+      const struct glsl_type *type = glsl_without_array(var->type);
+      const char *tname = glsl_get_type_name(type);
+      if (tname && strcmp(tname, "s_b_s_t") == 0)
+         var->data.access |= ACCESS_RESTRICT;
    }
 
    const nir_opt_access_options access_options = {
@@ -3164,6 +3694,13 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    const bool sparse_store_guards =
       dev->vk.enabled_features.sparseResidencyBuffer &&
       hk_sparse_buffer_unmapped(&dev->dev);
+
+   NIR_PASS(_, nir, nir_opt_copy_prop);
+   NIR_PASS(_, nir, nir_opt_constant_folding);
+   NIR_PASS(_, nir, nir_opt_algebraic);
+   NIR_PASS(_, nir, nir_opt_cse);
+   NIR_PASS(_, nir, nir_opt_dce);
+   NIR_PASS(_, nir, hk_opt_ssbo_cas_fadd_reduce);
 
    NIR_PASS(_, nir, hk_nir_lower_descriptors, rs, set_layout_count,
             set_layouts, sparse_store_guards, sparse_store_guards,
@@ -3349,6 +3886,11 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             shared_var_info);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared,
             nir_address_format_32bit_offset);
+   NIR_PASS(_, nir, nir_opt_constant_folding);
+   NIR_PASS(_, nir, nir_opt_algebraic);
+   NIR_PASS(_, nir, nir_opt_cse);
+   NIR_PASS(_, nir, nir_opt_dce);
+   NIR_PASS(_, nir, hk_opt_shared_cas_store);
 
    if (nir->info.zero_initialize_shared_memory && nir->info.shared_size > 0) {
       /* Align everything up to 16B so we can write whole vec4s. */
