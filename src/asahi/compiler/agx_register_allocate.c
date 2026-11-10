@@ -2952,6 +2952,14 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
 
       max_possible_regs =
          agx_max_registers_for_occupancy(threads_per_workgroup);
+
+      /* AGX_CS_REG_BUDGET=<halves> (diagnostic): cap compute shaders' register
+       * budget to trade scratch spills for occupancy, e.g. 208 for 512
+       * threads. Not part of the shader cache key: measure with the affected
+       * binaries out of any cache. */
+      unsigned cap = debug_get_num_option("AGX_CS_REG_BUDGET", 0);
+      if (cap >= 64 && cap < max_possible_regs)
+         max_possible_regs = cap;
    }
 
    /* G17P's register file is 192 halves. Halves 192..255 still fit its
