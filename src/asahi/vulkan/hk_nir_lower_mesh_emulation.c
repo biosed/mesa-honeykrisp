@@ -736,9 +736,7 @@ export_scratch(nir_builder *b,
    for (unsigned base = 0; base < layout->primitives_per_group;
         base += threads) {
       nir_def *primitive = nir_iadd_imm(b, lane, base);
-      nir_push_if(b,
-                  nir_ult_imm(b, primitive, layout->primitives_per_group));
-      nir_def *active = nir_ult(b, primitive, primitive_count);
+      nir_push_if(b, nir_ult(b, primitive, primitive_count));
       nir_def *primitive_index = nir_iadd(b, primitive_base, primitive);
       nir_def *primitive_record = record_address(
          b, primitive_records, primitive_index,
@@ -748,65 +746,82 @@ export_scratch(nir_builder *b,
          nir_iadd_imm(b, primitive_record, layout->index_offset_B),
          .align_mul = 4);
 
-      for (unsigned c = 0; c < 3; ++c) {
-         nir_def *source_vertex = nir_channel(b, indices, c);
-         nir_def *source_valid = nir_iand(
-            b, active, nir_ult(b, source_vertex, vertex_count));
-         nir_def *safe_vertex = nir_umin(
-            b, source_vertex,
-            nir_imm_int(b, layout->vertices_per_group - 1));
-         nir_def *source_index = nir_iadd(b, vertex_base, safe_vertex);
-         nir_def *source_record = record_address(
-            b, vertex_records, source_index, layout->vertex_stride_B);
-         nir_def *expanded = nir_iadd_imm(
-            b, nir_imul_imm(b, primitive_index, 3), c);
-         nir_def *expanded_record = record_address(
-            b, expanded_records, expanded, layout->expanded_stride_B);
-
-         nir_def *position = nir_load_global(
-            b, 4, 32,
-            nir_iadd_imm(b, source_record, layout->position_offset_B),
-            .align_mul = 4);
-         position = nir_bcsel(b, source_valid, position,
-                              nir_imm_zero(b, 4, 32));
-         nir_store_global(
-            b, position,
-            nir_iadd_imm(b, expanded_record, layout->position_offset_B),
-            .write_mask = 0xf, .align_mul = 4);
-
-         for (unsigned slot = VARYING_SLOT_VAR0;
-              slot <= VARYING_SLOT_VAR31; ++slot) {
-            const unsigned components = MAX2(
-               layout->vertex_components[slot],
-               layout->primitive_components[slot]);
-            if (!components)
-               continue;
-
-            const bool per_primitive =
-               layout->primitive_components[slot] != 0;
-            nir_def *record = per_primitive ? primitive_record
-                                            : source_record;
-            const unsigned offset = per_primitive
-               ? layout->primitive_offset_B[slot]
-               : layout->vertex_offset_B[slot];
-            nir_def *value = nir_load_global(
-               b, components, 32, nir_iadd_imm(b, record, offset),
-               .align_mul = 4);
-            value = nir_bcsel(b, source_valid, value,
-                              nir_imm_zero(b, components, 32));
-            nir_store_global(
-               b, value,
-               nir_iadd_imm(b, expanded_record,
-                            layout->expanded_offset_B[slot]),
-               .write_mask = BITFIELD_MASK(components), .align_mul = 4);
-         }
-
-         nir_def *word = nir_iadd_imm(
-            b, nir_imul_imm(b, primitive_index, 3), c);
+      if (!(layout->primitive_outputs & ~VARYING_BIT_PRIMITIVE_INDICES)) {
+         nir_def *v0 = nir_channel(b, indices, 0);
+         nir_def *v1 = nir_channel(b, indices, 1);
+         nir_def *v2 = nir_channel(b, indices, 2);
+         nir_def *tri_valid = nir_iand(
+            b, nir_ult(b, v0, vertex_count),
+            nir_iand(b, nir_ult(b, v1, vertex_count),
+                     nir_ult(b, v2, vertex_count)));
+         nir_def *base_vec = nir_replicate(b, vertex_base, 3);
+         nir_def *idx_vec = nir_bcsel(
+            b, tri_valid, nir_iadd(b, indices, base_vec), base_vec);
+         nir_def *word = nir_imul_imm(b, primitive_index, 3);
          nir_def *address = nir_ulea_agx(
             b, index_buffer, word, nir_imm_int(b, 2));
-         nir_store_global(b, expanded, address,
-                          .write_mask = 1, .align_mul = 4);
+         nir_store_global(b, idx_vec, address,
+                          .write_mask = 0x7, .align_mul = 4);
+      } else {
+         for (unsigned c = 0; c < 3; ++c) {
+            nir_def *source_vertex = nir_channel(b, indices, c);
+            nir_def *source_valid = nir_ult(b, source_vertex, vertex_count);
+            nir_def *safe_vertex = nir_umin(
+               b, source_vertex,
+               nir_imm_int(b, layout->vertices_per_group - 1));
+            nir_def *source_index = nir_iadd(b, vertex_base, safe_vertex);
+            nir_def *source_record = record_address(
+               b, vertex_records, source_index, layout->vertex_stride_B);
+            nir_def *expanded = nir_iadd_imm(
+               b, nir_imul_imm(b, primitive_index, 3), c);
+            nir_def *expanded_record = record_address(
+               b, expanded_records, expanded, layout->expanded_stride_B);
+
+            nir_def *position = nir_load_global(
+               b, 4, 32,
+               nir_iadd_imm(b, source_record, layout->position_offset_B),
+               .align_mul = 4);
+            position = nir_bcsel(b, source_valid, position,
+                                 nir_imm_zero(b, 4, 32));
+            nir_store_global(
+               b, position,
+               nir_iadd_imm(b, expanded_record, layout->position_offset_B),
+               .write_mask = 0xf, .align_mul = 4);
+
+            for (unsigned slot = VARYING_SLOT_VAR0;
+                 slot <= VARYING_SLOT_VAR31; ++slot) {
+               const unsigned components = MAX2(
+                  layout->vertex_components[slot],
+                  layout->primitive_components[slot]);
+               if (!components)
+                  continue;
+
+               const bool per_primitive =
+                  layout->primitive_components[slot] != 0;
+               nir_def *record = per_primitive ? primitive_record
+                                               : source_record;
+               const unsigned offset = per_primitive
+                  ? layout->primitive_offset_B[slot]
+                  : layout->vertex_offset_B[slot];
+               nir_def *value = nir_load_global(
+                  b, components, 32, nir_iadd_imm(b, record, offset),
+                  .align_mul = 4);
+               value = nir_bcsel(b, source_valid, value,
+                                 nir_imm_zero(b, components, 32));
+               nir_store_global(
+                  b, value,
+                  nir_iadd_imm(b, expanded_record,
+                               layout->expanded_offset_B[slot]),
+                  .write_mask = BITFIELD_MASK(components), .align_mul = 4);
+            }
+
+            nir_def *word = nir_iadd_imm(
+               b, nir_imul_imm(b, primitive_index, 3), c);
+            nir_def *address = nir_ulea_agx(
+               b, index_buffer, word, nir_imm_int(b, 2));
+            nir_store_global(b, expanded, address,
+                             .write_mask = 1, .align_mul = 4);
+         }
       }
       nir_pop_if(b, NULL);
    }
@@ -1173,9 +1188,12 @@ hk_nir_mesh_emulation_pull_vs(
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_VERTEX, options, "G13 software mesh pull VS");
    nir_def *params = nir_load_geometry_param_buffer_poly(&b);
+   const unsigned records_offset =
+      (layout->primitive_outputs & ~VARYING_BIT_PRIMITIVE_INDICES)
+         ? offsetof(struct hk_mesh_emulation_params, expanded_records)
+         : offsetof(struct hk_mesh_emulation_params, vertex_records);
    nir_def *expanded_records =
-      load_param(&b, params,
-                 offsetof(struct hk_mesh_emulation_params, expanded_records));
+      load_param(&b, params, records_offset);
    nir_def *vertex = nir_load_vertex_id(&b);
    nir_def *address = record_address(
       &b, expanded_records, vertex, layout->expanded_stride_B);
