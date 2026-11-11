@@ -54,10 +54,10 @@ static void
 buffer_aliases(struct hk_device *dev, struct hk_device_memory *memory)
 {
    uint8_t metadata[2][AIL_PAGESIZE] = {{0}};
-   struct agx_bo maps[2] = {{0}};
+   struct agx_bo maps[2] = {0};
    struct agx_va vas[2] = {{.addr = 0x100000, .size_B = 4 * AIL_PAGESIZE},
                            {.addr = 0x200000, .size_B = 4 * AIL_PAGESIZE}};
-   struct hk_buffer buffers[2] = {{0}};
+   struct hk_buffer buffers[2] = {0};
    uint32_t *bits[2];
    for (unsigned i = 0; i < 2; ++i) {
       maps[i] = (struct agx_bo){.dev = &dev->dev,
