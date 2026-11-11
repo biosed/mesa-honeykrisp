@@ -81,10 +81,27 @@ record_output(struct hk_mesh_emulation_layout *layout,
    }
 
    if (primitive && slot == VARYING_SLOT_PRIMITIVE_INDICES) {
-      return sem.num_slots == 1 && component == 0 && components == 3 &&
-             nir_intrinsic_write_mask(intr) == 0x7 &&
-             intr->src[0].ssa->num_components == 3 &&
+      /* PrimitivePoint/Line/TriangleIndicesEXT: one complete uint, uvec2 or
+       * uvec3 store per primitive.  Partial index stores fail closed. */
+      const unsigned n = layout->indices_per_primitive;
+      return sem.num_slots == 1 && component == 0 && components == n &&
+             nir_intrinsic_write_mask(intr) == BITFIELD_MASK(n) &&
+             intr->src[0].ssa->num_components == n &&
              nir_intrinsic_src_type(intr) == nir_type_uint32;
+   }
+
+   if (!primitive && slot == VARYING_SLOT_PSIZ) {
+      /* PointSize only affects point rasterization.  The contract carries
+       * it for point meshes; a line or triangle mesh that writes it still
+       * fails closed (dropping it is not yet a qualified rule here). */
+      if (layout->primitive_type != MESA_PRIM_POINTS ||
+          sem.num_slots != 1 || component != 0 || write_mask != 0x1 ||
+          nir_intrinsic_src_type(intr) != nir_type_float32)
+         return false;
+      layout->vertex_components[slot] = 1;
+      layout->output_type[slot] = nir_type_float32;
+      layout->vertex_outputs |= VARYING_BIT_PSIZ;
+      return true;
    }
 
    if (slot < VARYING_SLOT_VAR0 || slot > VARYING_SLOT_VAR31 ||
@@ -127,8 +144,17 @@ validate_shader(const nir_shader *shader,
    memset(layout->expanded_offset_B, 0xff,
           sizeof(layout->expanded_offset_B));
 
+   const unsigned primitive_type = shader->info.mesh.primitive_type;
+   const unsigned indices_per_primitive =
+      hk_mesh_emulation_indices_per_primitive(primitive_type);
+   const uint64_t vertex_builtins =
+      VARYING_BIT_POS |
+      (primitive_type == MESA_PRIM_POINTS ? VARYING_BIT_PSIZ : 0);
+   layout->primitive_type = primitive_type;
+   layout->indices_per_primitive = indices_per_primitive;
+
    if (shader->info.stage != MESA_SHADER_MESH || !shader->info.io_lowered ||
-       shader->info.mesh.primitive_type != MESA_PRIM_TRIANGLES ||
+       !indices_per_primitive ||
        shader->info.mesh.max_vertices_out == 0 ||
        shader->info.mesh.max_vertices_out > HK_MESH_EMULATION_MAX_VERTICES ||
        shader->info.mesh.max_primitives_out == 0 ||
@@ -139,7 +165,7 @@ validate_shader(const nir_shader *shader,
           HK_MESH_EMULATION_MAX_TASK_PAYLOAD ||
        shader->info.outputs_read != 0 ||
        (shader->info.outputs_written &
-        ~(VARYING_BIT_POS | VARYING_BIT_PRIMITIVE_INDICES |
+        ~(vertex_builtins | VARYING_BIT_PRIMITIVE_INDICES |
           HK_MESH_EMULATION_USER_OUTPUTS)) ||
        (shader->info.per_primitive_outputs &
         ~(VARYING_BIT_PRIMITIVE_INDICES |
@@ -272,6 +298,15 @@ validate_shader(const nir_shader *shader,
       }
       layout->expanded_offset_B[slot] = layout->expanded_stride_B;
       layout->expanded_stride_B += components * sizeof(uint32_t);
+   }
+
+   /* PointSize follows the user varyings so a point mesh that does not write
+    * it, and every line or triangle mesh, keeps the same record layout. */
+   if (layout->vertex_outputs & VARYING_BIT_PSIZ) {
+      layout->vertex_offset_B[VARYING_SLOT_PSIZ] = layout->vertex_stride_B;
+      layout->vertex_stride_B += sizeof(uint32_t);
+      layout->expanded_offset_B[VARYING_SLOT_PSIZ] = layout->expanded_stride_B;
+      layout->expanded_stride_B += sizeof(uint32_t);
    }
 
    layout->vertex_stride_B = ALIGN_POT(layout->vertex_stride_B, 16);
@@ -705,8 +740,10 @@ export_scratch(nir_builder *b,
       nir_imul_imm(b, group, layout->vertices_per_group);
    nir_def *primitive_base =
       nir_imul_imm(b, group, layout->primitives_per_group);
+   const unsigned n = layout->indices_per_primitive;
+   const bool triangles = layout->primitive_type == MESA_PRIM_TRIANGLES;
    nir_def *expanded_base = nir_imul_imm(
-      b, primitive_base, 3);
+      b, primitive_base, n);
    nir_def *primitive_count = nir_load_shared(
       b, 1, 32, nir_imm_int(b, layout->primitive_count), .align_mul = 4);
    nir_def *vertex_count = nir_load_shared(
@@ -738,7 +775,8 @@ export_scratch(nir_builder *b,
       nir_def *primitive = nir_iadd_imm(b, lane, base);
       /* Every slot of the group is written: the draw covers the whole group,
        * so a slot past this group's primitive count must become a degenerate
-       * triangle rather than keep a stale entry from an earlier group or draw.
+       * triangle (or a clipped point/line) rather than keep a stale entry from
+       * an earlier group or draw.
        */
       nir_push_if(b,
                   nir_ult_imm(b, primitive, layout->primitives_per_group));
@@ -748,11 +786,27 @@ export_scratch(nir_builder *b,
          b, primitive_records, primitive_index,
          layout->primitive_stride_B);
       nir_def *indices = nir_load_global(
-         b, 3, 32,
+         b, n, 32,
          nir_iadd_imm(b, primitive_record, layout->index_offset_B),
          .align_mul = 4);
 
-      if (!(layout->primitive_outputs & ~VARYING_BIT_PRIMITIVE_INDICES)) {
+      /* A triangle validates each copied vertex on its own; a degenerate
+       * result has no area.  A point or line is culled as a whole: if the
+       * slot is inactive or any index is out of range, every copied vertex
+       * gets a position outside the clip volume.  (-2, -2, -2, -1) fails
+       * -w <= x, y and lands at NDC (2, 2, 2) after the divide. */
+      nir_def *primitive_valid = NULL;
+      if (!triangles) {
+         primitive_valid = active;
+         for (unsigned c = 0; c < n; ++c) {
+            primitive_valid = nir_iand(
+               b, primitive_valid,
+               nir_ult(b, nir_channel(b, indices, c), vertex_count));
+         }
+      }
+
+      if (!hk_mesh_emulation_layout_expanded(layout)) {
+         assert(triangles);
          nir_def *v0 = nir_channel(b, indices, 0);
          nir_def *v1 = nir_channel(b, indices, 1);
          nir_def *v2 = nir_channel(b, indices, 2);
@@ -769,10 +823,11 @@ export_scratch(nir_builder *b,
          nir_store_global(b, idx_vec, address,
                           .write_mask = 0x7, .align_mul = 4);
       } else {
-         for (unsigned c = 0; c < 3; ++c) {
+         for (unsigned c = 0; c < n; ++c) {
             nir_def *source_vertex = nir_channel(b, indices, c);
-            nir_def *source_valid = nir_iand(
-               b, active, nir_ult(b, source_vertex, vertex_count));
+            nir_def *source_valid = triangles
+               ? nir_iand(b, active, nir_ult(b, source_vertex, vertex_count))
+               : primitive_valid;
             nir_def *safe_vertex = nir_umin(
                b, source_vertex,
                nir_imm_int(b, layout->vertices_per_group - 1));
@@ -780,7 +835,7 @@ export_scratch(nir_builder *b,
             nir_def *source_record = record_address(
                b, vertex_records, source_index, layout->vertex_stride_B);
             nir_def *expanded = nir_iadd_imm(
-               b, nir_imul_imm(b, primitive_index, 3), c);
+               b, nir_imul_imm(b, primitive_index, n), c);
             nir_def *expanded_record = record_address(
                b, expanded_records, expanded, layout->expanded_stride_B);
 
@@ -788,8 +843,10 @@ export_scratch(nir_builder *b,
                b, 4, 32,
                nir_iadd_imm(b, source_record, layout->position_offset_B),
                .align_mul = 4);
-            position = nir_bcsel(b, source_valid, position,
-                                 nir_imm_zero(b, 4, 32));
+            position = nir_bcsel(
+               b, source_valid, position,
+               triangles ? nir_imm_zero(b, 4, 32)
+                         : nir_imm_vec4(b, -2.0f, -2.0f, -2.0f, -1.0f));
             nir_store_global(
                b, position,
                nir_iadd_imm(b, expanded_record, layout->position_offset_B),
@@ -822,8 +879,23 @@ export_scratch(nir_builder *b,
                   .write_mask = BITFIELD_MASK(components), .align_mul = 4);
             }
 
+            if (layout->vertex_outputs & VARYING_BIT_PSIZ) {
+               nir_def *point_size = nir_load_global(
+                  b, 1, 32,
+                  nir_iadd_imm(b, source_record,
+                               layout->vertex_offset_B[VARYING_SLOT_PSIZ]),
+                  .align_mul = 4);
+               point_size = nir_bcsel(b, source_valid, point_size,
+                                      nir_imm_float(b, 1.0f));
+               nir_store_global(
+                  b, point_size,
+                  nir_iadd_imm(b, expanded_record,
+                               layout->expanded_offset_B[VARYING_SLOT_PSIZ]),
+                  .write_mask = 1, .align_mul = 4);
+            }
+
             nir_def *word = nir_iadd_imm(
-               b, nir_imul_imm(b, primitive_index, 3), c);
+               b, nir_imul_imm(b, primitive_index, n), c);
             nir_def *address = nir_ulea_agx(
                b, index_buffer, word, nir_imm_int(b, 2));
             nir_store_global(b, expanded, address,
@@ -834,7 +906,7 @@ export_scratch(nir_builder *b,
    }
 
    nir_push_if(b, nir_ieq_imm(b, lane, 0));
-   nir_def *expanded_count = nir_imul_imm(b, primitive_count, 3);
+   nir_def *expanded_count = nir_imul_imm(b, primitive_count, n);
    nir_store_global(
       b, nir_vec4(b, expanded_count, primitive_count, expanded_base,
                   primitive_base),
@@ -1196,7 +1268,7 @@ hk_nir_mesh_emulation_pull_vs(
       MESA_SHADER_VERTEX, options, "G13 software mesh pull VS");
    nir_def *params = nir_load_geometry_param_buffer_poly(&b);
    const unsigned records_offset =
-      (layout->primitive_outputs & ~VARYING_BIT_PRIMITIVE_INDICES)
+      hk_mesh_emulation_layout_expanded(layout)
          ? offsetof(struct hk_mesh_emulation_params, expanded_records)
          : offsetof(struct hk_mesh_emulation_params, vertex_records);
    nir_def *expanded_records =
@@ -1230,6 +1302,25 @@ hk_nir_mesh_emulation_pull_vs(
          .write_mask = BITFIELD_MASK(components),
          .src_type = layout->output_type[slot],
          .io_semantics = {.location = slot, .num_slots = 1});
+   }
+
+   /* A point mesh always rasterizes with an explicit size: the producer's
+    * per-vertex PointSize, or Vulkan's 1.0 default when the mesh shader
+    * does not write it.  The ordinary hardware-VS lowering clamps it to the
+    * advertised pointSizeRange. */
+   if (layout->primitive_type == MESA_PRIM_POINTS) {
+      nir_def *point_size =
+         (layout->vertex_outputs & VARYING_BIT_PSIZ)
+            ? nir_load_global_constant(
+                 &b, 1, 32,
+                 nir_iadd_imm(&b, address,
+                              layout->expanded_offset_B[VARYING_SLOT_PSIZ]),
+                 .align_mul = 4, .access = ACCESS_CAN_SPECULATE)
+            : nir_imm_float(&b, 1.0f);
+      nir_store_output(
+         &b, point_size, nir_imm_int(&b, 0), .write_mask = 0x1,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_PSIZ, .num_slots = 1});
    }
 
    b.shader->info.io_lowered = true;

@@ -26,6 +26,10 @@ static unsigned limit_producer_binary_size;
 static unsigned limit_pull_vs_binary_size;
 static unsigned task_producer_binary_size;
 static unsigned task_mesh_binary_size;
+static unsigned point_producer_binary_size;
+static unsigned point_pull_vs_binary_size;
+static unsigned line_producer_binary_size;
+static unsigned line_pull_vs_binary_size;
 
 static bool
 lower_driver_sysvals(nir_builder *b, nir_intrinsic_instr *intr, void *data)
@@ -53,12 +57,16 @@ lower_pull_vs_output(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 
    nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
    assert(sem.location == VARYING_SLOT_POS ||
+          sem.location == VARYING_SLOT_PSIZ ||
           (sem.location >= VARYING_SLOT_VAR0 &&
            sem.location <= VARYING_SLOT_VAR31));
    b->cursor = nir_instr_remove(&intr->instr);
 
-   const unsigned base = sem.location == VARYING_SLOT_POS
-      ? 0 : 4 + 4 * (sem.location - VARYING_SLOT_VAR0);
+   /* Mirror the hardware UVS group order: Position, user varyings, then
+    * PointSize. */
+   const unsigned base = sem.location == VARYING_SLOT_POS ? 0
+      : sem.location == VARYING_SLOT_PSIZ ? 4 + 4 * 32
+      : 4 + 4 * (sem.location - VARYING_SLOT_VAR0);
 
    u_foreach_bit(c, nir_intrinsic_write_mask(intr)) {
       nir_store_uvs_agx(
@@ -539,6 +547,324 @@ test_contract_boundaries(void)
    ralloc_free(over_shared.shader);
 }
 
+
+/* One point per lane (indices i) or one line per lane pair (indices 2i,
+ * 2i + 1).  PointSize is optional so both the carried and the default value
+ * are covered. */
+static nir_builder
+point_line_builder(enum mesa_prim prim, bool point_size,
+                   unsigned vertex_slots)
+{
+   const bool points = prim == MESA_PRIM_POINTS;
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_MESH, &agx_nir_options,
+      points ? "G13 software mesh points" : "G13 software mesh lines");
+   b.shader->info.io_lowered = true;
+   b.shader->info.workgroup_size[0] = 4;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.shared_size = 20;
+   b.shader->info.mesh.max_vertices_out = 4;
+   b.shader->info.mesh.max_primitives_out = points ? 4 : 2;
+   b.shader->info.mesh.primitive_type = prim;
+   b.shader->info.outputs_written =
+      VARYING_BIT_POS | VARYING_BIT_PRIMITIVE_INDICES;
+   b.shader->info.per_primitive_outputs = VARYING_BIT_PRIMITIVE_INDICES;
+
+   nir_def *lane = nir_load_local_invocation_index(&b);
+   nir_set_vertex_and_primitive_count(
+      &b, nir_imm_int(&b, 4), nir_imm_int(&b, points ? 4 : 2),
+      nir_imm_int(&b, 0));
+   nir_store_per_vertex_output(
+      &b, nir_vec4(&b, nir_i2f32(&b, lane), nir_imm_float(&b, 0.0f),
+                   nir_imm_float(&b, 0.0f), nir_imm_float(&b, 1.0f)),
+      lane, nir_imm_int(&b, 0), .write_mask = 0xf,
+      .src_type = nir_type_float32,
+      .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+   if (point_size) {
+      b.shader->info.outputs_written |= VARYING_BIT_PSIZ;
+      nir_store_per_vertex_output(
+         &b, nir_fadd_imm(&b, nir_i2f32(&b, lane), 2.0f), lane,
+         nir_imm_int(&b, 0), .write_mask = 0x1,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_PSIZ, .num_slots = 1});
+   }
+   for (unsigned i = 0; i < vertex_slots; ++i) {
+      const unsigned slot = VARYING_SLOT_VAR0 + i;
+      b.shader->info.outputs_written |= BITFIELD64_BIT(slot);
+      nir_store_per_vertex_output(
+         &b, nir_imm_vec4(&b, (float)i, 0.0f, 0.0f, 1.0f), lane,
+         nir_imm_int(&b, 0), .write_mask = 0xf,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = slot, .num_slots = 1});
+   }
+
+   if (points) {
+      nir_store_per_primitive_output(
+         &b, lane, lane, nir_imm_int(&b, 0), .write_mask = 0x1,
+         .src_type = nir_type_uint32,
+         .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES,
+                          .num_slots = 1});
+   } else {
+      nir_push_if(&b, nir_ult_imm(&b, lane, 2));
+      nir_def *first = nir_imul_imm(&b, lane, 2);
+      nir_store_per_primitive_output(
+         &b, nir_vec2(&b, first, nir_iadd_imm(&b, first, 1)), lane,
+         nir_imm_int(&b, 0), .write_mask = 0x3,
+         .src_type = nir_type_uint32,
+         .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES,
+                          .num_slots = 1});
+      nir_pop_if(&b, NULL);
+   }
+
+   return b;
+}
+
+struct pull_vs_counts {
+   unsigned global_constants;
+   unsigned psiz_stores;
+   unsigned psiz_constant_stores;
+   float psiz_constant;
+   uint64_t written;
+};
+
+static struct pull_vs_counts
+count_pull_vs(const nir_shader *vs)
+{
+   struct pull_vs_counts counts = {.written = vs->info.outputs_written};
+   nir_foreach_function_impl(impl, vs) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            counts.global_constants +=
+               intr->intrinsic == nir_intrinsic_load_global_constant;
+            if (intr->intrinsic != nir_intrinsic_store_output ||
+                nir_intrinsic_io_semantics(intr).location !=
+                   VARYING_SLOT_PSIZ)
+               continue;
+            counts.psiz_stores++;
+            assert(nir_intrinsic_write_mask(intr) == 0x1);
+            assert(nir_intrinsic_src_type(intr) == nir_type_float32);
+            if (nir_src_is_const(intr->src[0])) {
+               counts.psiz_constant_stores++;
+               counts.psiz_constant = nir_src_as_float(intr->src[0]);
+            }
+         }
+      }
+   }
+   return counts;
+}
+
+/* Mesh output intrinsics left behind after lowering (must be none). */
+static unsigned
+count_mesh_intrinsics(const nir_shader *shader)
+{
+   unsigned mesh_intrinsics = 0;
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            mesh_intrinsics +=
+               intr->intrinsic == nir_intrinsic_store_per_vertex_output ||
+               intr->intrinsic == nir_intrinsic_store_per_primitive_output ||
+               intr->intrinsic ==
+                  nir_intrinsic_set_vertex_and_primitive_count;
+         }
+      }
+   }
+   return mesh_intrinsics;
+}
+
+static void
+test_points(void)
+{
+   /* Carried PointSize after one user vec4: Position 0, VAR0 16, PSIZ 32. */
+   nir_builder b = point_line_builder(MESA_PRIM_POINTS, true, 1);
+   struct hk_mesh_emulation_layout layout;
+   assert(hk_nir_lower_mesh_emulation(b.shader, &layout));
+   nir_validate_shader(b.shader, "G13 software mesh points lowered");
+   assert(b.shader->info.stage == MESA_SHADER_COMPUTE);
+   assert(count_mesh_intrinsics(b.shader) == 0);
+   assert(layout.primitive_type == MESA_PRIM_POINTS);
+   assert(layout.indices_per_primitive == 1);
+   assert(hk_mesh_emulation_layout_expanded(&layout));
+   assert(layout.vertices_per_group == 4);
+   assert(layout.primitives_per_group == 4);
+   assert(layout.vertex_offset_B[VARYING_SLOT_VAR0] == 16);
+   assert(layout.vertex_offset_B[VARYING_SLOT_PSIZ] == 32);
+   assert(layout.expanded_offset_B[VARYING_SLOT_VAR0] == 16);
+   assert(layout.expanded_offset_B[VARYING_SLOT_PSIZ] == 32);
+   assert(layout.vertex_stride_B == 48);
+   assert(layout.primitive_stride_B == 16);
+   assert(layout.expanded_stride_B == 48);
+   assert(layout.output_memory_B == 4 * 48 + 4 * 16);
+   assert(layout.vertex_outputs ==
+          (VARYING_BIT_POS | VARYING_BIT_PSIZ | VARYING_BIT_VAR(0)));
+   assert(layout.primitive_outputs == VARYING_BIT_PRIMITIVE_INDICES);
+
+   nir_shader *vs = hk_nir_mesh_emulation_pull_vs(&agx_nir_options, &layout);
+   nir_validate_shader(vs, "G13 software mesh point pull VS");
+   struct pull_vs_counts counts = count_pull_vs(vs);
+   assert(counts.written ==
+          (VARYING_BIT_POS | VARYING_BIT_PSIZ | VARYING_BIT_VAR(0)));
+   /* Parameter pointer, Position, VAR0 and the carried PointSize. */
+   assert(counts.global_constants == 4);
+   assert(counts.psiz_stores == 1 && counts.psiz_constant_stores == 0);
+   point_producer_binary_size = compile_producer(b.shader);
+   point_pull_vs_binary_size = compile_pull_vs(vs);
+
+   /* A point mesh that never writes PointSize keeps the bare record and
+    * rasterizes at Vulkan's default size. */
+   nir_builder bare = point_line_builder(MESA_PRIM_POINTS, false, 0);
+   assert(hk_nir_lower_mesh_emulation(bare.shader, &layout));
+   assert(layout.vertex_stride_B == 16 && layout.expanded_stride_B == 16);
+   assert(layout.vertex_offset_B[VARYING_SLOT_PSIZ] == 0xffff);
+   assert(layout.vertex_outputs == VARYING_BIT_POS);
+   vs = hk_nir_mesh_emulation_pull_vs(&agx_nir_options, &layout);
+   counts = count_pull_vs(vs);
+   assert(counts.written == (VARYING_BIT_POS | VARYING_BIT_PSIZ));
+   assert(counts.global_constants == 2);
+   assert(counts.psiz_stores == 1 && counts.psiz_constant_stores == 1);
+   assert(counts.psiz_constant == 1.0f);
+   assert(compile_producer(bare.shader) > 0);
+   assert(compile_pull_vs(vs) > 0);
+
+   /* Points in an admission are distinct from the same shader as lines. */
+   nir_builder as_points = point_line_builder(MESA_PRIM_POINTS, false, 0);
+   nir_builder as_lines = point_line_builder(MESA_PRIM_LINES, false, 0);
+   struct hk_mesh_emulation_admission *p =
+      hk_mesh_emulation_admission_create(as_points.shader, &agx_nir_options);
+   struct hk_mesh_emulation_admission *l =
+      hk_mesh_emulation_admission_create(as_lines.shader, &agx_nir_options);
+   assert(p && l);
+   assert(hk_mesh_emulation_admission_layout(p)->primitive_type ==
+          MESA_PRIM_POINTS);
+   assert(hk_mesh_emulation_admission_layout(l)->primitive_type ==
+          MESA_PRIM_LINES);
+   assert(memcmp(hk_mesh_emulation_admission_identity(p),
+                 hk_mesh_emulation_admission_identity(l),
+                 BLAKE3_KEY_LEN) != 0);
+   assert(hk_mesh_emulation_admission_unref(p));
+   assert(hk_mesh_emulation_admission_unref(l));
+   ralloc_free(as_points.shader);
+   ralloc_free(as_lines.shader);
+}
+
+static void
+test_lines(void)
+{
+   nir_builder b = point_line_builder(MESA_PRIM_LINES, false, 1);
+   struct hk_mesh_emulation_layout layout;
+   assert(hk_nir_lower_mesh_emulation(b.shader, &layout));
+   nir_validate_shader(b.shader, "G13 software mesh lines lowered");
+   assert(b.shader->info.stage == MESA_SHADER_COMPUTE);
+   assert(count_mesh_intrinsics(b.shader) == 0);
+   assert(layout.primitive_type == MESA_PRIM_LINES);
+   assert(layout.indices_per_primitive == 2);
+   /* No per-primitive user output, but lines still take the expanded copy
+    * so an inactive slot can be clipped as a whole. */
+   assert(hk_mesh_emulation_layout_expanded(&layout));
+   assert(layout.primitives_per_group == 2);
+   assert(layout.vertex_stride_B == 32);
+   assert(layout.primitive_stride_B == 16);
+   assert(layout.expanded_stride_B == 32);
+   assert(layout.vertex_outputs == (VARYING_BIT_POS | VARYING_BIT_VAR(0)));
+
+   nir_shader *vs = hk_nir_mesh_emulation_pull_vs(&agx_nir_options, &layout);
+   struct pull_vs_counts counts = count_pull_vs(vs);
+   assert(counts.written == (VARYING_BIT_POS | VARYING_BIT_VAR(0)));
+   assert(counts.psiz_stores == 0);
+   line_producer_binary_size = compile_producer(b.shader);
+   line_pull_vs_binary_size = compile_pull_vs(vs);
+}
+
+static void
+test_point_line_fail_closed(void)
+{
+   /* PointSize is carried only for points. */
+   nir_builder line_psiz = point_line_builder(MESA_PRIM_LINES, true, 0);
+   assert(!hk_nir_lower_mesh_emulation(line_psiz.shader, NULL));
+   assert(line_psiz.shader->info.stage == MESA_SHADER_MESH);
+   nir_validate_shader(line_psiz.shader, "line PointSize left unchanged");
+   ralloc_free(line_psiz.shader);
+
+   /* PointSize stored without the matching outputs_written bit. */
+   nir_builder line_psiz_store = point_line_builder(MESA_PRIM_LINES, false, 0);
+   nir_store_per_vertex_output(
+      &line_psiz_store, nir_imm_float(&line_psiz_store, 4.0f),
+      nir_imm_int(&line_psiz_store, 0), nir_imm_int(&line_psiz_store, 0),
+      .write_mask = 1, .src_type = nir_type_float32,
+      .io_semantics = {.location = VARYING_SLOT_PSIZ, .num_slots = 1});
+   assert(!hk_nir_lower_mesh_emulation(line_psiz_store.shader, NULL));
+   ralloc_free(line_psiz_store.shader);
+
+   nir_builder int_psiz = point_line_builder(MESA_PRIM_POINTS, false, 0);
+   int_psiz.shader->info.outputs_written |= VARYING_BIT_PSIZ;
+   nir_store_per_vertex_output(
+      &int_psiz, nir_imm_int(&int_psiz, 4), nir_imm_int(&int_psiz, 0),
+      nir_imm_int(&int_psiz, 0), .write_mask = 1,
+      .src_type = nir_type_uint32,
+      .io_semantics = {.location = VARYING_SLOT_PSIZ, .num_slots = 1});
+   assert(!hk_nir_lower_mesh_emulation(int_psiz.shader, NULL));
+   ralloc_free(int_psiz.shader);
+
+   nir_builder primitive_psiz = point_line_builder(MESA_PRIM_POINTS, false, 0);
+   primitive_psiz.shader->info.outputs_written |= VARYING_BIT_PSIZ;
+   primitive_psiz.shader->info.per_primitive_outputs |= VARYING_BIT_PSIZ;
+   nir_store_per_primitive_output(
+      &primitive_psiz, nir_imm_float(&primitive_psiz, 4.0f),
+      nir_imm_int(&primitive_psiz, 0), nir_imm_int(&primitive_psiz, 0),
+      .write_mask = 1, .src_type = nir_type_float32,
+      .io_semantics = {.location = VARYING_SLOT_PSIZ, .num_slots = 1});
+   assert(!hk_nir_lower_mesh_emulation(primitive_psiz.shader, NULL));
+   ralloc_free(primitive_psiz.shader);
+
+   /* The index vector width must match the output topology. */
+   nir_builder point_vec3 = point_line_builder(MESA_PRIM_POINTS, false, 0);
+   nir_store_per_primitive_output(
+      &point_vec3, nir_imm_ivec3(&point_vec3, 0, 1, 2),
+      nir_imm_int(&point_vec3, 0), nir_imm_int(&point_vec3, 0),
+      .write_mask = 0x7, .src_type = nir_type_uint32,
+      .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES,
+                       .num_slots = 1});
+   assert(!hk_nir_lower_mesh_emulation(point_vec3.shader, NULL));
+   ralloc_free(point_vec3.shader);
+
+   nir_builder triangle_vec2 = triangle_builder(0, 0);
+   nir_store_per_primitive_output(
+      &triangle_vec2, nir_imm_ivec2(&triangle_vec2, 0, 1),
+      nir_imm_int(&triangle_vec2, 0), nir_imm_int(&triangle_vec2, 0),
+      .write_mask = 0x3, .src_type = nir_type_uint32,
+      .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES,
+                       .num_slots = 1});
+   assert(!hk_nir_lower_mesh_emulation(triangle_vec2.shader, NULL));
+   ralloc_free(triangle_vec2.shader);
+
+   /* A partial line index store would leave the other endpoint undefined. */
+   nir_builder line_partial = point_line_builder(MESA_PRIM_LINES, false, 0);
+   nir_store_per_primitive_output(
+      &line_partial, nir_imm_ivec2(&line_partial, 0, 1),
+      nir_imm_int(&line_partial, 0), nir_imm_int(&line_partial, 0),
+      .write_mask = 0x1, .src_type = nir_type_uint32,
+      .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES,
+                       .num_slots = 1});
+   assert(!hk_nir_lower_mesh_emulation(line_partial.shader, NULL));
+   ralloc_free(line_partial.shader);
+
+   /* Mesh output topologies are point, line and triangle lists only. */
+   nir_builder strip = point_line_builder(MESA_PRIM_LINES, false, 0);
+   strip.shader->info.mesh.primitive_type = MESA_PRIM_LINE_STRIP;
+   assert(!hk_nir_lower_mesh_emulation(strip.shader, NULL));
+   assert(strip.shader->info.stage == MESA_SHADER_MESH);
+   ralloc_free(strip.shader);
+   assert(hk_mesh_emulation_indices_per_primitive(MESA_PRIM_LINE_STRIP) == 0);
+   assert(hk_mesh_emulation_indices_per_primitive(MESA_PRIM_QUADS) == 0);
+}
+
 static void
 test_admission_identity_lifetime(void)
 {
@@ -857,15 +1183,21 @@ main(void)
    test_admission_identity_lifetime();
    test_task_producer();
    test_task_mesh_interface();
+   test_points();
+   test_lines();
+   test_point_line_fail_closed();
    test_scratch_packing_and_reuse();
    printf("G13 mesh NIR: producer PASS (%u B), pull VS PASS (%u B), "
           "56-component PASS (%u/%u B), limits PASS (%u/%u B), "
           "admission/cache PASS (%u/%u B), task PASS (%u/%u B), "
+          "points PASS (%u/%u B), lines PASS (%u/%u B), "
           "unsupported PASS\n",
           producer_binary_size, pull_vs_binary_size,
           wide_producer_binary_size, wide_pull_vs_binary_size,
           limit_producer_binary_size, limit_pull_vs_binary_size,
           admitted_producer_binary_size, admitted_pull_vs_binary_size,
-          task_producer_binary_size, task_mesh_binary_size);
+          task_producer_binary_size, task_mesh_binary_size,
+          point_producer_binary_size, point_pull_vs_binary_size,
+          line_producer_binary_size, line_pull_vs_binary_size);
    return 0;
 }

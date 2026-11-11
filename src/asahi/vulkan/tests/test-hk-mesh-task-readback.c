@@ -2,8 +2,9 @@
  * Copyright 2026 Aurora Silicon
  * SPDX-License-Identifier: MIT
  *
- * Public-API G13 task -> payload -> mesh physical readback fixture.  The
- * --record-only mode is safe for drm-shim and never submits a command buffer.
+ * Public-API G13 task -> payload -> mesh physical readback fixture, plus
+ * taskless point and line meshes.  The --record-only mode is safe for
+ * drm-shim and never submits a command buffer.
  */
 
 #undef NDEBUG
@@ -46,9 +47,17 @@ static const uint32_t taskless_fragment_spv[] = {
 #include "g13_mesh_public_triangle.frag.spv.h"
 };
 
+static const uint32_t points_mesh_spv[] = {
+#include "g13_mesh_public_points.mesh.spv.h"
+};
+
+static const uint32_t lines_mesh_spv[] = {
+#include "g13_mesh_public_lines.mesh.spv.h"
+};
+
 #define WIDTH 64u
 #define HEIGHT 64u
-#define CASE_COUNT 6u
+#define CASE_COUNT 8u
 #define IMAGE_SIZE (WIDTH * HEIGHT * 4u)
 
 #define CHECK(call)                                                            \
@@ -389,6 +398,63 @@ check_taskless_indirect(const uint8_t *pixels, const char *label)
    return pass;
 }
 
+/* Constant position-only fragment colour on black: count covered pixels. */
+static unsigned
+count_coloured(const uint8_t *pixels, unsigned *wrong)
+{
+   unsigned coloured = 0;
+   *wrong = 0;
+   for (unsigned i = 0; i < WIDTH * HEIGHT; ++i) {
+      const uint8_t *pixel = pixels + i * 4;
+      const bool black = pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 0;
+      coloured += !black;
+      *wrong += pixel[3] != 255 ||
+                (!black && (!near_byte(pixel[0], 64) ||
+                            !near_byte(pixel[1], 128) ||
+                            !near_byte(pixel[2], 191)));
+   }
+   return coloured;
+}
+
+static bool
+covered(const uint8_t *pixels, unsigned x, unsigned y)
+{
+   const uint8_t *pixel = pixels + (y * WIDTH + x) * 4;
+   return pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0;
+}
+
+static bool
+check_points(const uint8_t *pixels)
+{
+   unsigned wrong;
+   const unsigned coloured = count_coloured(pixels, &wrong);
+   bool pass = wrong == 0 && coloured == 4 * 8 * 8;
+   static const unsigned centres[2] = {12, 44};
+   for (unsigned i = 0; i < 4; ++i) {
+      const unsigned x = centres[i & 1], y = centres[i >> 1];
+      pass &= covered(pixels, x, y) && covered(pixels, x - 4, y + 3) &&
+              !covered(pixels, x + 5, y) && !covered(pixels, x, y - 5);
+   }
+   printf("taskless points PointSize 8 {1,1,1}: coloured=%u wrong=%u %s\n",
+          coloured, wrong, pass ? "PASS" : "FAIL");
+   return pass;
+}
+
+static bool
+check_lines(const uint8_t *pixels)
+{
+   unsigned wrong;
+   const unsigned coloured = count_coloured(pixels, &wrong);
+   /* Two 48-pixel lines crossing at (40, 20). */
+   const bool pass = wrong == 0 && coloured >= 90 && coloured <= 97 &&
+                     covered(pixels, 20, 20) && covered(pixels, 40, 40) &&
+                     !covered(pixels, 20, 22) && !covered(pixels, 42, 40) &&
+                     !covered(pixels, 4, 20) && !covered(pixels, 40, 60);
+   printf("taskless lines {1,1,1}: coloured=%u wrong=%u %s\n", coloured,
+          wrong, pass ? "PASS" : "FAIL");
+   return pass;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -495,6 +561,10 @@ main(int argc, char **argv)
       shader_module(taskless_mesh_spv, sizeof(taskless_mesh_spv));
    VkShaderModule taskless_fragment_module =
       shader_module(taskless_fragment_spv, sizeof(taskless_fragment_spv));
+   VkShaderModule points_mesh_module =
+      shader_module(points_mesh_spv, sizeof(points_mesh_spv));
+   VkShaderModule lines_mesh_module =
+      shader_module(lines_mesh_spv, sizeof(lines_mesh_spv));
    const VkPipelineLayoutCreateInfo layout_info = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
    };
@@ -594,6 +664,27 @@ main(int argc, char **argv)
    CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
                                    &taskless_pipeline_info, NULL,
                                    &taskless_pipeline));
+   /* Point and line meshes: the raster topology comes from the mesh output
+    * declaration; the constant position-only fragment shader shows coverage.
+    */
+   VkPipeline topology_pipeline[2];
+   for (unsigned i = 0; i < 2; ++i) {
+      const VkPipelineShaderStageCreateInfo stages[] = {
+         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_MESH_BIT_EXT,
+          .module = i == 0 ? points_mesh_module : lines_mesh_module,
+          .pName = "main"},
+         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+          .module = position_only_fragment_module,
+          .pName = "main"},
+      };
+      VkGraphicsPipelineCreateInfo info = pipeline_info;
+      info.stageCount = 2;
+      info.pStages = stages;
+      CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &info, NULL,
+                                      &topology_pipeline[i]));
+   }
 
    struct target targets[CASE_COUNT];
    for (unsigned i = 0; i < CASE_COUNT; ++i)
@@ -743,6 +834,13 @@ main(int argc, char **argv)
       assert(mesh_grid_addr[5] != mesh_grid_addr[4]);
    }
    end_target(command, &targets[5], readback.buffer, 5 * IMAGE_SIZE);
+
+   for (unsigned i = 0; i < 2; ++i) {
+      begin_target(command, &targets[6 + i], topology_pipeline[i]);
+      draw_mesh(command, 1, 1, 1);
+      end_target(command, &targets[6 + i], readback.buffer,
+                 (6 + i) * IMAGE_SIZE);
+   }
    buffer_barrier(command, readback.buffer,
                   VK_PIPELINE_STAGE_2_COPY_BIT,
                   VK_ACCESS_2_TRANSFER_WRITE_BIT,
@@ -777,6 +875,8 @@ main(int argc, char **argv)
                                       "GPU-written");
       pass &= check_taskless_indirect(pixels + 5 * IMAGE_SIZE,
                                       "transfer-ring");
+      pass &= check_points(pixels + 6 * IMAGE_SIZE);
+      pass &= check_lines(pixels + 7 * IMAGE_SIZE);
    }
 
    vkDestroyCommandPool(device, pool, NULL);
@@ -798,11 +898,15 @@ main(int argc, char **argv)
    vkDestroyPipeline(device, pipeline, NULL);
    vkDestroyPipeline(device, position_only_pipeline, NULL);
    vkDestroyPipeline(device, taskless_pipeline, NULL);
+   vkDestroyPipeline(device, topology_pipeline[0], NULL);
+   vkDestroyPipeline(device, topology_pipeline[1], NULL);
    vkDestroyPipelineLayout(device, layout, NULL);
    vkDestroyShaderModule(device, position_only_fragment_module, NULL);
    vkDestroyShaderModule(device, position_only_mesh_module, NULL);
    vkDestroyShaderModule(device, taskless_fragment_module, NULL);
    vkDestroyShaderModule(device, taskless_mesh_module, NULL);
+   vkDestroyShaderModule(device, points_mesh_module, NULL);
+   vkDestroyShaderModule(device, lines_mesh_module, NULL);
    vkDestroyShaderModule(device, fragment_module, NULL);
    vkDestroyShaderModule(device, mesh_module, NULL);
    vkDestroyShaderModule(device, task_module, NULL);

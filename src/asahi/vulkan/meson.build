@@ -878,6 +878,26 @@ if with_tests
       ],
       depfile : 'g13_mesh_task_position_only.frag.spv.h.d',
     )
+    g13_mesh_public_points_spv = custom_target(
+      'g13_mesh_public_points.mesh.spv.h',
+      input : 'tests/g13_mesh_public_points.mesh',
+      output : 'g13_mesh_public_points.mesh.spv.h',
+      command : [
+        prog_glslang, '-V', '--target-env', 'vulkan1.3', '-S', 'mesh',
+        '-x', '-o', '@OUTPUT@', '@INPUT@', glslang_quiet, glslang_depfile,
+      ],
+      depfile : 'g13_mesh_public_points.mesh.spv.h.d',
+    )
+    g13_mesh_public_lines_spv = custom_target(
+      'g13_mesh_public_lines.mesh.spv.h',
+      input : 'tests/g13_mesh_public_lines.mesh',
+      output : 'g13_mesh_public_lines.mesh.spv.h',
+      command : [
+        prog_glslang, '-V', '--target-env', 'vulkan1.3', '-S', 'mesh',
+        '-x', '-o', '@OUTPUT@', '@INPUT@', glslang_quiet, glslang_depfile,
+      ],
+      depfile : 'g13_mesh_public_lines.mesh.spv.h.d',
+    )
     hk_mesh_task_readback_test = executable(
       'hk_mesh_task_readback_test',
       files('tests/test-hk-mesh-task-readback.c'),
@@ -888,6 +908,8 @@ if with_tests
       g13_mesh_task_position_only_frag_spv,
       g13_mesh_public_triangle_spv,
       g13_mesh_public_triangle_frag_spv,
+      g13_mesh_public_points_spv,
+      g13_mesh_public_lines_spv,
       include_directories : [inc_include],
       dependencies : [cc.find_library('vulkan'), dep_dl],
       c_args : [c_msvc_compat_args],

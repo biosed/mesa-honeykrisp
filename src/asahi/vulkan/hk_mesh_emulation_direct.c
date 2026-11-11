@@ -45,7 +45,7 @@ hk_mesh_emulation_direct_requirements(
        raster->b.info.stage != MESA_SHADER_VERTEX || predicated->compiled ||
        !producer->info.mesh.max_vertices ||
        !producer->info.mesh.max_primitives ||
-       producer->info.mesh.prim != MESA_PRIM_TRIANGLES ||
+       !hk_mesh_emulation_indices_per_primitive(producer->info.mesh.prim) ||
        !producer->info.mesh.vertex_stride_B ||
        !producer->info.mesh.primitive_stride_B ||
        !raster->info.mesh.vertex_stride_B ||
@@ -80,11 +80,14 @@ hk_mesh_emulation_direct_requirements(
         primitives / groups != producer->info.mesh.max_primitives))
       return false;
 
+   /* One expanded vertex and one U32 index per primitive vertex. */
+   const unsigned indices_per_primitive =
+      hk_mesh_emulation_indices_per_primitive(producer->info.mesh.prim);
    if (vertices > UINT64_MAX / producer->info.mesh.vertex_stride_B ||
        primitives > UINT64_MAX / producer->info.mesh.primitive_stride_B ||
-       primitives > UINT64_MAX / 3)
+       primitives > UINT64_MAX / indices_per_primitive)
       return false;
-   const uint64_t expanded_vertices = primitives * 3;
+   const uint64_t expanded_vertices = primitives * indices_per_primitive;
    if (expanded_vertices >
           UINT64_MAX / raster->info.mesh.vertex_stride_B ||
        expanded_vertices > UINT32_MAX ||
@@ -217,7 +220,7 @@ hk_mesh_emulation_task_requirements(
        producer->info.mesh.payload_size_B != payload ||
        !producer->info.mesh.max_vertices ||
        !producer->info.mesh.max_primitives ||
-       producer->info.mesh.prim != MESA_PRIM_TRIANGLES ||
+       !hk_mesh_emulation_indices_per_primitive(producer->info.mesh.prim) ||
        !producer->info.mesh.vertex_stride_B ||
        !producer->info.mesh.primitive_stride_B ||
        !raster->info.mesh.vertex_stride_B)
@@ -240,11 +243,14 @@ hk_mesh_emulation_task_requirements(
    const uint64_t groups = HK_G13_MESH_MAX_GROUP_TOTAL;
    const uint64_t vertices = groups * producer->info.mesh.max_vertices;
    const uint64_t primitives = groups * producer->info.mesh.max_primitives;
+   /* One expanded vertex and one U32 index per primitive vertex. */
+   const unsigned indices_per_primitive =
+      hk_mesh_emulation_indices_per_primitive(producer->info.mesh.prim);
    if (vertices > UINT64_MAX / producer->info.mesh.vertex_stride_B ||
        primitives > UINT64_MAX / producer->info.mesh.primitive_stride_B ||
-       primitives > UINT64_MAX / 3)
+       primitives > UINT64_MAX / indices_per_primitive)
       return false;
-   const uint64_t expanded_vertices = primitives * 3;
+   const uint64_t expanded_vertices = primitives * indices_per_primitive;
    if (expanded_vertices >
           UINT64_MAX / raster->info.mesh.vertex_stride_B ||
        expanded_vertices > UINT32_MAX)

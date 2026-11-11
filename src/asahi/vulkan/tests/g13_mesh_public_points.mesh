@@ -1,0 +1,23 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+
+/* Four 8-pixel points centred on pixels (12|44, 12|44) of a 64x64 target,
+ * in the PrimitivePointIndicesEXT + PointSize form used by translated point
+ * meshes.  Four of eight primitive slots are emitted so the software path's
+ * inactive point slots are exercised too. */
+layout(local_size_x = 4, local_size_y = 1, local_size_z = 1) in;
+layout(points, max_vertices = 4, max_primitives = 8) out;
+
+void
+main()
+{
+   const uint lane = gl_LocalInvocationIndex;
+   const float lo = 12.5 / 32.0 - 1.0;
+   const float hi = 44.5 / 32.0 - 1.0;
+
+   SetMeshOutputsEXT(4, 4);
+   gl_MeshVerticesEXT[lane].gl_Position =
+      vec4((lane & 1u) != 0u ? hi : lo, (lane & 2u) != 0u ? hi : lo, 0.0, 1.0);
+   gl_MeshVerticesEXT[lane].gl_PointSize = 8.0;
+   gl_PrimitivePointIndicesEXT[lane] = lane;
+}

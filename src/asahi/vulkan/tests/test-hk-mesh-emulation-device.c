@@ -188,6 +188,126 @@ check_uploaded_pair(const struct hk_api_shader *obj)
           (VARYING_BIT_PRIMITIVE_INDICES | VARYING_BIT_VAR(1)));
 }
 
+
+/* Four points (indices i) or two lines (2i, 2i + 1), optionally writing
+ * PointSize, compiled through the real G13 pair path. */
+static nir_shader *
+point_line_mesh(enum mesa_prim prim, bool point_size)
+{
+   static const nir_shader_compiler_options options = {0};
+   const bool points = prim == MESA_PRIM_POINTS;
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_MESH, &options,
+      points ? "G13 device-cache mesh points" : "G13 device-cache mesh lines");
+   b.shader->info.io_lowered = true;
+   b.shader->info.workgroup_size[0] = 4;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.mesh.max_vertices_out = 4;
+   b.shader->info.mesh.max_primitives_out = points ? 4 : 2;
+   b.shader->info.mesh.primitive_type = prim;
+
+   nir_def *lane = nir_load_local_invocation_index(&b);
+   nir_set_vertex_and_primitive_count(
+      &b, nir_imm_int(&b, 4), nir_imm_int(&b, points ? 4 : 2),
+      nir_imm_int(&b, 0));
+   nir_store_per_vertex_output(
+      &b, nir_vec4(&b, nir_i2f32(&b, lane), nir_imm_float(&b, 0.0f),
+                   nir_imm_float(&b, 0.0f), nir_imm_float(&b, 1.0f)),
+      lane, nir_imm_int(&b, 0), .write_mask = 0xf,
+      .src_type = nir_type_float32,
+      .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+   if (point_size) {
+      nir_store_per_vertex_output(
+         &b, nir_imm_float(&b, 8.0f), lane, nir_imm_int(&b, 0),
+         .write_mask = 0x1, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_PSIZ, .num_slots = 1});
+   }
+   if (points) {
+      nir_store_per_primitive_output(
+         &b, lane, lane, nir_imm_int(&b, 0), .write_mask = 0x1,
+         .src_type = nir_type_uint32,
+         .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES,
+                          .num_slots = 1});
+   } else {
+      nir_push_if(&b, nir_ult_imm(&b, lane, 2));
+      nir_def *first = nir_imul_imm(&b, lane, 2);
+      nir_store_per_primitive_output(
+         &b, nir_vec2(&b, first, nir_iadd_imm(&b, first, 1)), lane,
+         nir_imm_int(&b, 0), .write_mask = 0x3,
+         .src_type = nir_type_uint32,
+         .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES,
+                          .num_slots = 1});
+      nir_pop_if(&b, NULL);
+   }
+   nir_shader_gather_info(b.shader, b.impl);
+   return b.shader;
+}
+
+static struct hk_api_shader *deserialize(struct hk_device *dev,
+                                         const void *data, size_t size);
+
+/* The raster consumer must draw the mesh's own topology with one expanded
+ * vertex and U32 index per primitive vertex, and only a point pull VS may
+ * export PointSize.  Round-trip through the shader binary to keep the
+ * serialized topology. */
+static void
+check_point_line_pair(struct hk_device *dev, enum mesa_prim prim,
+                      bool point_size)
+{
+   const bool points = prim == MESA_PRIM_POINTS;
+   struct vk_shader_compile_info info = {
+      .stage = MESA_SHADER_MESH,
+      .next_stage_mask = VK_SHADER_STAGE_FRAGMENT_BIT,
+      .nir = point_line_mesh(prim, point_size),
+      .robustness = &vk_robustness_disabled,
+   };
+   struct vk_shader *compiled_vk = NULL;
+   CHECK(dev->vk.shader_ops->compile(&dev->vk, 1, &info, NULL, NULL, NULL,
+                                     &compiled_vk));
+   struct hk_api_shader *compiled =
+      container_of(compiled_vk, struct hk_api_shader, vk);
+   const struct hk_shader *main = hk_main_mesh_variant(compiled);
+   const struct hk_shader *rast = hk_rast_mesh_variant(compiled);
+   assert(main->compiled && rast->compiled);
+   assert(main->b.info.stage == MESA_SHADER_COMPUTE);
+   assert(rast->b.info.stage == MESA_SHADER_VERTEX);
+   assert(main->info.mesh.prim == prim);
+   assert(main->info.mesh.max_primitives == (points ? 4 : 2));
+
+   const unsigned n = points ? 1 : 2;
+   const unsigned stride = point_size ? 32 : 16;
+   assert(main->info.mesh.vertex_stride_B == stride);
+   assert(main->info.mesh.primitive_stride_B == 16);
+   assert(rast->info.mesh.vertex_stride_B == stride);
+   assert(main->info.mesh.vertex_outputs ==
+          (VARYING_BIT_POS | (point_size ? VARYING_BIT_PSIZ : 0)));
+   const struct agx_unlinked_uvs_layout *uvs = &rast->info.uvs;
+   assert((uvs->group_offs[UVS_LAYER_VIEWPORT] ==
+           uvs->group_offs[UVS_PSIZ] + 1) == points);
+
+   const uint32_t grid[3] = {2, 1, 1};
+   struct hk_mesh_emulation_direct_plan plan;
+   assert(hk_mesh_emulation_direct_requirements(
+      dev->dev.chip, compiled, grid, &plan));
+   const unsigned primitives = 2 * main->info.mesh.max_primitives;
+   assert(plan.draw_count == 2);
+   assert(plan.expanded_records_size_B == primitives * n * stride);
+   assert(plan.index_buffer_size_B == primitives * n * sizeof(uint32_t));
+   assert(plan.vertex_records_size_B == 2 * 4 * stride);
+
+   struct blob blob;
+   blob_init(&blob);
+   assert(compiled->vk.ops->serialize(&dev->vk, &compiled->vk, &blob));
+   assert(!blob.out_of_memory && blob.size > 0);
+   struct hk_api_shader *clone = deserialize(dev, blob.data, blob.size);
+   assert(hk_main_mesh_variant(clone)->info.mesh.prim == prim);
+   assert(hk_rast_mesh_variant(clone)->info.mesh.vertex_stride_B == stride);
+   clone->vk.ops->destroy(&dev->vk, &clone->vk, NULL);
+   compiled->vk.ops->destroy(&dev->vk, &compiled->vk, NULL);
+   blob_finish(&blob);
+}
+
 static struct hk_api_shader *
 deserialize(struct hk_device *dev, const void *data, size_t size)
 {
@@ -667,6 +787,10 @@ main(void)
    assert(memcmp(&fragment_second_main->frag_face, &fragment_main->frag_face,
                  sizeof(fragment_main->frag_face)) == 0);
 
+   check_point_line_pair(dev, MESA_PRIM_POINTS, true);
+   check_point_line_pair(dev, MESA_PRIM_POINTS, false);
+   check_point_line_pair(dev, MESA_PRIM_LINES, false);
+
    const uint32_t producer_size = hk_main_mesh_variant(compiled)->code_size;
    const uint32_t pull_vs_size = hk_rast_mesh_variant(compiled)->code_size;
    compiled->vk.ops->destroy(&dev->vk, &compiled->vk, NULL);
@@ -694,7 +818,7 @@ main(void)
    vkDestroyInstance(instance, NULL);
 
    printf("G13 mesh device/cache: uploaded MAIN %u B, RAST %u B, "
-          "binary cache hit PASS\n",
+          "binary cache hit PASS, points/lines PASS\n",
           producer_size, pull_vs_size);
    return 0;
 }

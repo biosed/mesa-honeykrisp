@@ -1,0 +1,26 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+
+/* A horizontal line on pixel row 20 and a vertical line on pixel column 40
+ * of a 64x64 target, each spanning NDC -0.75..0.75 (48 pixels). */
+layout(local_size_x = 4, local_size_y = 1, local_size_z = 1) in;
+layout(lines, max_vertices = 4, max_primitives = 2) out;
+
+void
+main()
+{
+   const uint lane = gl_LocalInvocationIndex;
+   const float row = 20.5 / 32.0 - 1.0;
+   const float column = 40.5 / 32.0 - 1.0;
+   const vec2 positions[4] = vec2[4](
+      vec2(-0.75, row),
+      vec2( 0.75, row),
+      vec2(column, -0.75),
+      vec2(column,  0.75)
+   );
+
+   SetMeshOutputsEXT(4, 2);
+   gl_MeshVerticesEXT[lane].gl_Position = vec4(positions[lane], 0.0, 1.0);
+   if (lane < 2u)
+      gl_PrimitiveLineIndicesEXT[lane] = uvec2(lane * 2u, lane * 2u + 1u);
+}

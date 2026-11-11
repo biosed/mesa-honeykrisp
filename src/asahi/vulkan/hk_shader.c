@@ -6616,7 +6616,10 @@ hk_compile_g13_mesh_emulation(
    main->info.mesh.vertex_outputs = layout->vertex_outputs;
    main->info.mesh.primitive_outputs = layout->primitive_outputs;
    main->info.mesh.payload_size_B = layout->task_payload_size_B;
-   main->info.mesh.prim = MESA_PRIM_TRIANGLES;
+   /* The raster draw's hardware topology and object type follow this
+    * (hk_flush_dynamic_state_slow), so the pull-VS consumer draws point,
+    * line or triangle lists to match the admitted mesh output. */
+   main->info.mesh.prim = layout->primitive_type;
    for (unsigned i = 0; i < 3; ++i)
       main->info.mesh.local_size[i] = producer->info.workgroup_size[i];
 
@@ -6643,9 +6646,11 @@ hk_compile_g13_mesh_emulation(
 
    struct hk_shader *rast = hk_rast_mesh_variant(obj);
    agx_preprocess_nir(pull_vs);
+   /* Only a point mesh rasterizes PointSize; its pull VS always writes it
+    * (the producer's value or 1.0) and the hardware-VS lowering clamps it. */
    const union hk_key pull_key = {
       .vs = {
-         .kill_psiz = true,
+         .kill_psiz = layout->primitive_type != MESA_PRIM_POINTS,
          .no_default_layer = true,
       },
    };

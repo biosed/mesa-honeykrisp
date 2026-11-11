@@ -2,10 +2,11 @@
  * Copyright 2026 Aurora Silicon
  * SPDX-License-Identifier: MIT
  *
- * Physical, game-free G13 software-mesh triangle. The public mesh extension
- * remains disabled: this fixture compiles/binds the admitted pair through
- * Honeykrisp's internal API, submits one direct mesh workgroup, and verifies
- * the resulting RGBA8 image through an ordinary transfer readback.
+ * Physical, game-free G13 software-mesh triangle, points and lines. The
+ * public mesh extension remains disabled: this fixture compiles/binds the
+ * admitted pair through Honeykrisp's internal API, submits one direct mesh
+ * workgroup per case, and verifies the resulting RGBA8 image through an
+ * ordinary transfer readback.
  */
 
 #undef NDEBUG
@@ -120,6 +121,101 @@ triangle_mesh(void)
    return b.shader;
 }
 
+
+/* Pixel-centre NDC coordinate of pixel p on a 64-pixel axis. */
+#define PIXEL_NDC(p) (((float)(p) + 0.5f) / 32.0f - 1.0f)
+
+static nir_def *
+select4(nir_builder *b, nir_def *lane, const float v[4])
+{
+   nir_def *value = nir_imm_float(b, v[3]);
+   for (int i = 2; i >= 0; --i)
+      value = nir_bcsel(b, nir_ieq_imm(b, lane, i), nir_imm_float(b, v[i]),
+                        value);
+   return value;
+}
+
+/* Points: four vertices at pixel centres (12|44, 12|44), primitive count 4
+ * out of 8 slots so the export also writes inactive point slots.  With
+ * point_size, each point is 8x8 pixels; without it the pull VS must default
+ * to 1.0, one pixel per point.
+ *
+ * Lines: a horizontal line on row 20 and a vertical line on column 40, each
+ * spanning NDC -0.75..0.75 (48 pixels). */
+static nir_shader *
+point_line_mesh(enum mesa_prim prim, bool point_size)
+{
+   static const nir_shader_compiler_options options = {0};
+   const bool points = prim == MESA_PRIM_POINTS;
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_MESH, &options,
+      points ? "G13 submitted mesh points" : "G13 submitted mesh lines");
+   b.shader->info.io_lowered = true;
+   b.shader->info.workgroup_size[0] = 4;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.mesh.max_vertices_out = 4;
+   b.shader->info.mesh.max_primitives_out = points ? 8 : 2;
+   b.shader->info.mesh.primitive_type = prim;
+
+   nir_def *lane = nir_load_local_invocation_index(&b);
+   const float lo = PIXEL_NDC(12), hi = PIXEL_NDC(44);
+   const float row = PIXEL_NDC(20), column = PIXEL_NDC(40);
+   const float point_x[4] = {lo, hi, lo, hi};
+   const float point_y[4] = {lo, lo, hi, hi};
+   const float line_x[4] = {-0.75f, 0.75f, column, column};
+   const float line_y[4] = {row, row, -0.75f, 0.75f};
+   nir_def *x = select4(&b, lane, points ? point_x : line_x);
+   nir_def *y = select4(&b, lane, points ? point_y : line_y);
+
+   nir_set_vertex_and_primitive_count(
+      &b, nir_imm_int(&b, 4), nir_imm_int(&b, points ? 4 : 2),
+      nir_imm_int(&b, 0));
+   nir_store_per_vertex_output(
+      &b, nir_vec4(&b, x, y, nir_imm_float(&b, 0.0f),
+                   nir_imm_float(&b, 1.0f)),
+      lane, nir_imm_int(&b, 0), .write_mask = 0xf,
+      .src_type = nir_type_float32,
+      .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+   if (point_size) {
+      nir_store_per_vertex_output(
+         &b, nir_imm_float(&b, 8.0f), lane, nir_imm_int(&b, 0),
+         .write_mask = 0x1, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_PSIZ, .num_slots = 1});
+   }
+   if (points) {
+      nir_store_per_primitive_output(
+         &b, lane, lane, nir_imm_int(&b, 0), .write_mask = 0x1,
+         .src_type = nir_type_uint32,
+         .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES,
+                          .num_slots = 1});
+   } else {
+      nir_push_if(&b, nir_ult_imm(&b, lane, 2));
+      nir_def *first = nir_imul_imm(&b, lane, 2);
+      nir_store_per_primitive_output(
+         &b, nir_vec2(&b, first, nir_iadd_imm(&b, first, 1)), lane,
+         nir_imm_int(&b, 0), .write_mask = 0x3,
+         .src_type = nir_type_uint32,
+         .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES,
+                          .num_slots = 1});
+      nir_pop_if(&b, NULL);
+   }
+   nir_shader_gather_info(b.shader, b.impl);
+   return b.shader;
+}
+
+static bool
+is_orange(const uint8_t *p)
+{
+   return p[0] > 240 && p[1] > 55 && p[1] < 90 && p[2] < 30 && p[3] > 240;
+}
+
+static bool
+is_black(const uint8_t *p)
+{
+   return p[0] < 8 && p[1] < 8 && p[2] < 8 && p[3] > 240;
+}
+
 static void
 image_barrier(VkCommandBuffer command, VkImage image,
               VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
@@ -145,6 +241,155 @@ image_barrier(VkCommandBuffer command, VkImage image,
       .pImageMemoryBarriers = &image_barrier,
    };
    vkCmdPipelineBarrier2(command, &dependency);
+}
+
+
+/* Clear, draw one direct mesh workgroup with the bound triangle pipeline's
+ * fragment shader, and read the image back.  The raster topology comes from
+ * the mesh shader, not from the pipeline's triangle-list input assembly. */
+static bool
+submit_mesh_case(VkQueue queue, VkCommandPool pool, VkPipeline pipeline,
+                 VkImage image, VkImageView view, VkBuffer readback,
+                 hk_test_mesh_emulation_draw_fn record_mesh,
+                 struct hk_api_shader *mesh)
+{
+   const VkCommandBufferAllocateInfo command_info = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+      .commandPool = pool,
+      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+      .commandBufferCount = 1,
+   };
+   VkCommandBuffer command;
+   CHECK(vkAllocateCommandBuffers(device, &command_info, &command));
+   const VkCommandBufferBeginInfo begin_info = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+   };
+   CHECK(vkBeginCommandBuffer(command, &begin_info));
+   image_barrier(command, image, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                 VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                 VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                 VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+   const VkRenderingAttachmentInfo attachment = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+      .imageView = view,
+      .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+      .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+      .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+      .clearValue.color = {{0.0f, 0.0f, 0.0f, 1.0f}},
+   };
+   const VkRenderingInfo rendering = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+      .renderArea = {{0, 0}, {WIDTH, HEIGHT}},
+      .layerCount = 1,
+      .colorAttachmentCount = 1,
+      .pColorAttachments = &attachment,
+   };
+   vkCmdBeginRendering(command, &rendering);
+   vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+   const uint32_t grid[3] = {1, 1, 1};
+   if (!record_mesh(command, mesh, grid, 0, NULL)) {
+      fprintf(stderr, "G13 mesh recording failed: VkResult=%d\n",
+              hk_cmd_buffer_from_handle(command)->vk.record_result);
+      return false;
+   }
+   vkCmdEndRendering(command);
+   image_barrier(command, image,
+                 VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                 VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                 VK_PIPELINE_STAGE_2_COPY_BIT,
+                 VK_ACCESS_2_TRANSFER_READ_BIT,
+                 VK_IMAGE_LAYOUT_GENERAL,
+                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+   const VkBufferImageCopy copy = {
+      .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+      .imageExtent = {WIDTH, HEIGHT, 1},
+   };
+   vkCmdCopyImageToBuffer(command, image,
+                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                          readback, 1, &copy);
+   CHECK(vkEndCommandBuffer(command));
+   const VkSubmitInfo submit = {
+      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+      .commandBufferCount = 1,
+      .pCommandBuffers = &command,
+   };
+   CHECK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE));
+   CHECK(vkQueueWaitIdle(queue));
+   vkFreeCommandBuffers(device, pool, 1, &command);
+   return true;
+}
+
+static struct hk_api_shader *
+compile_mesh(struct hk_device *dev, nir_shader *nir)
+{
+   struct vk_shader_compile_info info = {
+      .stage = MESA_SHADER_MESH,
+      .next_stage_mask = VK_SHADER_STAGE_FRAGMENT_BIT,
+      .nir = nir,
+      .robustness = &vk_robustness_disabled,
+   };
+   struct vk_shader *mesh_vk = NULL;
+   CHECK(dev->vk.shader_ops->compile(&dev->vk, 1, &info, NULL, NULL, NULL,
+                                     &mesh_vk));
+   return container_of(mesh_vk, struct hk_api_shader, vk);
+}
+
+static const uint8_t *
+pixel(const uint8_t *pixels, unsigned x, unsigned y)
+{
+   return pixels + (y * WIDTH + x) * 4;
+}
+
+/* Returns true on pass. */
+static bool
+check_points(const uint8_t *pixels, bool point_size)
+{
+   unsigned orange = 0, black = 0, other = 0;
+   for (unsigned i = 0; i < WIDTH * HEIGHT; ++i) {
+      const uint8_t *p = pixels + i * 4;
+      orange += is_orange(p);
+      black += is_black(p);
+      other += !is_orange(p) && !is_black(p);
+   }
+   bool pass = other == 0;
+   static const unsigned centres[2] = {12, 44};
+   for (unsigned i = 0; i < 4; ++i) {
+      const unsigned x = centres[i & 1], y = centres[i >> 1];
+      pass &= is_orange(pixel(pixels, x, y));
+      /* Inside an 8-pixel point, outside a 1-pixel one. */
+      pass &= is_orange(pixel(pixels, x + 3, y - 3)) == point_size;
+      pass &= is_black(pixel(pixels, x + 5, y));
+   }
+   pass &= point_size ? orange == 4 * 64 : orange == 4;
+   printf("G13 mesh submitted points (PointSize %s): orange=%u black=%u "
+          "other=%u %s\n",
+          point_size ? "8" : "default", orange, black, other,
+          pass ? "PASS" : "FAIL");
+   return pass;
+}
+
+static bool
+check_lines(const uint8_t *pixels)
+{
+   unsigned orange = 0, black = 0, other = 0;
+   for (unsigned i = 0; i < WIDTH * HEIGHT; ++i) {
+      const uint8_t *p = pixels + i * 4;
+      orange += is_orange(p);
+      black += is_black(p);
+      other += !is_orange(p) && !is_black(p);
+   }
+   /* Two 48-pixel one-pixel-wide lines crossing at (40, 20). */
+   bool pass = other == 0 && orange >= 90 && orange <= 97 &&
+               is_orange(pixel(pixels, 20, 20)) &&
+               is_orange(pixel(pixels, 40, 40)) &&
+               is_black(pixel(pixels, 20, 22)) &&
+               is_black(pixel(pixels, 42, 40)) &&
+               is_black(pixel(pixels, 4, 20)) &&
+               is_black(pixel(pixels, 40, 60));
+   printf("G13 mesh submitted lines: orange=%u black=%u other=%u %s\n",
+          orange, black, other, pass ? "PASS" : "FAIL");
+   return pass;
 }
 
 int
@@ -466,12 +711,35 @@ main(void)
          other++;
    }
    const uint8_t *center = pixels + ((HEIGHT / 2) * WIDTH + WIDTH / 2) * 4;
-   const bool pass = orange > 500 && black > 500 && other == 0 &&
+   bool pass = orange > 500 && black > 500 && other == 0 &&
                      center[0] > 240 && center[1] > 55 && center[1] < 90;
    printf("G13 mesh submitted triangle: orange=%u black=%u other=%u "
           "center=%u,%u,%u,%u %s\n",
           orange, black, other, center[0], center[1], center[2], center[3],
           pass ? "PASS" : "FAIL");
+
+   struct {
+      enum mesa_prim prim;
+      bool point_size;
+   } cases[] = {
+      {MESA_PRIM_POINTS, true},
+      {MESA_PRIM_POINTS, false},
+      {MESA_PRIM_LINES, false},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(cases); ++i) {
+      struct hk_api_shader *case_mesh = compile_mesh(
+         dev, point_line_mesh(cases[i].prim, cases[i].point_size));
+      assert(hk_main_mesh_variant(case_mesh)->info.mesh.prim ==
+             cases[i].prim);
+      memset(pixels, 0xcd, WIDTH * HEIGHT * 4);
+      if (!submit_mesh_case(queue, pool, pipeline, image, view, readback,
+                            record_mesh, case_mesh))
+         return 2;
+      pass &= cases[i].prim == MESA_PRIM_POINTS
+                 ? check_points(pixels, cases[i].point_size)
+                 : check_lines(pixels);
+      case_mesh->vk.ops->destroy(&dev->vk, &case_mesh->vk, NULL);
+   }
 
    mesh->vk.ops->destroy(&dev->vk, &mesh->vk, NULL);
    vkDestroyCommandPool(device, pool, NULL);

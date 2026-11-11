@@ -79,6 +79,10 @@ struct hk_mesh_emulation_group_record {
 };
 
 struct hk_mesh_emulation_layout {
+   /* Mesh output topology (MESA_PRIM_POINTS, _LINES or _TRIANGLES) and the
+    * matching number of PrimitiveIndices words per primitive (1, 2 or 3). */
+   unsigned primitive_type;
+   unsigned indices_per_primitive;
    unsigned vertex_count;
    unsigned primitive_count;
    unsigned shared_size;
@@ -110,8 +114,39 @@ struct hk_mesh_emulation_layout {
  */
 struct hk_mesh_emulation_admission;
 
+/* Index words per mesh primitive for an admitted output topology, or 0 for
+ * a topology outside the software contract. */
+static inline unsigned
+hk_mesh_emulation_indices_per_primitive(unsigned primitive_type)
+{
+   switch (primitive_type) {
+   case MESA_PRIM_POINTS:
+      return 1;
+   case MESA_PRIM_LINES:
+      return 2;
+   case MESA_PRIM_TRIANGLES:
+      return 3;
+   default:
+      return 0;
+   }
+}
+
+/* Whether the producer copies every primitive's vertices into expanded
+ * records (deindexed) instead of indexing the source vertex records.
+ * Per-primitive user outputs need a copy per primitive.  Point and line
+ * meshes always take the copy so that an inactive or invalid primitive can be
+ * given a position outside the clip volume: unlike a triangle, a point or
+ * line with repeated indices is not a zero-area primitive. */
+static inline bool
+hk_mesh_emulation_layout_expanded(const struct hk_mesh_emulation_layout *l)
+{
+   return (l->primitive_outputs & ~VARYING_BIT_PRIMITIVE_INDICES) ||
+          l->primitive_type != MESA_PRIM_TRIANGLES;
+}
+
 /*
- * Lower the bounded triangle-only mesh producer contract to a compute shader.
+ * Lower the bounded point/line/triangle mesh producer contract to a compute
+ * shader.  PointSize is carried per vertex for point meshes only.
  *
  * The extension remains unadvertised on G13 until the command and generated
  * pull-vertex consumer paths are complete.  Returning false is fail-closed:
