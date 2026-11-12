@@ -3597,8 +3597,12 @@ hk_opt_ssbo_cas_fadd_reduce(nir_shader *nir)
 static bool
 hk_coherent_images_in_memory(const struct agx_device *dev)
 {
+   /* HK_COHERENT_IMAGES_MEMORY=0 (diagnostic, default on): keep coherent
+    * image loads and stores on the texture path, as before 912ff036c89, to
+    * measure that change; it gets a shader binary UUID of its own. */
    return agx_chip_isa_encoding(dev->chip) == AGX_ISA_ENCODING_AGX2 &&
-          dev->params.num_clusters_total > 1;
+          dev->params.num_clusters_total > 1 &&
+          debug_get_bool_option("HK_COHERENT_IMAGES_MEMORY", true);
 }
 
 static void

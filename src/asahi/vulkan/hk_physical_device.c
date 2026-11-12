@@ -1909,6 +1909,8 @@ hk_physical_device_init_pipeline_cache(struct hk_physical_device *pdev)
              g13_swmesh_shader_uuid, VK_UUID_SIZE);
       if (!debug_get_bool_option("AGX_LOCAL_BIT47", true))
          pdev->vk.properties.shaderBinaryUUID[VK_UUID_SIZE - 2] ^= 0x80;
+      if (!debug_get_bool_option("HK_COHERENT_IMAGES_MEMORY", true))
+         pdev->vk.properties.shaderBinaryUUID[VK_UUID_SIZE - 2] ^= 0x40;
    }
 
 #ifdef ENABLE_SHADER_CACHE
