@@ -1126,11 +1126,15 @@ struct hk_cs {
     * fold the leading record into the destination's trailing one. */
    void *leading_barrier_end;
 
-   /* AGX3 CDM: weak_barrier_end when that barrier ends an application
-    * dispatch. Where agx_chip_elide_app_dispatch_barrier() holds, a following
-    * application dispatch overwrites it, so consecutive application dispatches
-    * carry no barrier between them; any other record still follows it. */
+   /* The stream position just after a barrier ending an application dispatch.
+    * Where the chip path admits it, a directly following application dispatch
+    * may overwrite that barrier so Vulkan dispatches without an API dependency
+    * can overlap; every other record still follows the trailing barrier. */
    void *app_dispatch_end;
+
+   /* AGX2 only: the start of the removable barrier named above. AGX3 barriers
+    * have a fixed byte size and recover their start from app_dispatch_end. */
+   void *app_dispatch_barrier;
 
    /* Whether there is more than just the root chunk */
    bool stream_linked;
@@ -1383,6 +1387,38 @@ struct hk_cs {
    bool restart_index_set;
 };
 
+/* Drop only the barrier which is still the exact tail of the preceding
+ * application dispatch.  The caller immediately replaces it with another
+ * launch and trailing barrier; clearing the markers on every attempt keeps an
+ * intervening record, stream link, internal launch, or API barrier final. */
+static inline bool
+hk_cs_elide_app_dispatch_barrier(struct hk_cs *cs, bool app_dispatch)
+{
+   const bool elide = app_dispatch && cs->app_dispatch_barrier &&
+                      cs->current == cs->app_dispatch_end;
+
+   if (elide) {
+      cs->current = cs->app_dispatch_barrier;
+      assert(cs->stats.flushes > 0);
+      cs->stats.flushes--;
+   }
+
+   cs->app_dispatch_barrier = NULL;
+   cs->app_dispatch_end = NULL;
+   return elide;
+}
+
+/* Scratch-using launches were not safe in the first AGX2 experiment. Keep
+ * that hardware boundary explicit and independently testable. */
+static inline bool
+hk_app_dispatch_overlap_eligible(bool in_meta, mesa_shader_stage stage,
+                                 uint32_t scratch_size,
+                                 uint32_t preamble_scratch_size)
+{
+   return !in_meta && stage == MESA_SHADER_COMPUTE && scratch_size == 0 &&
+          preamble_scratch_size == 0;
+}
+
 static inline unsigned
 hk_sync_sq(const struct hk_cs *cs)
 {
@@ -1477,6 +1513,7 @@ hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b)
          : (a_memory && b_skip && a->current == dst) ? dst
                                                      : NULL;
       a->app_dispatch_end = NULL;
+      a->app_dispatch_barrier = NULL;
    } else {
       void *link_end =
          hk_cmd_buffer_emit_cs_jump(a->cmd, a->current, b->addr, false);
@@ -1489,6 +1526,7 @@ hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b)
       a->weak_barrier_end = b->weak_barrier_end;
       a->memory_flush_end = b->memory_flush_end;
       a->app_dispatch_end = NULL;
+      a->app_dispatch_barrier = NULL;
    }
 
    a->uses_sampler_heap |= b->uses_sampler_heap;
@@ -2668,7 +2706,8 @@ bool hk_cdm_visibility_flush_needed(const struct hk_device *dev,
 void hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
                                  struct agx_cdm_launch_word_0_packed launch,
                                  uint32_t usc, struct agx_grid grid,
-                                 struct agx_workgroup local_size);
+                                 struct agx_workgroup local_size,
+                                 bool app_dispatch);
 
 void hk_dispatch_with_usc(struct hk_device *dev, struct hk_cs *cs,
                           struct agx_shader_info *info, uint32_t usc,
