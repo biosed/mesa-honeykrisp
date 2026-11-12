@@ -5,6 +5,7 @@
 
 #include "agx_compiler.h"
 #include "agx_opcodes.h"
+#include "util/u_debug.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -816,6 +817,15 @@ agx_pack_instr(struct util_dynarray *emission, struct util_dynarray *fixups,
          ((O & BITFIELD64_MASK(6)) << 28) | (Ot ? BITFIELD64_BIT(34) : 0) |
          (((uint64_t)I->mask) << 36) | (((uint64_t)(O >> 6)) << 48) |
          (((uint64_t)(A >> 6)) << 58) | (((uint64_t)(R >> 6)) << 60);
+
+      /* AGX_LOCAL_BIT47=1 (diagnostic, off by default): set bit 47 of local
+       * load/store, which every Metal-compiled binary sets and whose meaning is
+       * unknown (Mesa MR !42482 measured +13% on llama.cpp matmuls on G13). */
+      static int bit47 = -1;
+      if (bit47 < 0)
+         bit47 = debug_get_bool_option("AGX_LOCAL_BIT47", false);
+      if (bit47)
+         raw |= BITFIELD64_BIT(47);
 
       unsigned size = L ? 8 : 6;
       memcpy(util_dynarray_grow_bytes(emission, 1, size), &raw, size);

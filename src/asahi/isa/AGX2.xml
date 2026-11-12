@@ -1416,6 +1416,7 @@
     <localmemindex/>
     <modifier name="format" bit="24:27" kind="format"/>
     <modifier name="mask" kind="mask" bit="36:39"/>
+    <modifier name="unk47" bit="47"/>   <!-- set by every Metal binary, meaning unknown (Mesa MR !42482); AGX_LOCAL_BIT47 -->
   </ins>
 
   <ins name="lstore" length="6/8">
@@ -1425,6 +1426,7 @@
     <localmemindex/>
     <modifier name="format" bit="24:27" kind="format"/>
     <modifier name="mask" kind="mask" bit="36:39"/>
+    <modifier name="unk47" bit="47"/>   <!-- set by every Metal binary, meaning unknown (Mesa MR !42482); AGX_LOCAL_BIT47 -->
   </ins>
 
   <ins name="barrier" length="2">
