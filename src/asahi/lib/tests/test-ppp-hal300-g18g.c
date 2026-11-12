@@ -534,8 +534,8 @@ test_compute(void)
    }
    CHECK(records == 3 && offset == size);
 
-   /* These families remain ungrounded. Indirect launch is independently
-    * grounded by AGXMetalG18G 26A428, G18-INDIRECT-COMPUTE.md section 2.4. */
+   /* These families remain ungrounded. Indirect launch is grounded
+    * separately for G18G. */
    CHECK(!agx3_cdm_secondary_barrier_target_grounded(AGX_CHIP_G18G));
    CHECK(!agx3_cdm_stream_link_target_grounded(AGX_CHIP_G18G));
    struct agx3_cdm_indirect_launch_info indirect_info = {

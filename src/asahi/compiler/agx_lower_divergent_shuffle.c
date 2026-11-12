@@ -34,6 +34,13 @@ is_shuffle(enum agx_opcode op)
  * operation. This ensures that inactive threads read 0 for their index and
  * hence do not contribute to the accumulated index. AGX2 uses r0h, while
  * AGX3's full-width register-lane form uses the separately reserved r1.
+ *
+ * Zero it again right after the last shuffle of the block rather than at the
+ * end of the block. Nothing else reads the scratch register, so this is the
+ * same for every later shuffle, but it keeps the zeroing out of a vertex
+ * shader's terminal output bundle: the outputs are moved to the end of the
+ * last block ahead of STOP, and AGX3 encodes them only when nothing but STOP
+ * follows them.
  */
 void
 agx_lower_divergent_shuffle(agx_context *ctx)
@@ -48,7 +55,7 @@ agx_lower_divergent_shuffle(agx_context *ctx)
    agx_mov_imm_to(&b, scratch, 0);
 
    agx_foreach_block(ctx, block) {
-      bool needs_zero = false;
+      agx_instr *last_shuffle = NULL;
 
       agx_foreach_instr_in_block_safe(block, I) {
          if (is_shuffle(I->op) && I->src[1].type == AGX_INDEX_REGISTER) {
@@ -61,14 +68,14 @@ agx_lower_divergent_shuffle(agx_context *ctx)
              */
             b.cursor = agx_before_instr(I);
             agx_mov_to(&b, scratch, I->src[1]);
-            needs_zero = true;
+            last_shuffle = I;
 
             I->src[1] = scratch;
          }
       }
 
-      if (needs_zero) {
-         b.cursor = agx_after_block_logical(block);
+      if (last_shuffle) {
+         b.cursor = agx_after_instr(last_shuffle);
          agx_mov_imm_to(&b, scratch, 0);
       }
    }

@@ -104,14 +104,16 @@ hk_stamp_oq_available(struct hk_cmd_buffer *cmd, struct hk_cs *post)
          return HK_OQ_KEEP;
    }
 
-   /* Fragment end first, then the slots no API timestamp uses, then vertex
-    * start. A slot an API timestamp rides on stays with it. */
-   const unsigned order[] = {3, 1, 2, 0};
-   unsigned free_slots[4], nfree = 0;
+   /* The host-written slots only: vertex end and fragment start, which no
+    * API timestamp uses, then vertex start. The fragment end is never used:
+    * the kernel lets the firmware write it at the end of the pass, before the
+    * end-of-render maintenance has made the counts visible
+    * (hk_query_oq.h). A slot an API timestamp rides on stays with it. */
+   const unsigned order[] = {1, 2, 0};
+   unsigned free_slots[ARRAY_SIZE(order)], nfree = 0;
    for (unsigned i = 0; i < ARRAY_SIZE(order); ++i) {
       const unsigned slot = order[i];
       if ((slot == 0 && render->timestamp.start.handle) ||
-          (slot == 3 && render->timestamp.end.handle) ||
           render->oq_stamp[slot].handle)
          continue;
       free_slots[nfree++] = slot;

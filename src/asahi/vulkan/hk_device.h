@@ -303,6 +303,12 @@ struct hk_device {
       uint32_t next_size[HK_CMD_SLAB_COUNT];
    } vdm;
 
+   bool cmd_pending_ready;
+   simple_mtx_t cmd_pending_lock;
+   struct list_head cmd_pending;
+   /* Submissions that completed with an error: kept until destruction. */
+   struct list_head cmd_pending_failed;
+
    /* Native G17P indirect compute grid helper.  A compact indirect helper
     * record carries no dimensions and no resource table, so the only way a
     * runtime grid can reach the main record is for this program to publish

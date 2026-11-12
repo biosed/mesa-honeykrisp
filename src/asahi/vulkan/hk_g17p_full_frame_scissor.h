@@ -15,11 +15,11 @@ struct hk_g17p_full_frame_scissor {
    bool default_depth;
 };
 
-/* Native ClipRectContext (2bf958..968, 2bf9b0..b8) defaults to the full
- * attachment and Z=[0,1]. updateClipRegions (2c06c8..708) compares effective
- * bounds with that screen; canUseScissorConfigReg (2c0950..9dc) additionally
- * requires matching Z. handleScissorUpdates (477684..69c) then clears only
- * PRIMARY bit16. Restrict Linux to exact original full-frame inputs: checking
+/* The default clip region is the full attachment with Z=[0,1]. A scissor
+ * that matches that full frame, bounds and Z alike, needs no scissor test:
+ * only PRIMARY bit16 is cleared.
+ *
+ * Restrict Linux to exact original full-frame inputs: checking
  * only the integer bounds after viewport truncation would admit fractions.
  * The caller retains all array records and indices, even when this is true.
  */

@@ -122,7 +122,7 @@ agx_g17p_upload_bind_state(void *cpu, size_t capacity, uint64_t compact,
    memcpy((uint8_t *)cpu + AGX_G17P_BIND_GROUP_BYTES, viewport,
           viewport_size);
 
-   /* Native VertexProgramVariant+0x1008: separate f32/f16 varying counts and
+   /* Native vertex varying record: separate f32/f16 varying counts and
     * two auxiliary words, zero for the admitted user-varying layout. */
    const uint32_t words[5] = {
       AGX_G17P_VARYING_RECORD_WORD0, counts_32, counts_16, 0, 0,

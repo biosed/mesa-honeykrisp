@@ -1,13 +1,12 @@
 <!--
   AGX3c.xml : Apple G17 (M5) native GPU instruction set,
-  encoding group A3-c == Apple encoder GPU variant 1.
+  encoding group A3-c (encoder table variant 1).
   Applies to: applegpu_g17g, g17s, and g18p.
 
-  Transcribed mechanically from the llvm::AGX3 packed encoder tables
-  inside Apple's MetalToolchain libapplegpu-nt.dylib.
+  Transcribed mechanically from the AGX3 instruction encoding tables.
 
-  Same grammar as Mesa src/asahi/isa/AGX2.xml.  Field names are Apple's
-  numeric field ids (fNN); their semantic names are not in the binary.
+  Same grammar as Mesa src/asahi/isa/AGX2.xml.  Field names are the
+  tables' numeric field ids (fNN); their semantics are not assigned yet.
 -->
 <isa>
   <!--

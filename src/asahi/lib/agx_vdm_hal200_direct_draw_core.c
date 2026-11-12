@@ -130,11 +130,11 @@ agx_vdm_hal200_index_range(uint64_t address, uint64_t range_B,
        (!zero_indices && count_B > range_B - offset_B))
       return false;
 
-   /* Native direct indexed 0x47e57c..0x47e584 rounds the supplied byte
-    * length up to dwords, then 0x47e664 subtracts one. Keep arithmetic 64-bit
-    * so firstIndex and a near-4GiB range cannot wrap before validation. The
-    * window starts at the dword holding the first index, so a range that
-    * ends inside a dword needs that dword counted from there. */
+   /* A native direct indexed draw rounds the supplied byte length up to
+    * dwords, then subtracts one. Keep arithmetic 64-bit so firstIndex and a
+    * near-4GiB range cannot wrap before validation. The window starts at the
+    * dword holding the first index, so a range that ends inside a dword needs
+    * that dword counted from there. */
    *relocated = address + offset_B;
    *size_word = (uint32_t)(((range_B - offset_B + (*relocated & 3) + 3) >> 2) -
                            1);
@@ -170,8 +170,8 @@ agx_vdm_hal200_indexed_draw_body_pack(
           (uint32_t)fields->base_vertex, size_word, &packet) || packet.count != 7)
       return false;
 
-   /* 0x47e618..0x47e678: restart state precedes every native indexed draw,
-    * even with restart disabled; baseVertex is copied as a raw signed word. */
+   /* Restart state precedes every native indexed draw, even with restart
+    * disabled; baseVertex is copied as a raw signed word. */
    agx_store_le32(out->bytes, UINT32_C(0x40000001));
    const uint32_t restart_max = fields->index_size_B == 1 ? UINT32_C(0xff)
                                  : fields->index_size_B == 2 ? UINT32_C(0xffff)

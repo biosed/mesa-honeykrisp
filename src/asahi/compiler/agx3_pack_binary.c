@@ -1323,49 +1323,61 @@ out:
    return valid;
 }
 
-/* Explicit sample and G17P centroid coordinates are an opaque 32-bit token.
- * Require the most recent overlapping write in this block to be ITRCOORDS of
- * the same interpolation, so a legacy ITER sample-index register or an
- * unrelated arithmetic value cannot accidentally select the native f32interp
- * coordinate leaf. A tied final interpolation is valid because sources are
- * read before its destination overwrites the token. */
-static bool
-agx3_sample_coords_use(const agx_block *block, const agx_instr *consumer)
-{
-   if (consumer->nr_srcs != 2 || !agx3_vary_reg32(consumer->src[1]))
-      return false;
-
-   const unsigned base = consumer->src[1].value;
-   const agx_instr *producer = NULL;
-   agx_foreach_instr_in_block(block, I) {
-      if (I == consumer)
-         return producer != NULL;
-
-      agx_foreach_dest(I, d) {
-         const agx_index dst = I->dest[d];
-         if (!agx3_src_is_register(dst) || dst.memory)
-            continue;
-         const unsigned end = dst.value + agx_index_size_16(dst);
-         if (end <= base || dst.value >= base + 2)
-            continue;
-
-         producer = I->op == AGX_OPCODE_ITRCOORDS_AGX3 && dst.value == base &&
-                          dst.size == AGX_SIZE_32 && agx_channels(dst) == 1 &&
-                          I->interpolation == consumer->interpolation
-                       ? I
-                       : NULL;
-      }
-   }
-
-   return false;
-}
-
 static bool
 agx3_interp_uses_coords(enum agx_isa_encoding enc, const agx_instr *I)
 {
    return I->interpolation == AGX_INTERPOLATION_SAMPLE ||
           (I->interpolation == AGX_INTERPOLATION_CENTROID &&
            (enc == AGX_ISA_ENCODING_AGX3B || enc == AGX_ISA_ENCODING_AGX3C));
+}
+
+/* Explicit sample and G17P centroid coordinates are an opaque 32-bit token.
+ * Require each consumer's token to be the SSA result of ITRCOORDS of the same
+ * interpolation, so a legacy ITER sample-index register or an unrelated
+ * arithmetic value cannot select the native f32interp coordinate leaf.
+ *
+ * This is a property of the SSA value, not of a physical register: register
+ * allocation may copy, swap or spill and fill the token on its way to a
+ * consumer, which preserves its 32 bits but not the register that ITRCOORDS
+ * wrote. Check it before RA; the packer then only checks the encoding.
+ */
+bool
+agx3_interp_coords_from_itrcoords(const agx_context *ctx)
+{
+   const enum agx_isa_encoding enc = ctx->key->dev.encoding;
+   const agx_instr **defs = calloc(ctx->alloc, sizeof(*defs));
+   if (!defs)
+      return false;
+
+   agx_foreach_instr_global(ctx, I) {
+      agx_foreach_ssa_dest(I, d)
+         defs[I->dest[d].value] = I;
+   }
+
+   bool valid = true;
+   agx_foreach_instr_global(ctx, I) {
+      if ((I->op != AGX_OPCODE_INTERP_AGX3 &&
+           I->op != AGX_OPCODE_RHW_INTERP_AGX3) ||
+          !agx3_interp_uses_coords(enc, I))
+         continue;
+
+      const agx_index coords = I->src[1];
+      const agx_instr *producer =
+         I->nr_srcs == 2 && coords.type == AGX_INDEX_NORMAL &&
+               !coords.memory && coords.value < ctx->alloc
+            ? defs[coords.value]
+            : NULL;
+      if (!producer || producer->op != AGX_OPCODE_ITRCOORDS_AGX3 ||
+          producer->interpolation != I->interpolation ||
+          coords.size != AGX_SIZE_32 || agx_channels(coords) != 1 ||
+          coords.abs || coords.neg) {
+         valid = false;
+         break;
+      }
+   }
+
+   free(defs);
+   return valid;
 }
 
 static bool
@@ -2622,12 +2634,14 @@ agx3_image_write_copy(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
 
 static bool
 agx3_emit_storage_image_write(struct util_dynarray *emission,
-                              enum agx_isa_encoding enc, const agx_instr *I,
+                              enum agx_isa_encoding enc, enum agx_chip chip,
+                              const agx_instr *I,
                               uint16_t wait_mask,
                               struct agx3_staging_banks *banks,
                               uint16_t bank_floor, uint16_t *outstanding,
                               uint8_t *write_slot,
-                              uint16_t heap_uniform_base)
+                              uint16_t heap_uniform_base,
+                              bool state0_pair)
 {
    const bool m5 = enc == AGX_ISA_ENCODING_AGX3C;
    const unsigned slots = m5 ? 8 : 6;
@@ -2669,10 +2683,15 @@ agx3_emit_storage_image_write(struct util_dynarray *emission,
     * layer, and 1D stores as 2D. G17G writes a layered image as 3D, the layer
     * staged like z: Gallium describes its PBE as 3D (agx_batch_upload_pbe), a
     * single-level 3D slice being a 2D-array layer. The G17P PACK_IMGWIR layer
-    * did not reach the G17G write (every layer landed in layer 0). */
-   const bool array = I->dim == AGX_DIM_2D_ARRAY && !m5;
+    * did not reach the G17G write (every layer landed in layer 0). G17C takes
+    * the layer operand, and its array descriptors (Honeykrisp keeps them, and
+    * Gallium does on G17C) need it: their layer count does not shrink with
+    * the selected mip level, unlike 3D depth.
+    */
+   const bool layer_operand = !m5 || chip == AGX_CHIP_G17C;
+   const bool array = I->dim == AGX_DIM_2D_ARRAY && layer_operand;
    const bool three_d = I->dim == AGX_DIM_3D ||
-                        (m5 && I->dim == AGX_DIM_2D_ARRAY);
+                        (!layer_operand && I->dim == AGX_DIM_2D_ARRAY);
    const unsigned coords = (array || three_d) ? 3 : 2;
    if ((!m5 && enc != AGX_ISA_ENCODING_AGX3B) || I->nr_dests != 0 ||
        (m5 && ((I->dim != AGX_DIM_2D && !array && !three_d) ||
@@ -2849,8 +2868,15 @@ agx3_emit_storage_image_write(struct util_dynarray *emission,
    } else {
       const uint16_t base = heap_uniform_base + (d.image_value == 1 ? 4 : 0);
       const uint8_t staging_slot = d.image_value == 0 ? 1 : 2;
+      /* hk's read/write state-0 ABI points state 0 at the texture/PBE pair
+       * (agx_shader_key::g17p_storage_image_pair); record 0 there is the
+       * texture, which as a PBE describes a far larger surface and sends the
+       * stores past the image. Take the PBE as record 1 of the same heap. */
+      struct agx3_image_write_desc resolved = d;
+      if (state0_pair && d.image_value == 0)
+         resolved.image_value = 1;
       encoded = agx3_tex_encode_image_write_2d(
-         enc, &d, base, staging_slot, imgwci, &imgwci_len);
+         enc, &resolved, base, staging_slot, imgwci, &imgwci_len);
    }
    if (!encoded || !agx3_append(&staged, imgwci, imgwci_len) ||
        !agx3_append(emission, staged.data, staged.size)) {
@@ -14277,9 +14303,6 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
 
          if (I->op == AGX_OPCODE_INTERP_AGX3 ||
              I->op == AGX_OPCODE_RHW_INTERP_AGX3) {
-            if (agx3_interp_uses_coords(enc, I) &&
-                !agx3_sample_coords_use(block, I))
-               AGX3_REFUSE(I);
             if (I->op == AGX_OPCODE_RHW_INTERP_AGX3 &&
                 ((enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C) ||
                  ctx->stage != MESA_SHADER_FRAGMENT ||
@@ -14569,9 +14592,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                 ctx->stage == MESA_SHADER_VERTEX &&
                 I->src[3].type != AGX_INDEX_IMMEDIATE) ||
                ctx->stage == MESA_SHADER_FRAGMENT ||
+               ctx->stage == MESA_SHADER_MESH ||
                (enc == AGX_ISA_ENCODING_AGX3C &&
-                (ctx->stage == MESA_SHADER_MESH ||
-                 ctx->stage == MESA_SHADER_TASK)) ||
+                ctx->stage == MESA_SHADER_TASK) ||
                agx3_stage_runs_as_kernel(ctx->stage);
             /* imgwci takes its coordinates from staging halves 0/2, so in a
              * shader that also writes images a read stages its coordinates at
@@ -14784,11 +14807,13 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
 
          if (I->op == AGX_OPCODE_IMAGE_WRITE) {
             uint8_t write_slot;
-            if (!agx3_emit_storage_image_write(emission, enc, I, wait,
+            if (!agx3_emit_storage_image_write(emission, enc,
+                                               ctx->key->dev.chip, I, wait,
                                                &staging_banks,
                                                image_write_bank_floor,
                                                &outstanding, &write_slot,
-                                               ctx->key->g17p_texture_uniform_base))
+                                               ctx->key->g17p_texture_uniform_base,
+                                               ctx->key->g17p_storage_image_pair))
                AGX3_REFUSE(I);
             image_write_slots &= outstanding;
             image_write_slots |= 1u << (write_slot - 1);
@@ -14940,12 +14965,16 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                 I->lod_mode == AGX_LOD_MODE_LOD_GRAD_MIN);
             /* Native runtime-indexed vertex pipelines ground both a per-lane
              * explicit level and explicit gradients in every noncube sample
-             * dimension, including depth comparisons and array layers. */
+             * dimension, including depth comparisons and array layers. A G17P
+             * mesh program is VDM-launched like a vertex program and binds its
+             * textures through the vertex path, so it samples the same way. */
             const bool vertex_explicit_lod =
                (ctx->stage == MESA_SHADER_VERTEX ||
                 ctx->stage == MESA_SHADER_GEOMETRY ||
                 ctx->stage == MESA_SHADER_TESS_CTRL ||
-                ctx->stage == MESA_SHADER_TESS_EVAL) &&
+                ctx->stage == MESA_SHADER_TESS_EVAL ||
+                (enc == AGX_ISA_ENCODING_AGX3B &&
+                 ctx->stage == MESA_SHADER_MESH)) &&
                (I->lod_mode == AGX_LOD_MODE_LOD_MIN ||
                 I->lod_mode == AGX_LOD_MODE_LOD_GRAD);
             /* Relocation is an operand-ABI property. Other forms retain
@@ -15917,16 +15946,18 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
              * (hk_launch_gs_prerast()), which runs one GS invocation per
              * thread. M5 object (task) and mesh programs read SR34 the same
              * way: a native G17G first-thread election in an object
-             * shader reads SR34 into a half register. */
+             * shader reads SR34 into a half register. A G17P mesh program is
+             * a VDM-launched threadgroup whose subgroups Apple's own mesh
+             * code reduces across (sRedumax in its write_uvb helper). */
             const bool subgroup_stage =
                ctx->stage == MESA_SHADER_COMPUTE ||
                ctx->stage == MESA_SHADER_VERTEX ||
                ctx->stage == MESA_SHADER_TESS_CTRL ||
                ctx->stage == MESA_SHADER_GEOMETRY ||
                ctx->stage == MESA_SHADER_FRAGMENT ||
+               ctx->stage == MESA_SHADER_MESH ||
                (enc == AGX_ISA_ENCODING_AGX3C &&
-                (ctx->stage == MESA_SHADER_MESH ||
-                 ctx->stage == MESA_SHADER_TASK));
+                ctx->stage == MESA_SHADER_TASK);
             const bool active_index =
                I->sr == AGX_SR_ACTIVE_THREAD_INDEX_IN_SUBGROUP &&
                subgroup_stage;
@@ -16494,15 +16525,15 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                                          I->src[0].kill || I->src[0].discard,
                                          bytes, &length);
             }
-            /* M5 allocate_uvb completes on scoreboard slot 1: every native
-             * G17G write_uvb helper waits slot 1 on the instruction right
-             * after it (cndst f4, e.g. 1e00002e). UVSTs issued before that
-             * completion lost the exports of alternate mesh workgroups on
-             * hardware (workgroups 2, 4, 6 of 8). Retire any older slot-1
+            /* allocate_uvb completes on scoreboard slot 1: every native
+             * write_uvb helper waits slot 1 on the instruction right after it
+             * (cndst f4: 1e00002e on G17G, 0f155401 on G16S). UVSTs issued
+             * before that completion lost the exports of alternate mesh
+             * workgroups on M5 (workgroups 2, 4, 6 of 8) and the later
+             * vertices of some workgroups on G16S. Retire any older slot-1
              * generation before the allocation claims the slot, then wait
              * for the allocation itself. */
-            const bool alloc_slot = I->op == AGX_OPCODE_ALLOCATE_UVB_M5 &&
-                                    enc == AGX_ISA_ENCODING_AGX3C;
+            const bool alloc_slot = I->op == AGX_OPCODE_ALLOCATE_UVB_M5;
             const uint16_t pre_wait = alloc_slot ? (wait | (outstanding_here & 1u)) : wait;
             if (!encoded || (pre_wait && !agx3_retire_slots_noop(emission, enc, pre_wait)) ||
                 !agx3_append(emission, bytes, length))

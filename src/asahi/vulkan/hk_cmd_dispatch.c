@@ -14,6 +14,7 @@
 #include "hk_buffer.h"
 #include "hk_acceleration_structure.h"
 #include "hk_cmd_buffer.h"
+#include "hk_g17p_storage_image.h"
 #include "hk_frame_anatomy.h"
 #include "hk_sampler_index.h"
 #include "hk_g17p_patch.h"
@@ -604,7 +605,7 @@ hk_cdm_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
       if (dev->dev.chip == AGX_CHIP_G18G)
          return;
 
-      /* Apple's CommandEncodingNext emitter uses flags=5 for its strong
+      /* The AGX3 compute encoding uses flags=5 for its strong
        * post-dispatch cache flush on every grounded G15--G17 identity.  Keep
        * Honeykrisp's deliberately conservative flush-after-every-launch
        * policy, but encode it in the target command-stream ISA. */
@@ -695,7 +696,7 @@ hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
       /* `usc` addresses an AGX2 USC block.  AGX3 direct launches instead
        * require a dispatch-local, 64-byte-aligned Ioto program VA.  Reject
        * this legacy entry point until the caller supplies that joined object;
-       * never feed an AGX2 launch to CommandEncodingNext. */
+       * never feed an AGX2 launch to the AGX3 compute encoding. */
       mesa_loge("legacy USC compute launch rejected for %s",
                 agx_chip_name(dev->dev.chip));
       vk_command_buffer_set_error(&cs->cmd->vk,
@@ -2533,19 +2534,14 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             return;
          }
 
-         if (write_only) {
-            pointers[0] =
-               set_address + s->info.agx3_storage_image.pbe_offset_B;
-            pointers[1] = access_control;
-         } else {
-            pointers[0] = set_address +
-                          s->info.agx3_storage_image.texture_offset_B;
-            pointers[1] =
-               set_address + s->info.agx3_storage_image.pbe_offset_B;
-            pointers[2] = access_control;
-            /* The native read_write ISEL clamps each unsigned coordinate
-             * against uniform half12. The consumed vector word is 0xffff. */
-            pointers[3] = UINT64_C(0xffff);
+         /* A read/write image's read takes sampler 0 from halves 4..7:
+          * the texel-fetch sampler, as a read-only texel fetch does. */
+         if (!hk_g17p_storage_image_pointers(
+                set_address, s->info.agx3_storage_image.texture_offset_B,
+                s->info.agx3_storage_image.pbe_offset_B, write_only,
+                access_control, dev->rodata.bo->va->addr, pointers)) {
+            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+            return;
          }
       } else {
          /* Native G17P compute read() uses table pointers in uniform

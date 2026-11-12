@@ -308,12 +308,11 @@ agx_vdm_index_list_indirect_pack_words(
  * above stay as they are for every other chip; G18G callers use these.
  */
 
-/* HAL300's extra Index List word ("Unk 2", gated by header bit 27). Apple's
- * setRenderPipelineStateCommon derives it per pipeline from word 4 of the
- * UVS record {0x0c280000, ...}: n = byte 0 + byte 2, the vertex output count
- * (AGXMetalG18G 0x219643220..0x2196432b4; G17G 0x216106df8..0x216106e8c).
- * Every J873 capture has n <= 9 and 7. Only G18G takes the derived value;
- * the other HAL300 chips keep the constant their captures show. */
+/* HAL300's extra Index List word ("Unk 2", gated by header bit 27). It is a
+ * per-pipeline value taken from word 4 of the UVS record {0x0c280000, ...}:
+ * n = byte 0 + byte 2, the vertex output count (the same on G18G and G17G).
+ * Every J873 capture has n <= 9 and 7. Only G18G takes the derived value; the
+ * other HAL300 chips keep the constant their captures show. */
 static inline uint32_t
 agx_vdm_index_list_hal300_unk2(enum agx_chip chip, uint32_t uvs_word4)
 {
@@ -346,10 +345,9 @@ agx_vdm_index_list_record_chip(enum agx_chip chip)
  * direct indexed words byte for byte, e.g. 69f20600 00018300 3 1 0 7 0000000f
  * 1 for three u16 triangles and 69f30900 ... for a restarted u16 strip.
  *
- * No indirect draw is captured, but AGXMetalG18G 26A428 emits the indirect
- * forms below word for word: non-indexed at 0x219662e7c..0x219662eb0 and
- * indexed, with its State Update, at 0x219663130..0x2196631fc. The G17G
- * copies are instruction-identical, with the same header tables. */
+ * No indirect draw is captured; the indirect forms below, non-indexed and
+ * indexed with its State Update, follow the same header layout as the
+ * direct ones, on G18G and G17G alike. */
 static inline bool
 agx_vdm_index_list_indexed_or_indirect_supported_inline(enum agx_chip chip)
 {

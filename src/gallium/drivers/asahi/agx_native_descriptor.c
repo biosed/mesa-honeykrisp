@@ -121,7 +121,7 @@ agx_gallium_pack_g17p_txf_sampler(
 
    memset(out, 0, sizeof(*out));
 
-   if (chip == AGX_CHIP_G17G || chip == AGX_CHIP_G18G) {
+   if (agx_chip_g17_m5(chip) || chip == AGX_CHIP_G18G) {
       /* The same texel-fetch state in G17G's Gen5 record, as
        * hk_pack_native_txf_sampler() and the G17G tile reload use it: the
        * compare-mode selector is set even without a comparison. */
@@ -160,7 +160,7 @@ bool
 agx_gallium_g17p_sampler_handle(enum agx_chip chip, unsigned api_sampler,
                                 uint16_t *native_handle)
 {
-   if ((!agx_chip_native_agx3(chip) && chip != AGX_CHIP_G18G && chip != AGX_CHIP_G17G) ||
+   if ((!agx_chip_native_agx3(chip) && chip != AGX_CHIP_G18G && !agx_chip_g17_m5(chip)) ||
        api_sampler >= AGX_GALLIUM_G17P_API_SAMPLERS || !native_handle)
       return false;
 
@@ -173,7 +173,7 @@ agx_gallium_g17p_custom_border_handle(enum agx_chip chip,
                                       unsigned api_sampler,
                                       uint16_t *native_handle)
 {
-   if ((!agx_chip_native_agx3(chip) && chip != AGX_CHIP_G18G && chip != AGX_CHIP_G17G) ||
+   if ((!agx_chip_native_agx3(chip) && chip != AGX_CHIP_G18G && !agx_chip_g17_m5(chip)) ||
        api_sampler >= AGX_GALLIUM_G17P_API_SAMPLERS || !native_handle)
       return false;
 
@@ -490,10 +490,9 @@ agx_gallium_pack_native_pbe_impl(
         * address >> 4 in word1[43:0] and stride - 16 from bit 40.
         *
         * On G18G it is also the J873 bgra8/gears/colour end-of-tile PBE
-        * (ffc60a02 00007f80 00005800 0003f010 for BGRA8 256x256, pitch
-        * 1024), which the codec reproduces; AGXMetalG18G's StateFields
-        * writes pitch/16-1 at word1[59:44] (0x219546d98). hk already admits
-        * it (8295c0d67c5). */
+        * (ffc60a02 00007f80 00005800 0003f010 for BGRA8 256x256, pitch 1024),
+        * which the codec reproduces; on G18G the PBE holds pitch/16-1 at
+        * word1[59:44]. hk already admits it (8295c0d67c5). */
        (legacy->layout == AGX_LAYOUT_LINEAR &&
         (legacy->level != 0 || legacy->levels != 1 ||
          legacy->unk_mipmapped)) ||

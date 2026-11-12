@@ -823,6 +823,11 @@ struct hk_graphics_state {
     * has an emulating twin to switch to once the device needs it. */
    uint32_t border_free_stages;
 
+   /* G17P: the twin of the bound fragment shader that reads its per-primitive
+    * inputs from the bound mesh shader's records (hk_mesh_fs_twin()), or
+    * NULL to draw with the bound fragment shader itself. */
+   struct hk_api_shader *mesh_fs;
+
    /* Vertex buffers */
    struct hk_addr_range vb[AGX_MAX_VBUFS];
 

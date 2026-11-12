@@ -39,10 +39,10 @@ struct agx3_cdm_direct_template_fields {
    bool subkernel_x_target_workitems;
 };
 
-/* Inputs to the exact ComputeProgramVariant::finalize transforms: the
- * constant program's thread-invariant (TI) resources, AGCCodeTranslator
- * ShaderInfo fields 31 and 37 (vtable +0x42 and +0x4e), the same pair the
- * vertex and fragment variants publish in their stage state. */
+/* Inputs to the exact direct-template transforms: the constant
+ * program's thread-invariant (TI) resources, the TI spill and TI IPR byte
+ * counts the compiler reports, the same pair the vertex and fragment
+ * programs carry in their stage state. */
 struct agx3_cdm_direct_template_sources {
    /* thread_invariant_spill_buffer_bytes: the constant program's TPS frame. */
    uint32_t ti_spill_bytes;
@@ -66,8 +66,8 @@ struct agx3_cdm_direct_launch_info {
    uint64_t pipeline;
    uint8_t dimensions;
 
-   /* DeviceConstants::hasMultipleAGCs supplies word 3 bit 31 only in the
-    * aggregate G15X emitter (G15S, G15C and G15D here). */
+   /* Word 3 bit 31 is set for multi-cluster parts, and only on the
+    * aggregate G15X family (G15S, G15C and G15D here). */
    bool g15x_has_multiple_agcs;
 
    uint32_t global_size[3];

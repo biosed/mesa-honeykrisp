@@ -725,8 +725,8 @@ create_gs_rast_shader(const nir_shader *gs, const struct lower_gs_state *state,
    if (main_side_effects)
       strip_api_side_effects(shader, remove_dead, eliminate_local_ray_queries);
 
-   /* Turn into a vertex shader run only for rasterization. Transform feedback
-    * was handled in the prepass.
+   /* Turn into a vertex shader run only for rasterization. It also writes
+    * transform feedback, from gs->xfb_info below.
     */
    shader->info.stage = MESA_SHADER_VERTEX;
    shader->info.has_transform_feedback_varyings = false;
@@ -739,8 +739,15 @@ create_gs_rast_shader(const nir_shader *gs, const struct lower_gs_state *state,
       shader->info.name = "gs rast";
    }
 
-   /* Optimize out pointless gl_PointSize outputs. Bizarrely, these occur. */
-   if (gs->info.gs.output_primitive != MESA_PRIM_POINTS)
+   /* Optimize out pointless gl_PointSize outputs. Bizarrely, these occur.
+    * Transform feedback below reads the outputs selected from
+    * outputs_written, so keep a captured point size.
+    */
+   bool xfb_psiz = false;
+   for (unsigned i = 0; gs->xfb_info && i < gs->xfb_info->output_count; ++i)
+      xfb_psiz |= gs->xfb_info->outputs[i].location == VARYING_SLOT_PSIZ;
+
+   if (gs->info.gs.output_primitive != MESA_PRIM_POINTS && !xfb_psiz)
       shader->info.outputs_written &= ~VARYING_BIT_PSIZ;
 
    nir_builder b_ =

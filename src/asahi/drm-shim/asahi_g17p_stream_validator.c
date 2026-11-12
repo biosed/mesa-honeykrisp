@@ -54,12 +54,10 @@ decode_pipeline_pair(const uint8_t pair[8])
    const uint32_t high = load_le32(pair);
    const uint32_t low = load_le32(pair + 4);
 
-   /* The high word's low 22 bits are the stage-program template, not
-    * address. A fragment with a constant program carries its
-    * thread-invariant spill quads in bits 3..20
-    * (agx_ppp_hal200_fragment_ti_resources, the native
-    * FragmentProgramVariantESLState::finalize layout); nothing sets the
-    * remaining template bits. */
+   /* The high word's low 22 bits are the stage-program template, not address.
+    * A fragment with a constant program carries its thread-invariant spill
+    * quads in bits 3..20 (agx_ppp_hal200_fragment_ti_resources, the native
+    * fragment record layout); nothing sets the remaining template bits. */
    if (high & UINT32_C(0x003fffff) & ~UINT32_C(0x001ffff8))
       return 0;
 

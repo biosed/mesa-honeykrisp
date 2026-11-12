@@ -41,9 +41,8 @@ agx_ppp_hal200_fragment_face_raster_pack(
    if (!agx_chip_native_agx3(chip) || line_width > 0xff || polygon_mode > 2 || !out)
       return false;
 
-   /* setLineWidth is consumed by the native finalize path as unsigned 4:4
-    * fixed point minus one. setTriangleFillMode at 0x45a1a4 writes the same
-    * two-bit field to both face words with BFI #18,#2. */
+   /* The line width is unsigned 4:4 fixed point minus one. The triangle
+    * fill mode is a two-bit field at bit 18 of both face words. */
    const uint32_t mask = UINT32_C(0x000cff00);
    *out = (original & ~mask) | (line_width << 8) | (polygon_mode << 18);
    return true;
@@ -123,12 +122,11 @@ agx_ppp_hal200_fragment_controls_pack(
 
    const uint32_t tri_merge_disable = UINT32_C(1) << 26;
 
-   /* updateFragmentShaderISPState masks these semantic fields into the
-    * HAL200 SECONDARY word.  Bit 26 is deliberately absent: Apple's G17P
-    * metadata leaves it clear for implicit texture gradients, explicit
-    * gradients, storage writes, and shadow sampling.  The generation-neutral
-    * linker sets its legacy bit for all of those cases, so it cannot be copied
-    * as native shader metadata. */
+   /* These semantic fields go into the HAL200 SECONDARY word.  Bit 26 is
+    * deliberately absent: Apple's G17P metadata leaves it clear for implicit
+    * texture gradients, explicit gradients, storage writes, and shadow
+    * sampling.  The generation-neutral linker sets its legacy bit for all of
+    * those cases, so it cannot be copied as native shader metadata. */
    const uint32_t linked_native_mask = UINT32_C(0xe2600000);
    uint32_t secondary = (secondary_original & ~tri_merge_disable) |
                         (fields->linked_control & linked_native_mask);
@@ -312,10 +310,9 @@ agx_ppp_hal200_fragment_ti_resources(
        ipr_quads > 0xffe)
       return false;
 
-   /* Pinned G17P FragmentProgramVariantESLState::finalize:
-    * 0x218841194..0x2188411c4 consumes the builder's TI spill quads at
-    * +0x128 and rounded TI largest-IPR bytes at +0x12c. It stores the
-    * seven-word fragment record at +0x544: IPR at +0x550, spill at +0x554. */
+   /* G17P fragment record: the TI spill quad count and the rounded TI
+    * largest-IPR count go into the seven-word fragment record, IPR in word 3
+    * and spill in word 4. */
    fields->unknown_0c = (fields->unknown_0c & ~UINT32_C(0xfff)) | ipr_quads;
    fields->stage_program_template =
       (fields->stage_program_template & ~UINT32_C(0x1ffff8)) | (spill_quads << 3);
@@ -343,8 +340,8 @@ agx_ppp_hal200_fragment_core_pack(
 
    const struct agx_ppp_hal200_graphics_fields raw = {
       .words = {
-         /* HAL200 emitFragmentProgramVariant at 0x4c5e38..0x4c5ec4
-          * merges the absolute VIT pair, using masks at 0x812f70. */
+         /* The HAL200 fragment record merges the absolute VIT pair into its
+          * first two words. */
          fields->resource_counts | (uint32_t)(fields->varying_table >> 32),
          (uint32_t)fields->varying_table,
          fields->unknown_0c,
@@ -367,9 +364,9 @@ agx_ppp_hal200_output_size_pack(uint32_t count_0, uint32_t count_2,
    if (count_0 > 0xff || count_2 > 0xff)
       return false;
 
-   /* VertexProgramVariant 0x35b314..0x35b328 packs VsStateConfig+0xc/+0x14.
-    * The first field includes all position and user f32 words, as proven by
-    * Apple vs0/vs2/vs4 metadata giving (4,0)/(6,0)/(8,0). */
+   /* The two vertex output counts share this word. The first field includes
+    * all position and user f32 words, as proven by Apple vs0/vs2/vs4 metadata
+    * giving (4,0)/(6,0)/(8,0). */
    *out = count_0 | (count_2 << 16);
    return true;
 }
@@ -386,11 +383,10 @@ agx_ppp_hal200_viewport_count_pack(enum agx_chip chip,
    return true;
 }
 
-/* Native HAL200 setDepthStencilState, 0x458878..0x458894, derives inverted
- * write-enable at bit21 and comparison at bits24..26. 0x458970..0x4589ac
- * merges those fields into both front and back face state. The depth descriptor
- * constructor reads Metal comparison directly at 0x26ab04..0x26ab10; its values
- * are the same eight comparison operations as Vulkan. No stencil bits move.
+/* HAL200 depth state: inverted write-enable at bit21 and comparison at
+ * bits24..26, in both front and back face state. The comparison field takes
+ * the Metal comparison value directly; its values are the same eight
+ * comparison operations as Vulkan. No stencil bits move.
  */
 bool
 agx_ppp_hal200_depth_face_pack(enum agx_chip chip, bool test_enable,
@@ -415,9 +411,8 @@ agx_ppp_hal200_fragment_face_depth_pack(
    if (!out || !agx_chip_native_agx3(chip) || conservative_depth > 3)
       return false;
 
-   /* Native __GPU_LD_MD root2.field4 -> FragmentProgramVariant+0xfcd
-    * (216ba0bac..bd8), then updateFragmentShaderISPState (216c71904..950)
-    * inserts this mode into both SECONDARY face words. Isolated native
+   /* The fragment program's metadata (root 2, field 4) selects this
+    * mode, and it goes into both SECONDARY face words. Isolated native
     * witnesses give ANY=0, GREATER=1, LESS=2, UNCHANGED=3; adding a late
     * atomic to either conservative depth shader changes its mode to ANY. */
    unsigned mode = agx_ppp_fragment_depth_mode(conservative_depth, early_tests,
@@ -426,9 +421,8 @@ agx_ppp_hal200_fragment_face_depth_pack(
    return true;
 }
 
-/* AGXMetalG17P 26aa64..26ab64 constructs the descriptor; 458898..45891c
- * lowers both faces to this layout. The vector shifts/masks at811700/811710
- * route pass/depth-fail/fail/compare to16/19/22/25, respectively. Disabled
+/* G17P stencil face layout, the same for both faces:
+ * pass/depth-fail/fail/compare sit at bits 16/19/22/25, respectively. Disabled
  * stencil is ALWAYS+KEEP with zero masks, exactly the native0x0e000000.
  */
 uint32_t

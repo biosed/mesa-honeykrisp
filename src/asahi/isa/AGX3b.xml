@@ -1,14 +1,13 @@
 <!--
   AGX3b.xml : Apple G15 (M3) / G16 (M4) native GPU instruction set,
-  encoding group A3-b == Apple encoder GPU variant 0.
+  encoding group A3-b (encoder table variant 0).
   Applies to: applegpu_g15s, g15d, g16g, g16p, g16s, g17p, and
   (with G15G-only 2-byte `06 xx` scheduling stalls inserted) g15g.
 
-  Transcribed mechanically from the llvm::AGX3 packed encoder tables
-  inside Apple's MetalToolchain libapplegpu-nt.dylib.
+  Transcribed mechanically from the AGX3 instruction encoding tables.
 
-  Same grammar as Mesa src/asahi/isa/AGX2.xml.  Field names are Apple's
-  numeric field ids (fNN); their semantic names are not in the binary.
+  Same grammar as Mesa src/asahi/isa/AGX2.xml.  Field names are the
+  tables' numeric field ids (fNN); their semantics are not assigned yet.
 -->
 <isa>
   <!--

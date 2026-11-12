@@ -402,3 +402,73 @@ TEST_F(AvailabilityVisibility, opcopymemory_vis)
    EXPECT_EQ(nir_intrinsic_memory_scope(intrinsic), SCOPE_WORKGROUP);
    EXPECT_EQ(nir_intrinsic_execution_scope(intrinsic), SCOPE_NONE);
 }
+
+TEST_F(AvailabilityVisibility, opimageread_vis_opimagewrite_avail_coherent)
+{
+   /*
+    ; Extra arguments for spirv-as --target-env vulkan1.2
+
+                  OpCapability Shader
+                  OpCapability VulkanMemoryModel
+                  OpCapability VulkanMemoryModelDeviceScope
+                  OpMemoryModel Logical Vulkan
+                  OpEntryPoint GLCompute %main "main" %img
+                  OpExecutionMode %main LocalSize 1 1 1
+                  OpDecorate %img DescriptorSet 0
+                  OpDecorate %img Binding 0
+          %void = OpTypeVoid
+            %fn = OpTypeFunction %void
+          %uint = OpTypeInt 32 0
+           %int = OpTypeInt 32 1
+         %v2int = OpTypeVector %int 2
+        %v4uint = OpTypeVector %uint 4
+         %image = OpTypeImage %uint 2D 0 0 0 2 R32ui
+       %ptr_img = OpTypePointer UniformConstant %image
+           %img = OpVariable %ptr_img UniformConstant
+        %device = OpConstant %int 1
+         %int_0 = OpConstant %int 0
+         %coord = OpConstantComposite %v2int %int_0 %int_0
+          %main = OpFunction %void None %fn
+         %entry = OpLabel
+             %i = OpLoad %image %img
+             %t = OpImageRead %v4uint %i %coord NonPrivateTexel|MakeTexelVisible %device
+            %i2 = OpLoad %image %img
+                  OpImageWrite %i2 %coord %t NonPrivateTexel|MakeTexelAvailable %device
+                  OpReturn
+                  OpFunctionEnd
+    */
+   static const uint32_t words[] = {
+      0x07230203, 0x00010500, 0x00070000, 0x00000012, 0x00000000, 0x00020011,
+      0x00000001, 0x00020011, 0x000014e1, 0x00020011, 0x000014e2, 0x0003000e,
+      0x00000000, 0x00000003, 0x0006000f, 0x00000005, 0x00000001, 0x6e69616d,
+      0x00000000, 0x00000002, 0x00060010, 0x00000001, 0x00000011, 0x00000001,
+      0x00000001, 0x00000001, 0x00040047, 0x00000002, 0x00000022, 0x00000000,
+      0x00040047, 0x00000002, 0x00000021, 0x00000000, 0x00020013, 0x00000003,
+      0x00030021, 0x00000004, 0x00000003, 0x00040015, 0x00000005, 0x00000020,
+      0x00000000, 0x00040015, 0x00000006, 0x00000020, 0x00000001, 0x00040017,
+      0x00000007, 0x00000006, 0x00000002, 0x00040017, 0x00000008, 0x00000005,
+      0x00000004, 0x00090019, 0x00000009, 0x00000005, 0x00000001, 0x00000000,
+      0x00000000, 0x00000000, 0x00000002, 0x00000021, 0x00040020, 0x0000000a,
+      0x00000000, 0x00000009, 0x0004003b, 0x0000000a, 0x00000002, 0x00000000,
+      0x0004002b, 0x00000006, 0x0000000b, 0x00000001, 0x0004002b, 0x00000006,
+      0x0000000c, 0x00000000, 0x0005002c, 0x00000007, 0x0000000d, 0x0000000c,
+      0x0000000c, 0x00050036, 0x00000003, 0x00000001, 0x00000000, 0x00000004,
+      0x000200f8, 0x0000000e, 0x0004003d, 0x00000009, 0x0000000f, 0x00000002,
+      0x00070062, 0x00000008, 0x00000010, 0x0000000f, 0x0000000d, 0x00000600,
+      0x0000000b, 0x0004003d, 0x00000009, 0x00000011, 0x00000002, 0x00060063,
+      0x00000011, 0x0000000d, 0x00000010, 0x00000500, 0x0000000b, 0x000100fd,
+      0x00010038,
+   };
+
+   get_nir(sizeof(words) / sizeof(words[0]), words);
+
+   /* MakeTexelVisible/MakeTexelAvailable make the image access itself
+    * visible/available, so the access is coherent at that scope. */
+   nir_intrinsic_instr *load = find_intrinsic(nir_intrinsic_image_deref_load, 0);
+   ASSERT_NE(load, nullptr);
+   EXPECT_NE(nir_intrinsic_access(load) & ACCESS_COHERENT, 0);
+
+   nir_intrinsic_instr *store = find_intrinsic(nir_intrinsic_image_deref_store, 0);
+   ASSERT_NE(store, nullptr);
+   EXPECT_NE(nir_intrinsic_access(store) & ACCESS_COHERENT, 0);
+}

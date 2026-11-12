@@ -25,6 +25,9 @@ struct constant_info {
    /* Number of uses of the constant that could be promoted */
    unsigned nr_promotable_uses;
 
+   /* Order of the constant's first promotable use in the shader */
+   unsigned first_use;
+
    /* If we push, the uniform used */
    uint16_t uniform;
 
@@ -59,7 +62,16 @@ priority_compare(const void *A_, const void *B_)
    /* This is backwards from qsort's documentation, because we want descending
     * order and qsort returns ascending.
     */
-   return constant_priority(*B) - constant_priority(*A);
+   int delta = constant_priority(*B) - constant_priority(*A);
+   if (delta)
+      return delta;
+
+   /* Break ties by first use. The array is gathered from a hash table whose
+    * iteration order depends on the host's pointer width and qsort is not
+    * stable, so without this the uniform assignment, and therefore the
+    * shader binary, would depend on the host the compiler runs on.
+    */
+   return (int)(*A)->first_use - (int)(*B)->first_use;
 }
 
 static void
@@ -71,6 +83,7 @@ record_use(void *memctx, struct hash_table_u64 *constants, uint64_t imm,
    if (!info) {
       info = rzalloc(memctx, struct constant_info);
       info->value = imm;
+      info->first_use = _mesa_hash_table_u64_num_entries(constants);
       _mesa_hash_table_u64_insert(constants, imm, info);
    }
 

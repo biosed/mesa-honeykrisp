@@ -232,7 +232,7 @@ agx_xfb_cpu_applies(struct agx_context *ctx,
 {
    struct agx_uncompiled_shader *vs = ctx->stage[MESA_SHADER_VERTEX].shader;
 
-   return agx_device(ctx->base.screen)->chip == AGX_CHIP_G17G && !indirect &&
+   return agx_chip_g17_m5(agx_device(ctx->base.screen)->chip) && !indirect &&
           vs && vs->xfb_cpu_vs && ctx->attributes &&
           !ctx->stage[MESA_SHADER_GEOMETRY].shader &&
           !ctx->stage[MESA_SHADER_TESS_EVAL].shader;

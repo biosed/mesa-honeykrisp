@@ -26,12 +26,11 @@ agx_ppp_hal300_graphics_core_pack_g18g(
       return false;
 
    if (fields->general_varyings) {
-      /* Apple's widths: a 7-bit binding count
-       * (0x2195dd31c), 8-bit class counts (0x21954bbfc..c5c) and a 4-byte
-       * VIT alignment (0x219f69c20). OUTPUT_SELECT is held to what Gallium
-       * emits: clip planes 0..7, varyings, point size and fragcoord Z.
-       * Native597 executes the same G18 constructor with viewport/layer
-       * outputs: viewport is bit 19; layer requires both bits 19 and 20. */
+      /* Field widths: a 7-bit binding count, 8-bit class counts and a 4-byte
+       * VIT alignment. OUTPUT_SELECT is held to what Gallium emits: clip
+       * planes 0..7, varyings, point size and fragcoord Z. Native597 carries
+       * the same G18 records with viewport/layer outputs: viewport is bit 19;
+       * layer requires both bits 19 and 20. */
       if (chip != AGX_CHIP_G18G || fields->cf_binding_count > 0x7f ||
           ((fields->varying_counts_32 | fields->varying_counts_16) >> 24) ||
           (fields->output_select & ~UINT32_C(0x003d00ff)) ||
@@ -88,7 +87,7 @@ agx_ppp_hal300_graphics_core_pack_g18g(
         fields->object_type != AGX_PPP_HAL300_LINES || fields->line_width > 0xff))
       return false;
 
-   /* Rasterizer discard is read from AGXMetalG18G; G17G has no witness. */
+   /* Rasterizer discard is known on G18G only; G17G has no witness. */
    if (fields->rasterizer_discard && chip != AGX_CHIP_G18G)
       return false;
    /* The written-nothing ISP word is witnessed on G18G only. */
@@ -113,12 +112,12 @@ agx_ppp_hal300_graphics_core_pack_g18g(
       return false;
 
    /* Retain the captured bit 18 for depth-disabled draws. On G18, stencil
-    * testing independently requires BOTH bits 18 and 19, including when
-    * depth testing is enabled. The native state constructor at 0x2194210bc
-    * selects 0xc0000 for either enabled stencil face, and setDepthStencilState
-    * copies both bits into primary ISP control at 0x219660404..0x21966042c.
-    * Setting only bit 19 silently loses stencil tests/updates on combined
-    * depth/stencil draws; stencil-only draws already had bit 18 by accident.
+    * testing independently requires BOTH bits 18 and 19, including when depth
+    * testing is enabled. A depth/stencil state with either stencil face
+    * enabled selects 0xc0000, and binding that state puts both bits into
+    * primary ISP control. Setting only bit 19 silently loses stencil
+    * tests/updates on combined depth/stencil draws; stencil-only draws already
+    * had bit 18 by accident.
     */
    const uint8_t compare = fields->depth_active ? fields->depth_compare : 7;
    const bool write = fields->depth_active && fields->depth_write;
@@ -198,11 +197,10 @@ agx_ppp_hal300_graphics_core_pack_g18g(
        fields->stencil_active ? fields->front_stencil : 0x0e000000,
        fields->stencil_active ? fields->back_stencil : 0x0e000000,
        fields->occlusion_query_index << 17},
-      /* HAL300 updateFragmentShaderISPState (M5/25G76, 4d2b10..4d2b38)
-       * stores pass bits29..31 at context+780c. encodeAndEmitRenderState
-       * loads them at 4e831c (7500+30c), preserves them at 4e83ac..4e83b8,
-       * and emits this secondary record's word1 at 4e83d0. They do not
-       * belong in the primary face record, unlike the HAL200 layout. */
+      /* On HAL300 (M5) the fragment pass type lives in bits 29..31 of this
+       * secondary record's word1, and stays there unchanged across
+       * render-state emission. They do not belong in the primary face record,
+       * unlike the HAL200 layout. */
       {0x02000062, 0x00000200 | (fields->fragment_pass << 29) |
                       (fields->disable_tri_merging || points || lines
                           ? 0x04000000
@@ -235,8 +233,8 @@ agx_ppp_hal300_graphics_core_pack_g18g(
 
    /* Native fragment record uses the same full 48-bit Ioto pair as VDM
     * vertex state. The captured 01000000/00005c1c points to 0x10000170700.
-    * Native setCullMode 4ee1b0..4ee1c4 and setFrontFacingWinding
-    * 4ee73c..4ee750 establish cull bits0..1 and winding bit16 above. */
+    * Metal's cull mode and front-facing winding map to cull bits 0..1 and
+    * winding bit 16 above. */
    memcpy(staged.bytes + staged.offsets[1] + 16, program.bytes, 8);
    *out = staged;
    return true;
@@ -366,7 +364,7 @@ agx_ppp_hal300_graphics_core_pack(
                          (write ? 0 : 0x00200000) | (fields->line_width << 8) |
                          (fields->polygon_mode << 18);
 
-   /* HAL300 setFragmentVariant(nullptr) disables tag writes, clears its
+   /* On HAL300 a draw with no fragment program disables tag writes, clears
     * fragment output mask and selects depth mode 3. Rasterizer discard
     * selects that inert fragment state while the VDM still runs the VS. */
    const uint32_t early_test =
@@ -424,8 +422,8 @@ agx_ppp_hal300_graphics_core_pack(
        fields->stencil_active ? fields->back_stencil : 0x0e000000,
        visibility_query},
 
-      /* Bit 21 is the tag-write disable that setFragmentVariant(nullptr)
-       * selects; a linked fragment that writes no tile needs it as well. */
+      /* Bit 21 is the tag-write disable that a draw with no fragment
+       * program selects; a linked fragment that writes no tile needs it too. */
       {0x02000062, 0x00000200 |
                       (fields->rasterizer_discard ? 0x00200000
                                                 : fields->fragment_pass << 29) |

@@ -234,8 +234,10 @@ test_stamped(void)
    T("stamped fixture defers", deferred(c, post));
    const unsigned before = nstreams(c);
    hk_resolve_deferred_oq_available(c);
-   T("stamped: the render carries the store in the fragment-end slot",
-     slot_is(render, 3, 5));
+   T("stamped: the render carries the store in the vertex-end slot",
+     slot_is(render, 1, 5));
+   T("stamped: the firmware-written fragment-end slot stays free",
+     render->oq_stamp[3].handle == 0);
    T("stamped: the stream is dropped", nstreams(c) == before - 1);
    T("stamped: nothing is dispatched", ndispatched == 0);
 
@@ -254,16 +256,39 @@ test_stamped(void)
      slot_is(render, 1, 7) && slot_is(render, 2, 8));
    T("stamped: no dispatch with API timestamps", ndispatched == 0);
 
-   /* Another occlusion store already rides on the fragment-end slot. */
+   /* Another occlusion store already rides on the vertex-end slot. */
    c = new_cmd();
    render = add(c, false);
-   render->oq_stamp[3] = (struct agx_timestamp_req){.handle = 11, .offset_B = 88};
+   render->oq_stamp[1] = (struct agx_timestamp_req){.handle = 11, .offset_B = 88};
    post = add_post(c, render, 1, 12);
    T("stamped with an occupied slot fixture defers", deferred(c, post));
    hk_resolve_deferred_oq_available(c);
    T("stamped: the store skips the occupied slot",
-     render->oq_stamp[3].handle == 11 && slot_is(render, 1, 12));
+     render->oq_stamp[1].handle == 11 && slot_is(render, 2, 12));
    T("stamped: dropped with an occupied slot", !listed(c, post) && ndispatched == 0);
+
+   /* Three host-written slots carry three stores, vertex start last. */
+   c = new_cmd();
+   render = add(c, false);
+   post = add_post(c, render, 3, 20);
+   T("stamped three fixture defers", deferred(c, post));
+   hk_resolve_deferred_oq_available(c);
+   T("stamped: three stores take slots 1, 2 then 0",
+     slot_is(render, 1, 20) && slot_is(render, 2, 21) &&
+        slot_is(render, 0, 22) && render->oq_stamp[3].handle == 0 &&
+        !listed(c, post) && ndispatched == 0);
+
+   /* A fourth store does not fit: the fragment end is not a candidate even
+    * when free, so the stream keeps its compute store. */
+   c = new_cmd();
+   render = add(c, false);
+   post = add_post(c, render, 4, 30);
+   T("stamped four fixture defers", deferred(c, post));
+   hk_resolve_deferred_oq_available(c);
+   T("stamped: four stores never use the fragment-end slot",
+     render->oq_stamp[3].handle == 0 && render->oq_stamp[1].handle == 0 &&
+        ndispatched == 1 && dispatched[0].cs == post &&
+        dispatched[0].writes == 4);
 }
 
 static void
@@ -413,7 +438,7 @@ test_order(void)
    const unsigned before = nstreams(c);
    hk_resolve_deferred_oq_available(c);
    T("order: every render carries its own store",
-     slot_is(r[0], 3, 1) && slot_is(r[1], 3, 2) && slot_is(r[2], 3, 3));
+     slot_is(r[0], 1, 1) && slot_is(r[1], 1, 2) && slot_is(r[2], 1, 3));
    T("order: all three streams dropped, nothing dispatched",
      nstreams(c) == before - 3 && ndispatched == 0);
 
@@ -492,7 +517,7 @@ test_order(void)
    reset->sync.dep[HK_SYNC_CDM].cut = p[0];
    hk_resolve_deferred_oq_available(c);
    T("order: a reset of the first query keeps only the first store",
-     slot_is(r[1], 3, 2) && !listed(c, p[1]) && ndispatched == 1 &&
+     slot_is(r[1], 1, 2) && !listed(c, p[1]) && ndispatched == 1 &&
         dispatched[0].cs == p[0]);
 }
 
@@ -512,7 +537,7 @@ test_order_forward(void)
    hk_resolve_deferred_oq_available(c);
    T("forward: only the last render carries its store",
      r[0]->oq_stamp[3].handle == 0 && r[1]->oq_stamp[3].handle == 0 &&
-        slot_is(r[2], 3, 3) && !listed(c, p[2]));
+        slot_is(r[2], 1, 3) && !listed(c, p[2]));
    T("forward: the earlier stores are dispatched in order",
      ndispatched == 2 && dispatched[0].cs == p[0] && dispatched[1].cs == p[1]);
    test_chip = AGX_CHIP_G17P;

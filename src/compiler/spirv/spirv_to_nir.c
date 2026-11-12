@@ -4626,6 +4626,9 @@ vtn_handle_image(struct vtn_builder *b, SpvOp opcode,
                                           SpvImageOperandsMakeTexelVisibleMask);
          semantics = SpvMemorySemanticsMakeVisibleMask;
          scope = vtn_constant_uint(b, w[arg]);
+         /* The split barrier below only covers later reads; this read is
+          * itself made visible. */
+         access |= ACCESS_COHERENT;
       }
 
       if (operands & SpvImageOperandsLodMask) {
@@ -4669,6 +4672,9 @@ vtn_handle_image(struct vtn_builder *b, SpvOp opcode,
                                           SpvImageOperandsMakeTexelAvailableMask);
          semantics = SpvMemorySemanticsMakeAvailableMask;
          scope = vtn_constant_uint(b, w[arg]);
+         /* The split barrier below is placed before the write and only
+          * covers earlier writes; this write is itself made available. */
+         access |= ACCESS_COHERENT;
       }
 
       if (operands & SpvImageOperandsLodMask) {

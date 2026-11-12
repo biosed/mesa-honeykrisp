@@ -5,8 +5,8 @@
  * G18G (agx3d) code from the G17G (agx3c) packer.
  *
  * G18G executes the G17G instruction set under a third AGX3 encoding. The
- * field ids of Apple's llvm::AGX3 encoder tables are shared across encodings,
- * and on the 27 G17G/G18G pairs of Apple-compiled witness texts
+ * field ids of the AGX3 instruction encoding tables are shared across
+ * encodings, and on the 27 G17G/G18G pairs of Apple-compiled witness texts
  * (test/native/g18g) the two are one machine:
  *
  *  - every G17G instruction decodes, and all but the texture samples

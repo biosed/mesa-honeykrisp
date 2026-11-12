@@ -652,6 +652,30 @@ vk_queue_drain(struct vk_queue *queue)
    return result;
 }
 
+/* Device loss permits command-buffer teardown, but it does not imply that
+ * the submit worker has stopped reading command-buffer metadata. Unlike drain,
+ * this waits for host submission cleanup even after loss. It never waits for
+ * GPU completion. Drivers using this must have loss-aware WAIT_PENDING waits.
+ */
+void
+vk_queue_wait_lost_submissions(struct vk_queue *queue)
+{
+   assert(vk_device_is_lost_no_report(queue->base.device));
+
+   mtx_lock(&queue->submit.mutex);
+   if (queue->submit.mode == VK_QUEUE_SUBMIT_MODE_THREADED) {
+      while (!list_is_empty(&queue->submit.submits)) {
+         int ret = cnd_wait(&queue->submit.pop, &queue->submit.mutex);
+         if (ret == thrd_error)
+            abort(); /* Continuing would free memory still read by the worker. */
+      }
+   } else if (queue->submit.mode == VK_QUEUE_SUBMIT_MODE_DEFERRED) {
+      vk_queue_set_lost(queue, "Device lost before deferred submission");
+      vk_queue_drop_pending_locked(queue);
+   }
+   mtx_unlock(&queue->submit.mutex);
+}
+
 static VkResult
 vk_queue_submit_final(struct vk_queue *queue,
                       struct vk_queue_submit *submit)
@@ -829,11 +853,19 @@ vk_queue_submit_thread_func(void *_data)
    mtx_lock(&queue->submit.mutex);
 
    while (queue->submit.thread_run) {
+      if (vk_device_is_lost_no_report(queue->base.device)) {
+         vk_queue_set_lost(queue, "Device lost before threaded submission");
+         vk_queue_drop_pending_locked(queue);
+         mtx_unlock(&queue->submit.mutex);
+         return 1;
+      }
+
       if (list_is_empty(&queue->submit.submits)) {
          int ret = cnd_wait(&queue->submit.push, &queue->submit.mutex);
          if (ret == thrd_error) {
-            mtx_unlock(&queue->submit.mutex);
             vk_queue_set_lost(queue, "cnd_wait failed");
+            vk_queue_drop_pending_locked(queue);
+            mtx_unlock(&queue->submit.mutex);
             return 1;
          }
          continue;

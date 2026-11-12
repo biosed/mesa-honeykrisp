@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MIT */
-/* Parameter bytes captured from native AGXMetalG17X 26A428, not calculated
+/* Parameter bytes captured on G17X under macOS 26A428, not calculated
  * by this implementation. See native-dispatch/scs-layout-full-check.json. */
 #include "agx_scs_layout.h"
 #include <assert.h>

@@ -80,8 +80,8 @@ void
 agx_scs_layout_gen1_parameters(const struct agx_scs_layout_gen2 *layout,
                               uint8_t parameters[48])
 {
-   /* AGXMetalG17P finalizeScsParameters publishes the fixed Gen1 window
-    * address and zero level stride, including on a payload-free layout. */
+   /* On G17P the SCS parameters carry the fixed Gen1 window address and zero
+    * level stride, including on a payload-free layout. */
    memset(parameters, 0, 48);
    store32(parameters + 4, 0x6f);
    store32(parameters + 8, layout->end[6]);

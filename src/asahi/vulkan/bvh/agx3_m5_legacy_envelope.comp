@@ -257,12 +257,11 @@ main()
                0x00000101, 0x00010000, 0x00010000, 0x00ff0001, 0x02000000,
                0x01000005, 0x03000000, 1, 0, 0x3f800000, 0, 0, 0, 0, 0, 0);
    if (aabbs && HK_AGX3_GEN1 == 0) {
-      /* Descriptor word 16 selects the native geometry class: Apple's
-       * extractor maps 4 to BVHGeometryBoundingBox (8 is the instance class
-       * and 0/2/10 the triangle classes). Word 20 mirrors word 16 in both
-       * captured triangle and instance descriptors; the remaining words keep
-       * the triangle values, which no native bounding-box capture has yet
-       * confirmed or refuted. */
+      /* Descriptor word 16 selects the native geometry class: 4 is the
+       * bounding-box class (8 is the instance class and 0/2/10 the triangle
+       * classes). Word 20 mirrors word 16 in both captured triangle and
+       * instance descriptors; the remaining words keep the triangle values,
+       * which no native bounding-box capture has yet confirmed or refuted. */
       descriptor[16] = 4;
       descriptor[20] = 4;
    }

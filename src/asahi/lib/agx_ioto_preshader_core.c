@@ -304,12 +304,10 @@ agx_ioto_constant_program_emit(
 
    if (staged.mode == AGX_IOTO_PRESHADER_MODE_EXTERNAL &&
        program->absolute_branch) {
-      /* Current G17P finish() places absolute code_va at object bits 1..48
-       * and sets object bit 0. AGXIotoInstruction_B_0::emit deposits that
-       * selector at instruction bit 24 (f11); target bits occupy 25..71.
-       * cloneProgramInfo changes the code VA without subtracting a B PC.
-       * Witnesses: 0x218780f48/f4c, 0x218737b8c, 0x2188416d8/e0/e4 in
-       * AGXMetalG17P UUID 4A1B0ACE-B7E3-3B5B-A594-84289B937288. */
+      /* On G17P the absolute code_va sits at object bits 1..48 with object bit
+       * 0 set. The B instruction carries that selector at instruction bit 24
+       * (f11); target bits occupy 25..71. Relocating the program changes the
+       * code VA without subtracting a B PC. */
       if (!agx_chip_g17_m5(chip))
          staged.bytes[staged.branch_offset + 3] |= 1;
       else

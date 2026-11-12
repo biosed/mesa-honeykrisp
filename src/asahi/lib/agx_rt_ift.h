@@ -34,8 +34,8 @@ agx_rt_ift_entry_pack(uint8_t out[16], uint64_t address,
    return true;
 }
 
-/* G17P HAL200 Gen1 ordinary user intersection entry. Native setFunction
- * fixes bit 39; it has neither HAL300's variable field6 nor its kind2 mode.
+/* G17P HAL200 Gen1 ordinary user intersection entry. Bit 39 is always
+ * set; it has neither HAL300's variable field6 nor its kind2 mode.
  * This does not construct the built-in driver table or its RIA2 programs.
  */
 static inline bool

@@ -159,6 +159,15 @@ if with_tests
     ),
     suite : ['asahi'],
   )
+  test(
+    'hk_g17p_storage_image',
+    executable(
+      'hk_g17p_storage_image_test',
+      files('tests/test-hk-g17p-storage-image.c'),
+      include_directories : include_directories('.'),
+    ),
+    suite : ['asahi'],
+  )
 
   test(
     'hk_gen1_query_state',
@@ -632,6 +641,12 @@ if with_tests
       inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
     dependencies : [hk_deps], link_with : [libhk],
     link_args : [ld_args_gc_sections]), suite : ['asahi'])
+  test('hk_coherent_image', executable('hk_coherent_image_test',
+    files('tests/test-hk-coherent-image.c'),
+    include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
+      inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [ld_args_gc_sections]), suite : ['asahi'])
   test(
     'hk_rt_pipeline_executable',
     executable(
@@ -982,6 +997,15 @@ if with_tests
   )
 
   executable(
+    'vulkan-tess-batch',
+    files('tests/vulkan_tess_batch.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
+  executable(
     'vulkan-ubo-record-loop',
     files('tests/vulkan_ubo_record_loop.c'),
     include_directories : [inc_include],
@@ -1114,4 +1138,40 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
   test('hk_cpu_upload', hk_cpu_upload_bench, args : ['1'], suite : ['asahi'])
+endif
+
+if with_tests
+  test('hk_submit_admission', executable('hk_submit_admission_test',
+    files('tests/test-hk-submit-admission.c'),
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+    dependencies : [hk_deps], link_with : [libhk]),
+    timeout : 30, suite : ['asahi'])
+endif
+
+if with_tests
+  test('hk_lost_object_submit', executable('hk_lost_object_submit_test',
+    files('tests/test-hk-lost-object-submit.c'),
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+    dependencies : [hk_deps], link_with : [libhk]),
+    timeout : 30, suite : ['asahi'])
+endif
+
+if with_tests
+  test('hk_sparse_submit_wait', executable('hk_sparse_submit_wait_test',
+    files('tests/test-hk-sparse-submit-wait.c'),
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+    dependencies : [hk_deps], link_with : [libhk]),
+    timeout : 30, suite : ['asahi'])
+endif
+
+if with_tests
+  test('hk_queue_sharing', executable('hk_queue_sharing_test',
+    files('tests/test-hk-queue-sharing.c'),
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+    dependencies : [hk_deps], link_with : [libhk]),
+    timeout : 30, suite : ['asahi'])
 endif

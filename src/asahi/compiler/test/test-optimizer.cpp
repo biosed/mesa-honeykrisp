@@ -130,6 +130,36 @@ TEST_F(Optimizer, G17PPreservesHalfNotAfterBitwise)
    }
 }
 
+/* AGX3 FMA has no form with two immediate multiplicands: the first constant
+ * folds as the minifloat multiplier, the second stays in its register. */
+TEST_F(Optimizer, AGX3FmaInlinesOneConstantMultiplicand)
+{
+   for (enum agx_isa_encoding encoding :
+        {AGX_ISA_ENCODING_AGX3B, AGX_ISA_ENCODING_AGX3C}) {
+      agx_builder *actual = agx_test_builder(mem_ctx);
+      agx_builder *expected = agx_test_builder(mem_ctx);
+      struct agx_shader_key key = {};
+      key.dev.encoding = encoding;
+      actual->shader->key = &key;
+      expected->shader->key = &key;
+
+      agx_index one = agx_mov_imm(actual, 16, 0x3c00);
+      agx_index two = agx_mov_imm(actual, 16, 0x4000);
+      agx_index out = agx_temp(actual->shader, AGX_SIZE_32);
+      agx_ffma_to(actual, out, one, two, wx);
+      agx_unit_test(actual, out);
+
+      agx_temp(expected->shader, AGX_SIZE_16); /* the dead mov of 1.0 */
+      two = agx_mov_imm(expected, 16, 0x4000);
+      out = agx_temp(expected->shader, AGX_SIZE_32);
+      agx_ffma_to(expected, out, agx_immediate_f(1.0f), two, wx);
+      agx_unit_test(expected, out);
+
+      agx_optimize_and_dce(actual->shader);
+      ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+   }
+}
+
 TEST_F(Optimizer, G17PPreservesNarrowingAfterAdd)
 {
    agx_builder *actual = agx_test_builder(mem_ctx);

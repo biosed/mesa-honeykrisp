@@ -314,10 +314,9 @@
     <field name="sRGB" size="1" start="108" type="bool"/>
     <field name="sRGB 2-channel" size="1" start="109" type="bool"/>
     <field name="Stride" size="16" start="110" type="hex" modifier="shr(4)"/>
-    <!-- Stride is SIXTEEN bits, word1[61:46]. Apple's
-         AGX::TextureGen4&lt;&gt;::encodeImageReadState masks it with
-         0x3fffc00000000000, transcribed instruction by instruction and checked
-         against a live descriptor. Declaring 18 let a stride needing 17 bits
+    <!-- Stride is SIXTEEN bits, word1[61:46]: the field mask is
+         0x3fffc00000000000, checked bit for bit against a live
+         descriptor. Declaring 18 let a stride needing 17 bits
          run past the field and clobber "Page-aligned layers" (126) and
          "Extended" (127) instead of tripping util_bitpack_uint's range assert.
          Nothing hk builds reaches it today (the widest stride any path
@@ -370,10 +369,9 @@
     <field name="sRGB" size="1" start="108" type="bool"/>
     <field name="sRGB 2-channel" size="1" start="109" type="bool"/>
     <field name="Stride" size="16" start="110" type="hex" modifier="shr(4)"/>
-    <!-- Stride is SIXTEEN bits, word1[61:46]. Apple's
-         AGX::TextureGen4&lt;&gt;::encodeImageReadState masks it with
-         0x3fffc00000000000, transcribed instruction by instruction and checked
-         against a live descriptor. Declaring 18 let a stride needing 17 bits
+    <!-- Stride is SIXTEEN bits, word1[61:46]: the field mask is
+         0x3fffc00000000000, checked bit for bit against a live
+         descriptor. Declaring 18 let a stride needing 17 bits
          run past the field and clobber "Page-aligned layers" (126) and
          "Extended" (127) instead of tripping util_bitpack_uint's range assert.
          Nothing hk builds reaches it today (the widest stride any path
@@ -418,10 +416,9 @@
     <field name="sRGB" size="1" start="108" type="bool"/>
     <field name="sRGB 2-channel" size="1" start="109" type="bool"/>
     <field name="Stride" size="16" start="110" type="hex" modifier="shr(4)"/>
-    <!-- Stride is SIXTEEN bits, word1[61:46]. Apple's
-         AGX::TextureGen4&lt;&gt;::encodeImageReadState masks it with
-         0x3fffc00000000000, transcribed instruction by instruction and checked
-         against a live descriptor. Declaring 18 let a stride needing 17 bits
+    <!-- Stride is SIXTEEN bits, word1[61:46]: the field mask is
+         0x3fffc00000000000, checked bit for bit against a live
+         descriptor. Declaring 18 let a stride needing 17 bits
          run past the field and clobber "Page-aligned layers" (126) and
          "Extended" (127) instead of tripping util_bitpack_uint's range assert.
          Nothing hk builds reaches it today (the widest stride any path
@@ -445,7 +442,7 @@
     <field name="Unk word 3 bits 8-10" size="3" start="200" type="hex"/>
   </struct>
 
-  <!-- PBEStateEncoderGen9, byte-identical on G15 and HAL200. -->
+  <!-- Gen9 PBE descriptor, byte-identical on G15 and HAL200. -->
   <struct name="PBE Gen9" size="32">
     <field name="Dimension" size="4" start="0" type="Texture dimension"/>
     <field name="Layout" size="2" start="4" type="Layout"/>
@@ -479,7 +476,7 @@
     <field name="Reserved word 3" size="64" start="192" type="hex" exact="0"/>
   </struct>
 
-  <!-- PBEStateEncoderGen10 on HAL300 / M5. -->
+  <!-- Gen10 PBE descriptor on HAL300 / M5. -->
   <struct name="PBE Gen10" size="32">
     <field name="Dimension" size="4" start="0" type="Texture dimension"/>
     <field name="Layout" size="2" start="4" type="Layout"/>
@@ -1348,9 +1345,9 @@
     <field name="Block Type" size="3" start="29" type="CDM Block Type" exact="Stream Return"/>
   </struct>
 
-  <!-- ComputeControlFlowEmitterGen1::emitLink surrounds a link with this
+  <!-- An AGX3 compute stream link is surrounded by this
        four-byte type-5 token.  The low three bits carry the bounded padding
-       count; all other payload bits are zero in the pinned AGX3 emitters. -->
+       count; all other payload bits are zero on every AGX3 part. -->
   <struct name="CDM Link Padding AGX3" size="4">
     <field name="Count" size="3" start="0" type="uint"/>
     <field name="Block Type" size="3" start="29" type="CDM Block Type" exact="Unknown 5"/>

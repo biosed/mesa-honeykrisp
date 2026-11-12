@@ -23,6 +23,7 @@
 #include "agx_bo.h"
 #include "hk_buffer.h"
 #include "hk_device.h"
+#include "hk_queue.h"
 #include "hk_device_memory.h"
 #include "hk_entrypoints.h"
 #include "hk_g17p_meta_copy_core.h"
@@ -1861,6 +1862,8 @@ hk_DestroyImage(VkDevice device, VkImage _image,
 
    if (!image)
       return;
+
+   hk_device_quiesce_lost_submissions(dev);
 
    hk_image_finish(dev, image, pAllocator);
    vk_free2(&dev->vk.alloc, pAllocator, image);

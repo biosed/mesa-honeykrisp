@@ -234,6 +234,8 @@ records_replace_stream(struct hk_cmd_buffer *cmd, struct hk_cs *from,
       cmd->sync.pass_tile_first = to;
    if (cmd->sync.pass_tile_last == from)
       cmd->sync.pass_tile_last = to;
+   if (cmd->sync.suspended_last == from)
+      cmd->sync.suspended_last = to;
 }
 
 /*
@@ -837,8 +839,13 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          struct hk_sync_dep cont[HK_SYNC_NUM_SQ] = {0};
          if (st->pass_tile_last)
             cont[hk_sync_sq(st->pass_tile_last)].cut = st->pass_tile_last;
-         if (st->resume_pending)
+         /* An empty suspended instance may have been replaced by compute
+          * clears (hk_optimize_empty_vdm()), so graphics work on either
+          * subqueue can be a producer of what this instance continues. */
+         if (st->resume_pending) {
             cont[HK_SYNC_VDM].prior = HK_SYNC_GFX;
+            cont[HK_SYNC_CDM].prior = HK_SYNC_GFX;
+         }
          hk_sync_stream_wait(cs, cont);
          st->resume_pending = false;
       }
@@ -1245,6 +1252,22 @@ stamp_wait(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    }
 }
 
+/* G17P latches a command's start stamps when the firmware takes the command,
+ * before its barriers resolve: a vkCmdResetQueryPool dispatch followed by a
+ * full ALL_COMMANDS barrier still overwrites the next render's vertex start
+ * stamp most of the time, and dependent start stamps read earlier than the
+ * previous end. Only end stamps are ordered after a command's waits, so
+ * every stamp rides on a command's end: a top-of-pipe stamp (Vulkan 1.3,
+ * 17.5: no first scope) on the end of the last recorded work, which may
+ * latch it at any logically later point.
+ */
+static bool
+start_stamps_ordered(const struct hk_cmd_buffer *cmd)
+{
+   const struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   return !(agx_native_graphics(&dev->dev) && dev->dev.chip == AGX_CHIP_G17P);
+}
+
 static struct hk_cs *
 last_stream(struct hk_cmd_buffer *cmd)
 {
@@ -1305,9 +1328,11 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
 
    if (st->in_pass && gfx) {
       /* Inside a render pass instance the stamp belongs to the render.
-       * Vertex start for an unordered stamp, fragment end otherwise; a
-       * second end stamp is copied from the first after the render. */
-      if (!src_kinds && !gfx->timestamp.start.handle) {
+       * Vertex start for an unordered stamp where start stamps are ordered
+       * (start_stamps_ordered()), fragment end otherwise; a second end
+       * stamp is copied from the first after the render. */
+      if (!src_kinds && !gfx->timestamp.start.handle &&
+          start_stamps_ordered(cmd)) {
          gfx->timestamp.start = req;
          return;
       }
@@ -1336,7 +1361,7 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
       return;
    }
 
-   if (!src_kinds) {
+   if (!src_kinds && start_stamps_ordered(cmd)) {
       hk_sync_flush_pending_timestamp(cmd);
       st->pending_start_ts = req;
       /* A query reset or earlier dispatch may have left a reusable stream.
@@ -1389,6 +1414,13 @@ hk_sync_begin_rendering(struct hk_cmd_buffer *cmd, bool resuming)
    st->pass_fp_count = 0;
    memset(st->pass_tile_wait, 0, sizeof(st->pass_tile_wait));
    st->pass_tile_first = st->pass_tile_last = NULL;
+
+   /* A resuming instance is the same render pass instance as the suspended
+    * one before it: its first stream waits on that instance's last producer,
+    * which can be a compute stream on the other subqueue. */
+   if (resuming)
+      st->pass_tile_last = st->suspended_last;
+   st->suspended_last = NULL;
 }
 
 void
@@ -1403,10 +1435,11 @@ hk_sync_first_render_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 }
 
 void
-hk_sync_end_rendering(struct hk_cmd_buffer *cmd)
+hk_sync_end_rendering(struct hk_cmd_buffer *cmd, bool suspending)
 {
    struct hk_sync_state *st = &cmd->sync;
    st->epoch++;
+   st->suspended_last = suspending ? st->pass_tile_last : NULL;
    pass_footprints_commit(cmd);
    st->in_pass = false;
    memset(st->pass_req, 0, sizeof(st->pass_req));
@@ -1456,6 +1489,7 @@ hk_sync_merge_rendering(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    st->pass_fp_count = 0;
    memset(st->pass_tile_wait, 0, sizeof(st->pass_tile_wait));
    st->pass_tile_first = st->pass_tile_last = cs;
+   st->suspended_last = NULL;
 }
 
 void

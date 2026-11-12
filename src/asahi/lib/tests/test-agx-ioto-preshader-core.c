@@ -440,7 +440,9 @@ check_constant_program_refusals(void)
       {0x1000, 0x2001, 4, true, false, NULL},
       {0x1000, UINT64_C(1) << 48, 4, true, false, NULL},
       {0x1000, UINT64_C(0xfffffffffffe), 4, true, false, NULL},
-      {0x1000, 0x2000, SIZE_MAX - 1, true, false, NULL},
+      /* SIZE_MAX - 1 is at least 2^32 - 2, so this extent runs past the
+       * 48-bit address space for every size_t width. */
+      {0x1000, UINT64_C(0xffff00000004), SIZE_MAX - 1, true, false, NULL},
       {0x1000, 0x2000, 3, true, false, NULL},
       {2, UINT64_C(0x800000000002), 4, true, false, NULL},
       {UINT64_C(0x800000000004), 2, 4, true, false, NULL},

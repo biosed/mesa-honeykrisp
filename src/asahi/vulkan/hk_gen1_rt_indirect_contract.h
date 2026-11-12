@@ -57,7 +57,7 @@ hk_gen1_rt_indirect_contract_init(uint64_t packed,
       .physical_slots = slots, .cliques = cliques,
       .query_base = scs.end[5], .query_stride = stride,
       .driver_end = end, .state_bytes = state,
-      /* Exact ScratchRequest::new native guard expression, not launch size. */
+      /* Exact native scratch-page guard expression, not launch size. */
       .kernel_scs_pages = (end + 2 * 4096 - 1) >> 12,
       .as_table_bytes = HK_GEN1_AS_TABLE_BYTES,
    };

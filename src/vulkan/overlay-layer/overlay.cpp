@@ -534,8 +534,12 @@ static struct swapchain_data *new_swapchain_data(VkSwapchainKHR swapchain,
    list_inithead(&data->draws);
    map_object(HKEY(data->swapchain), data);
 
-   /* Open output file on swapchain creation */
-   assert(instance_data->output_file_fd == NULL);
+   /* Open the output file with the instance's first swapchain. It belongs to
+    * the instance, not to a swapchain: an application recreating its
+    * swapchain creates the new one before destroying the old, and closing the
+    * file with the old one left the new one writing through a NULL FILE.
+    */
+   if (instance_data->params.output_file && !instance_data->output_file_fd) {
    instance_data->output_file_fd =
       fopen(instance_data->params.output_file, "w+");
 
@@ -555,6 +559,7 @@ static struct swapchain_data *new_swapchain_data(VkSwapchainKHR swapchain,
       fprintf(instance_data->output_file_fd, "\n");
    } else
       fprintf(stderr, "ERROR opening output file: %s\n", strerror(errno));
+   }
 
    return data;
 }
@@ -864,7 +869,7 @@ static void snapshot_swapchain_frame(struct swapchain_data *data)
       if (capture_begin ||
           elapsed >= instance_data->params.fps_sampling_period) {
          data->fps = 1000000.0f * data->n_frames_since_update / elapsed;
-         if (instance_data->capture_started) {
+         if (instance_data->capture_started && instance_data->output_file_fd) {
             for (int s = 0; s < OVERLAY_PARAM_ENABLED_MAX; s++) {
                if (!instance_data->params.enabled[s])
                   continue;
@@ -1731,6 +1736,17 @@ static void setup_swapchain_data(struct swapchain_data *data,
    ImGui::GetIO().IniFilename = NULL;
    ImGui::GetIO().DisplaySize = ImVec2((float)data->width, (float)data->height);
 
+   /* MESA_OVERLAY_SCALE: draw the overlay this many times larger, for a
+    * swapchain rendered at a HiDPI output's buffer scale, where the default
+    * 13 px font is half the size it reads at on a scale-1 output. */
+   const char *scale_env = getenv("MESA_OVERLAY_SCALE");
+   const float overlay_scale = scale_env ? strtof(scale_env, NULL) : 1.0f;
+   if (overlay_scale > 1.0f && overlay_scale <= 8.0f) {
+      ImGui::GetIO().FontGlobalScale = overlay_scale;
+      ImGui::GetStyle().ScaleAllSizes(overlay_scale);
+      data->window_size.x *= overlay_scale;
+   }
+
    struct device_data *device_data = data->device;
 
    /* Render pass */
@@ -1916,11 +1932,6 @@ static void overlay_DestroySwapchainKHR(
    if (swapchain == VK_NULL_HANDLE) {
       device_data->vtable.DestroySwapchainKHR(device, swapchain, pAllocator);
       return;
-   }
-
-   if (instance_data->output_file_fd) {
-      fclose(instance_data->output_file_fd);
-      instance_data->output_file_fd = NULL;
    }
 
    struct swapchain_data *swapchain_data =
@@ -2691,6 +2702,8 @@ static void overlay_DestroyInstance(
    struct instance_data *instance_data = FIND(struct instance_data, instance);
    instance_data_map_physical_devices(instance_data, false);
    instance_data->vtable.DestroyInstance(instance, pAllocator);
+   if (instance_data->output_file_fd)
+      fclose(instance_data->output_file_fd);
    destroy_instance_data(instance_data);
 }
 

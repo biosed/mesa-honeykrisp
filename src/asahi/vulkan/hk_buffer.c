@@ -12,6 +12,7 @@
 #include "agx_bo.h"
 #include "agx_device.h"
 #include "hk_device.h"
+#include "hk_queue.h"
 #include "hk_device_memory.h"
 #include "hk_entrypoints.h"
 #include "hk_physical_device.h"
@@ -239,6 +240,12 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
 
       if (!buffer->va) {
          vk_buffer_destroy(&dev->vk, pAllocator, &buffer->vk);
+         /* A replay address that is already taken is the application's
+          * error to handle, not an out-of-memory condition. */
+         if (bda_fixed_addr != 0)
+            return vk_errorf(dev, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
+                             "Capture/replay address %#llx is in use",
+                             (unsigned long long)bda_fixed_addr);
          return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                           "Sparse VMA allocation failed");
       }
@@ -322,7 +329,7 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
       }
    }
 
-   if (buffer->sparse_map) {
+   if (hk_buffer_in_physical_sparse_map(dev, buffer)) {
       VkResult result = hk_update_physical_sparse_map(
          dev, buffer->va->addr, align64(buffer->vk.size, AIL_PAGESIZE), true);
       if (result != VK_SUCCESS) {
@@ -356,7 +363,9 @@ hk_DestroyBuffer(VkDevice device, VkBuffer _buffer,
    if (!buffer)
       return;
 
-   if (buffer->sparse_map)
+   hk_device_quiesce_lost_submissions(dev);
+
+   if (hk_buffer_in_physical_sparse_map(dev, buffer))
       hk_update_physical_sparse_map(dev, buffer->va->addr,
          align64(buffer->vk.size, AIL_PAGESIZE), false);
 

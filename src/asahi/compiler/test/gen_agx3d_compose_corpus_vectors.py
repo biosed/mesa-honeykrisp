@@ -17,9 +17,8 @@ composes back to exactly the instruction's bytes.
 These vectors are a round trip through one table: they prove that the C
 composer, the Python decoder and Apple's bytes agree, but a field-to-bit
 mapping that is wrong yet self-consistent would pass. What vouches for the
-mapping is the table generator (gen_agx3_tables.py), which reproduces the
-independently produced agx3b and agx3c tables byte-exactly from the same
-dylib.
+mapping is that the agx3d table comes from the same generator that
+reproduces the independently produced agx3b and agx3c tables byte-exactly.
 """
 
 import collections

@@ -149,21 +149,6 @@ agx_g17p_configure_rt0_eot_key(enum pipe_format format,
    if (!key)
       return;
 
-   key->g17p_rt0_eot_rgb565 = format == PIPE_FORMAT_R5G6B5_UNORM ||
-                              format == PIPE_FORMAT_B5G6R5_UNORM;
-   key->g17p_rt0_eot_norm16_selector_95 =
-      format == PIPE_FORMAT_R16_UNORM || format == PIPE_FORMAT_R16_SNORM ||
-      format == PIPE_FORMAT_R16G16_UNORM ||
-      format == PIPE_FORMAT_R16G16_SNORM ||
-      format == PIPE_FORMAT_R16G16B16A16_SNORM;
-   key->g17p_rt0_eot_i16_signed_two_words =
-      format == PIPE_FORMAT_R16G16B16A16_SINT ||
-      format == PIPE_FORMAT_R16G16B16X16_SINT;
-   key->g17p_rt0_eot_i32_selector_15 =
-      format == PIPE_FORMAT_R32G32_SINT;
-   key->g17p_rt0_eot_i32_selector_75 =
-      format == PIPE_FORMAT_R32G32_UINT;
-
    key->g17p_rt0_eot_words = 0;
    /* R11G11B10 is a raw I32 word unless the tile keeps M5's packed-float
     * format. G18G gathers its key as G17G (agx_gather_device_key), so

@@ -118,9 +118,12 @@ end_timestamp(struct hk_cmd_buffer *cmd, uint32_t query)
    hk_sync_write_timestamp(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, req);
 }
 
-/* ResetQueryPool leaves a reusable compute stream. TOP_OF_PIPE must become
- * its start stamp before a following dispatch reuses it; otherwise resolving
- * the pending start at BOTTOM_OF_PIPE puts both stamps after the work.
+/* G17P: ResetQueryPool leaves a reusable compute stream. A TOP_OF_PIPE stamp
+ * after it ends that stream's command: G17P start stamps latch before the
+ * command's waits (hk_sync.c, start_stamps_ordered()), so the stamp must not
+ * become the start of the dispatch that reuses the stream, and ending the
+ * reset's command keeps it after the reset. The dispatch gets a command of
+ * its own and the bottom stamp ends it.
  */
 static void
 test_timestamp_reused_compute(void)
@@ -138,31 +141,47 @@ test_timestamp_reused_compute(void)
       const struct agx_timestamp_req start = {
          .handle = 1, .addr = 0x10000, .offset_B = 0};
       hk_sync_write_timestamp(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, start);
-      T("top timestamp requests a check of the reused compute stream",
-        cmd->sync.cs_check_pending);
+      T("top timestamp is no pending start", !cmd->sync.pending_start_ts.handle);
+      T("top timestamp ends the reset's command",
+        reset->timestamp.end.handle == start.handle &&
+        reset->timestamp.end.offset_B == start.offset_B &&
+        !reset->timestamp.start.handle);
+      T("top timestamp closes the reset stream", !cmd->current_cs.cs);
 
-      struct hk_cs *dispatch = hk_cmd_buffer_get_cs(cmd, true);
-      T("timed dispatch reuses the reset stream", dispatch == reset);
-      T("top timestamp is consumed before the reused dispatch",
-        !cmd->sync.pending_start_ts.handle &&
-        dispatch->timestamp.start.handle == start.handle &&
-        dispatch->timestamp.start.offset_B == start.offset_B &&
-        dispatch->timestamp.start.addr == start.addr);
-      /* A broken placement would need another payload-producing stream,
-       * outside this CPU fixture, when recording the end stamp. */
-      if (cmd->sync.pending_start_ts.handle)
-         continue;
-
+      /* The next dispatch opens a stream of its own (the CPU fixture cannot
+       * allocate one through hk_cmd_buffer_get_cs()). */
+      struct hk_cs *dispatch = add(cmd, true);
+      cmd->current_cs.cs = dispatch;
+      T("dispatch takes no start stamp", !dispatch->timestamp.start.handle);
       dispatch->stats.cmds++;
       end_timestamp(cmd, 1);
       T("bottom timestamp ends the dispatch's command",
         dispatch->timestamp.end.handle == 1 &&
         dispatch->timestamp.end.offset_B == 8);
-      T("timestamp pair needs no extra compute command",
-        list_is_singular(&cmd->control_streams));
       T("bottom timestamp closes the timed stream", !cmd->current_cs.cs);
       T("timed reset and dispatch resolve", submit(new_queue(exact), cmd));
    }
+}
+
+/* G17P: a TOP_OF_PIPE stamp inside a render pass instance ends the render
+ * (fragment end), never its vertex start: G17P start stamps latch before the
+ * render's waits, so a query reset before the pass could overwrite one. */
+static void
+test_timestamp_top_in_pass(void)
+{
+   struct hk_cmd_buffer *cmd = timestamp_cmd(AGX_CHIP_G17P, true);
+   hk_sync_begin_rendering(cmd, false);
+   struct hk_cs *render = test_alloc(sizeof(*render));
+   render->type = HK_CS_VDM;
+   list_addtail(&render->node, &cmd->control_streams);
+   hk_sync_stream_created(cmd, render, &cmd->current_cs.gfx, false);
+   cmd->current_cs.gfx = render;
+   render->stats.cmds++;
+   const struct agx_timestamp_req top = {.handle = 1, .addr = 0x10000, .offset_B = 0};
+   hk_sync_write_timestamp(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, top);
+   T("in-pass top stamp ends the render",
+     render->timestamp.end.handle == 1 && render->timestamp.end.offset_B == 0);
+   T("in-pass top stamp takes no vertex start", !render->timestamp.start.handle);
 }
 
 /* Exercise actual timestamp placement, barriers and the submission resolver.
@@ -362,7 +381,7 @@ render_pass(struct hk_cmd_buffer *cmd, const void *image, uint32_t layers,
    cs->type = HK_CS_VDM;
    hk_sync_stream_created(cmd, cs, &cmd->current_cs.gfx, false);
    list_addtail(&cs->node, &cmd->control_streams);
-   hk_sync_end_rendering(cmd);
+   hk_sync_end_rendering(cmd, false);
    return cs;
 }
 
@@ -498,11 +517,11 @@ test_xfer_write_order(void)
    T("the ordered note is dropped", !hk_sync_xfer_pending(&cmd->sync));
    cmd->current_cs.pre_gfx = NULL;
    cmd->current_cs.gfx = NULL;
-   hk_sync_end_rendering(cmd);
+   hk_sync_end_rendering(cmd, false);
    hk_sync_begin_rendering(cmd, false);
    struct hk_cs *gfx2 = add(cmd, false);
    T("later graphics stays ordered", gfx2->sync.dep[HK_SYNC_CDM].cut == xfer);
-   hk_sync_end_rendering(cmd);
+   hk_sync_end_rendering(cmd, false);
    struct hk_queue *queue = new_queue(true);
    T("ordered transfer resolves", submit(queue, cmd));
    T("pre-graphics waits for the exact transfer ordinal",
@@ -520,7 +539,7 @@ test_xfer_write_order(void)
         gfx->sync.dep_ta[HK_SYNC_CDM].cut == xfer);
    T("robustness does not import earlier command buffers",
      cmd->sync.req[0][HK_SYNC_CDM].prior == 0);
-   hk_sync_end_rendering(cmd);
+   hk_sync_end_rendering(cmd, false);
 
    /* Dependencies the application records into graphics stages. */
    const uint8_t gfx_dsts[] = {HK_SYNC_GFX, HK_SYNC_GFX_FRAG,
@@ -671,8 +690,54 @@ compute_clear_pass(struct hk_cmd_buffer *cmd, const void *image,
    hk_sync_forget_stream(cmd, render);
    list_del(&render->node);
    if (end)
-      hk_sync_end_rendering(cmd);
+      hk_sync_end_rendering(cmd, false);
    return clear;
+}
+
+/* An empty suspended instance whose render was replaced by a compute clear:
+ * the resuming instance continues the same render pass and loads what the
+ * clear wrote, whatever its footprint. */
+static void
+test_resume_after_compute_clear(void)
+{
+   const void *image = (void *)0x4321;
+   struct hk_cmd_buffer *cmd = new_cmd();
+   struct hk_cs *clear = compute_clear_pass(cmd, image, 0, false);
+   hk_sync_end_rendering(cmd, true);
+   hk_sync_begin_rendering(cmd, true);
+   hk_sync_pass_footprint(cmd, image, 0, 0, 1, 32, 32,
+                          (VkRect2D){{0, 0}, {32, 32}}, false);
+   hk_sync_pass_footprints_done(cmd);
+   struct hk_cs *resumed = add(cmd, false);
+   T("resumed instance waits on the suspended instance's compute clear",
+     resumed->sync.dep[HK_SYNC_CDM].cut == clear);
+   struct hk_cs *next = add(cmd, false);
+   T("later streams of the resumed instance chain on it",
+     next->sync.dep[HK_SYNC_VDM].cut == resumed);
+   hk_sync_end_rendering(cmd, false);
+   T("resume after compute clear submit", submit(new_queue(true), cmd));
+   T("resumed instance resolves to the clear's compute prefix",
+     resumed->sync.barrier[HK_SYNC_CDM] == clear->sync.index);
+
+   /* A new instance is not a continuation: a whole-tile pass keeps
+    * overlapping the earlier one. */
+   cmd = new_cmd();
+   compute_clear_pass(cmd, image, 0, true);
+   hk_sync_begin_rendering(cmd, false);
+   struct hk_cs *fresh = add(cmd, false);
+   T("a new instance does not wait as a continuation",
+     fresh->sync.dep[HK_SYNC_CDM].cut == NULL);
+   hk_sync_end_rendering(cmd, false);
+
+   /* Resumed in a later command buffer: earlier graphics work on both
+    * subqueues may have produced the attachments. */
+   cmd = new_cmd();
+   hk_sync_begin_rendering(cmd, true);
+   resumed = add(cmd, false);
+   T("cross-buffer resume waits on earlier graphics on both subqueues",
+     (resumed->sync.dep[HK_SYNC_VDM].prior & HK_SYNC_GFX) &&
+        (resumed->sync.dep[HK_SYNC_CDM].prior & HK_SYNC_GFX));
+   hk_sync_end_rendering(cmd, false);
 }
 
 static void
@@ -812,7 +877,7 @@ test_compute_clear_layer_preservation(void)
    list_addtail(&continued->node, &cmd->control_streams);
    T("render continuation waits on replaced clear",
      continued->sync.dep[HK_SYNC_CDM].cut == clear);
-   hk_sync_end_rendering(cmd);
+   hk_sync_end_rendering(cmd, false);
 }
 
 /* XFB counter copies can precede creation of their consuming render stream.
@@ -846,7 +911,7 @@ test_pass_software_graphics_dependencies(void)
      !pre->sync.dep[HK_SYNC_VDM].cut);
    T("render still waits on its new pre-graphics producer",
      render->sync.dep[HK_SYNC_CDM].cut == pre);
-   hk_sync_end_rendering(local);
+   hk_sync_end_rendering(local, false);
    struct hk_queue *local_queue = new_queue(true);
    T("local barrier and later software draw resolve without cycle",
      submit(local_queue, local));
@@ -862,7 +927,7 @@ test_pass_software_graphics_dependencies(void)
      pre->sync.dep[HK_SYNC_VDM].cut == external);
    T("local requirement does not replace producer's external source",
      pre->sync.dep[HK_SYNC_VDM].cut != render);
-   hk_sync_end_rendering(local);
+   hk_sync_end_rendering(local, false);
    local_queue = new_queue(true);
    T("external and local requirements resolve without cycle",
      submit(local_queue, local));
@@ -888,7 +953,7 @@ test_pass_software_graphics_dependencies(void)
    T("second render consumes already-open resumed capture",
      second->sync.dep[HK_SYNC_CDM].cut == resume &&
      second->sync.dep_ta[HK_SYNC_CDM].cut == resume);
-   hk_sync_end_rendering(cmd);
+   hk_sync_end_rendering(cmd, false);
    cmd->current_cs.gfx = cmd->current_cs.pre_gfx = NULL;
    struct hk_cs *outside = add(cmd, false);
    T("self-dependency has no scope after the pass",
@@ -915,7 +980,7 @@ test_pass_software_graphics_dependencies(void)
      !unrelated->sync.dep[HK_SYNC_VDM].cut &&
      !unrelated->sync.dep[HK_SYNC_CDM].prior &&
      !unrelated->sync.dep[HK_SYNC_VDM].prior);
-   hk_sync_end_rendering(cmd);
+   hk_sync_end_rendering(cmd, false);
 
    cmd = new_cmd();
    struct hk_cs *clear = compute_clear_pass(cmd, (void *)0x1234, 0, false);
@@ -924,7 +989,7 @@ test_pass_software_graphics_dependencies(void)
    T("self-dependency follows an empty render replaced by compute clear",
      after_clear->sync.dep[HK_SYNC_CDM].cut == clear &&
      !after_clear->sync.dep[HK_SYNC_VDM].cut);
-   hk_sync_end_rendering(cmd);
+   hk_sync_end_rendering(cmd, false);
 }
 
 /* Kernels without per-command input syncs attach the ioctl's waits to the
@@ -1322,6 +1387,7 @@ main(void)
    test_barrier_chains_without_work();
    test_multiview_layer_preservation();
    test_compute_clear_layer_preservation();
+   test_resume_after_compute_clear();
    test_loaded_color_preservation();
    test_pass_software_graphics_dependencies();
    test_image_barrier_vertex_class();
@@ -1329,6 +1395,7 @@ main(void)
    test_rt_kernel_gate();
    test_timestamp_execution_scopes();
    test_timestamp_reused_compute();
+   test_timestamp_top_in_pass();
    {
       /* A submission longer than the 16-bit barrier field: a wait on a
        * command past it is named by its ordinal (that command went in an

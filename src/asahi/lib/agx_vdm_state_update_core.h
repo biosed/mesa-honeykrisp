@@ -131,10 +131,10 @@ struct agx_vdm_state_update_program_info {
 };
 
 /*
- * Exact renderer-side selector inputs.  The low bit is loaded from
- * RenderPipeline+0x2f0, which the pipeline constructor populates from
- * isRasterizationEnabled.  The provoking selector is the exact stored
- * renderer value, whose accepted domain is 0..2.  The pinned renderer computes
+ * Exact renderer-side selector inputs.  The low bit is the pipeline's
+ * rasterization-enabled property, fixed when the pipeline is built. The
+ * provoking selector is the exact stored renderer value, whose accepted domain
+ * is 0..2.  The renderer computes
  *
  *   variant = rasterization_enabled |
  *             (raw_provoking_selector << 1)

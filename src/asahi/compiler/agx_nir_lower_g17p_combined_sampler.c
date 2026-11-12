@@ -18,12 +18,14 @@
 #include <stdio.h>
 
 /* Pre-raster graphics stages have no implicit derivatives. Their Poly
- * compute variants use the same native explicit-LOD texture operations. */
+ * compute variants use the same native explicit-LOD texture operations, and
+ * so does the VDM-launched G17P mesh program. */
 static bool
 g17p_explicit_lod_stage(mesa_shader_stage stage)
 {
    return stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_GEOMETRY ||
-          stage == MESA_SHADER_TESS_CTRL || stage == MESA_SHADER_TESS_EVAL;
+          stage == MESA_SHADER_TESS_CTRL || stage == MESA_SHADER_TESS_EVAL ||
+          stage == MESA_SHADER_MESH;
 }
 
 /* M5 TA programs (API mesh and object/task) have no fragment derivatives and

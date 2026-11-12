@@ -634,6 +634,9 @@ typedef struct {
    /* Does the shader statically use scratch memory? */
    bool any_scratch;
 
+   /* Interlock waits guard memory, not the tilebuffer, so keep them. */
+   bool any_interlock;
+
    /* Mask of pixel fences we've definitely already waited for. */
    uint16_t already_pixel_waited;
 
@@ -1325,6 +1328,7 @@ void agx_pack_binary(agx_context *ctx, struct util_dynarray *emission);
  * encoding. */
 bool agx3_g17p_interleaved_zs(const agx_context *ctx);
 bool agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission);
+bool agx3_interp_coords_from_itrcoords(const agx_context *ctx);
 const char *agx3_last_pack_refusal(void);
 
 #ifndef NDEBUG
@@ -1429,6 +1433,7 @@ void agx_liveness_ins_update(struct u_sparse_bitset *live, agx_instr *I);
 
 bool agx_nir_opt_preamble(nir_shader *s, unsigned *sizes, bool g17p,
                           bool agx3c);
+bool agx_nir_export_select_flags_as_halves(nir_shader *s, bool branches);
 bool agx_nir_remove_unused_preamble_exports(nir_shader *s, unsigned reserved);
 bool agx_nir_coalesce_preamble_half_exports(nir_shader *s, unsigned reserved,
                                           unsigned allocated);

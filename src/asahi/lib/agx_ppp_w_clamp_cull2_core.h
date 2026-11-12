@@ -40,10 +40,10 @@ struct agx_ppp_w_clamp_cull2_core {
  *   u32 lossless Cull-2 payload
  *
  * G15G/G15X, G16G/G16X, and G17P emit 0x00410000.  G17G/G17X emit
- * 0x00840002.  The seven default paths respectively load the first two words
- * at 0x211159ec4, 0x212aef5f8, 0x214963738, 0x2157b96e8, 0x216c73748,
- * 0x21607c824, and 0x217815ee0, then store the third word and advance exactly
- * 12 bytes.  Their default complete witnesses are:
+ * 0x00840002.  On all seven the default record is the first two words
+ * followed by the third, exactly 12 bytes.
+ *
+ * Their default complete witnesses are:
  *
  *   Gen6: 00 00 41 00 00 00 00 00 80 00 00 00
  *   Gen7: 02 00 84 00 00 00 00 00 80 00 00 00

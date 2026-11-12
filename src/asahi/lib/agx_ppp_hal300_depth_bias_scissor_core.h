@@ -70,7 +70,7 @@ struct agx_ppp_hal300_depth_bias_scissor_bases {
  *               f32 min Z, f32 max Z
  *
  * The PPP reference block is new.  Both initial render-state emission and a
- * FlexiblePSOUpdateToken emit these five words in exactly this order:
+ * later pipeline-state update emit these five words in exactly this order:
  *
  *   u32 header = bits 8 | 9
  *   u32 depth bias base bits 32..47 in bits 16..31
@@ -78,14 +78,11 @@ struct agx_ppp_hal300_depth_bias_scissor_bases {
  *   u32 scissor base bits 32..47 in bits 16..31
  *   u32 scissor base bits 0..31
  *
- * G17X RenderContext initialization at 0x21783a534 stores 0x300 at
- * impl+0x79ec; its direct emitter at 0x217815f50 copies all 20 bytes.  The
- * G17G counterparts at 0x2160a0e48 and 0x21607c894 have the same geometry.
- * G17X FlexiblePSOUpdateToken::emit at 0x2177245a4 consumes selector bit 8
- * before bit 9 and copies the two base pairs in that order.  In contrast,
- * G15G_B0 stores the scissor and depth-bias indices at impl+0x7a00 and
- * impl+0x7a02 (0x21115e8d8 and 0x21119bd10), and G16G does likewise in
- * handleScissorUpdates/handleDepthBiasUpdates (0x214968560/0x214968284).
+ * On G17X a render starts with header 0x300 and all 20 bytes of the block;
+ * G17G has the same geometry.  A pipeline-state update handles selector
+ * bit 8 before bit 9 and writes the two base pairs in that order.  In
+ * contrast, G15G_B0 and G16G carry scissor and depth-bias indices rather
+ * than base addresses.
  *
  * G18G is admitted too: every J873 native render points its VDM at this
  * five-word block, e.g. 00000300 01000000 002d0000 0 0 in the colour mode.

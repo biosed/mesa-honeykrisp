@@ -40,11 +40,11 @@ enum ail_tiling {
    /**
     * G17P Interchange (descriptor Layout 3): 16x16-element macroblocks in
     * row-major order, row pitch ceil(width / 16) * 256 * blocksize; inside a
-    * macroblock, 8x4 blocks in row-major order, each x-first Morton
-    * (AGXMetalG17P InterchangeTiledMemory).  This is the layout the display
-    * coprocessor scans out as an address-format-5 surface.  Always lossless
-    * compressed (8 bytes of metadata per macroblock, as for GPU tiling).
-    * Single level, single layer, single sample, 32-bit formats only.
+    * macroblock, 8x4 blocks in row-major order, each x-first Morton. This is
+    * the layout the display coprocessor scans out as an address-format-5
+    * surface.  Always lossless compressed (8 bytes of metadata per macroblock,
+    * as for GPU tiling). Single level, single layer, single sample, 32-bit
+    * formats only.
     */
    AIL_TILING_INTERCHANGE,
 };

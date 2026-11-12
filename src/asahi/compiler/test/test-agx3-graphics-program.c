@@ -778,7 +778,15 @@ main(void)
    CHECK(!agx3_g17p_fragment_blend_constant_base(AGX_CHIP_G17P, 505,
                                                   &blend_base));
    CHECK(blend_base == valid_blend_base);
-   CHECK(!agx3_g17p_fragment_blend_constant_base(AGX_CHIP_G17S, 16,
+   /* The M5 parts (G17G, G17S, G17C) take the same placement; a pre-AGX3
+    * chip is refused and leaves the output alone. */
+   for (enum agx_chip m5 = AGX_CHIP_G17G; m5 <= AGX_CHIP_G17C;
+        m5 = (enum agx_chip)(m5 + 1)) {
+      uint16_t m5_base = UINT16_C(0xa5a5);
+      CHECK(agx3_g17p_fragment_blend_constant_base(m5, 16, &m5_base));
+      CHECK(m5_base == 16);
+   }
+   CHECK(!agx3_g17p_fragment_blend_constant_base(AGX_CHIP_G13G, 16,
                                                   &blend_base));
    CHECK(blend_base == valid_blend_base);
    CHECK(!agx3_g17p_fragment_blend_constant_base(AGX_CHIP_G17P, 16, NULL));

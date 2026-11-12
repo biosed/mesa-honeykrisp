@@ -123,12 +123,12 @@ g17p_fragment_pixrel_compose(unsigned colour_classes,
 
 /* Background programs do not inherit the ordinary fragment release mask.
  * Valid 20260904-194053 doorbell 1 BG and partial-BG Ioto both emit this
- * record at +0x1de. AGXMetalG17P's BackgroundObject ESL constructor reads
- * __GPU_METADATA_2 root field 1 into encoder+0xac (arm64e 0x3c49f8..3c4a78),
- * then ESLStateLoadEncoderGen2::finish serializes that value as PIXREL
- * (0x32cbd0..32ccc8). The BG value is 0x200, versus ordinary FS 0x2f3.
- * This form is for the bounded internal clear/reload shaders compiled with
- * ignore_tib_dependencies, not arbitrary shaders that own pixel waits.
+ * record at +0x1de. On G17P a background program's PIXREL value comes
+ * from root field 1 of its __GPU_METADATA_2 section.
+ *
+ * The BG value is 0x200, versus ordinary FS 0x2f3. This form is for the
+ * bounded internal clear/reload shaders compiled with ignore_tib_dependencies,
+ * not arbitrary shaders that own pixel waits.
  */
 static const uint8_t g17p_background_pixrel[] = {
    0x07, 0x02, 0x54, 0x00, 0x02, 0x00,
@@ -1451,7 +1451,7 @@ agx_ioto_m5_resource_program_compose_classes(
                               stage == AGX_IOTO_G17G_PROGRAM_BACKGROUND;
    if (stage == AGX_IOTO_G17G_PROGRAM_FRAGMENT ||
        stage == AGX_IOTO_G17G_PROGRAM_COVERAGE_FRAGMENT) {
-      /* HAL300 PIXREL::emit for 0x2ff with the shader's colour classes
+      /* HAL300 PIXREL for 0x2ff with the shader's colour classes
        * removed. Sparse targets retain their own class pair. */
       static const uint8_t release[8][6] = {
          {0},

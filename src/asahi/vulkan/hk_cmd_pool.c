@@ -29,7 +29,13 @@ struct hk_vdm_slab {
 #include "hk_entrypoints.h"
 #include "hk_physical_device.h"
 
+#include <errno.h>
 #include <string.h>
+#include <unistd.h>
+#include <xf86drm.h>
+#include "util/libsync.h"
+#include "util/u_atomic.h"
+#include "vk_queue.h"
 
 static void
 hk_g17p_vdm_alias_free(struct agx_device *dev, uint64_t alias, uint64_t size);
@@ -87,11 +93,14 @@ hk_cmd_bo_create(struct hk_cmd_pool *pool, enum hk_cmd_bo_type type,
 {
    struct hk_device *dev = hk_cmd_pool_device(pool);
    struct hk_cmd_bo *bo;
-   const VkAllocationCallbacks *alloc = &pool->vk.alloc;
+   /* Internal backing metadata can outlive the API command pool. */
+   const VkAllocationCallbacks *alloc = &dev->vk.alloc;
 
    bo = vk_zalloc(alloc, sizeof(*bo), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (bo == NULL)
       return vk_error(pool, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   bo->refcount = 1;
 
    static const char *labels[HK_CMD_BO_TYPE_COUNT] = {
       [HK_CMD_BO_MAIN] = "Main command pool",
@@ -134,12 +143,14 @@ hk_cmd_bo_create(struct hk_cmd_pool *pool, enum hk_cmd_bo_type type,
 }
 
 static void
-hk_cmd_bo_destroy(struct hk_device *dev, const VkAllocationCallbacks *alloc,
+hk_cmd_bo_destroy(struct hk_device *dev, UNUSED const VkAllocationCallbacks *alloc,
                    struct hk_cmd_bo *bo)
 {
+   if (!p_atomic_dec_zero(&bo->refcount))
+      return;
    if (bo->span) {
       hk_device_free_span(dev, bo->span);
-      vk_free(alloc, bo);
+      vk_free(&dev->vk.alloc, bo);
       return;
    }
 
@@ -151,7 +162,7 @@ hk_cmd_bo_destroy(struct hk_device *dev, const VkAllocationCallbacks *alloc,
          hk_g17p_vdm_alias_free(&dev->dev, bo->g17p_vdm_alias, bo->bo->size);
    }
    agx_bo_unreference(&dev->dev, bo->bo);
-   vk_free(alloc, bo);
+   vk_free(&dev->vk.alloc, bo);
 }
 
 static struct hk_vdm_slab *
@@ -272,6 +283,7 @@ hk_cmd_pool_alloc_span(struct hk_cmd_pool *pool, enum hk_cmd_slab_class class,
 
    owner->spans++;
    *lease = (struct hk_vdm_allocation){
+      .refcount = 1,
       .slab = owner,
       .addr = addr,
       .alias = owner->alias ? owner->alias + (addr - owner->bo->va->addr) : 0,
@@ -299,7 +311,8 @@ hk_cmd_pool_alloc_bo_span(struct hk_cmd_pool *pool, enum hk_cmd_bo_type type,
       }
    }
 
-   const VkAllocationCallbacks *alloc = &pool->vk.alloc;
+   struct hk_device *dev = hk_cmd_pool_device(pool);
+   const VkAllocationCallbacks *alloc = &dev->vk.alloc;
    struct hk_cmd_bo *bo =
       vk_zalloc(alloc, sizeof(*bo), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (bo == NULL)
@@ -314,6 +327,7 @@ hk_cmd_pool_alloc_bo_span(struct hk_cmd_pool *pool, enum hk_cmd_bo_type type,
       return result;
    }
 
+   bo->refcount = 1;
    bo->bo = bo->span->slab->bo;
    bo->map = ptr.cpu;
    bo->addr = ptr.gpu;
@@ -325,7 +339,7 @@ hk_cmd_pool_alloc_bo_span(struct hk_cmd_pool *pool, enum hk_cmd_bo_type type,
 void
 hk_device_free_span(struct hk_device *dev, struct hk_vdm_allocation *allocation)
 {
-   if (!allocation)
+   if (!allocation || !p_atomic_dec_zero(&allocation->refcount))
       return;
 
    struct hk_vdm_slab *slab = allocation->slab;
@@ -599,7 +613,11 @@ hk_cmd_pool_free_bo_list(struct hk_cmd_pool *pool, enum hk_cmd_bo_type type,
 
    list_for_each_entry_safe(struct hk_cmd_bo, bo, bos, link) {
       list_del(&bo->link);
-      if (bo->span && pool->num_free_spans[type] < HK_CMD_POOL_BO_MAX) {
+      if (p_atomic_read(&bo->refcount) != 1) {
+         /* Drop recording ownership, but never put pending bytes in either
+          * pool reuse list. Submission pins also retain aliases and spans. */
+         hk_cmd_bo_destroy(hk_cmd_pool_device(pool), &pool->vk.alloc, bo);
+      } else if (bo->span && pool->num_free_spans[type] < HK_CMD_POOL_BO_MAX) {
          list_add(&bo->link, &pool->free_spans[type]);
          pool->num_free_spans[type]++;
       } else if (bo->span || pool->num_free_bos[type] >= max_free) {
@@ -644,4 +662,329 @@ hk_cmd_pool_clean_vdm(const struct hk_vdm_allocation *allocation)
    util_flush_range_no_fence(
       (uint8_t *)slab->map + (allocation->addr - slab->bo->va->addr),
       allocation->size);
+}
+
+/* One immutable resource snapshot per driver submission. An occurrence on
+ * another queue takes independent pins; no scalar "last reader" is used.
+ */
+enum hk_cmd_pin_kind {
+   HK_PIN_BO,
+   HK_PIN_SPAN,
+   HK_PIN_LARGE,
+};
+
+struct hk_cmd_pin {
+   enum hk_cmd_pin_kind kind;
+   void *object;
+};
+
+struct hk_cmd_pending {
+   struct list_head link;
+
+   /* One private binary syncobj per submit ioctl, whether its fence is
+    * already known to have signalled without error, and scratch space for
+    * polling the others. Polling holds cmd_pending_lock.
+    */
+   uint32_t *signals;
+   uint32_t *unknown;
+   bool *succeeded;
+   unsigned chunks, attempted;
+
+   unsigned count;
+   struct hk_cmd_pin pins[];
+};
+
+static void
+hk_cmd_add_pin(struct hk_cmd_pin *pins, size_t *count,
+               enum hk_cmd_pin_kind kind, void *object)
+{
+   if (pins)
+      pins[*count] = (struct hk_cmd_pin){kind, object};
+   ++*count;
+}
+
+/* Count first, then fill a preallocated array. No fallible allocation may
+ * happen after acquiring only a subset of the references. Repeated command
+ * buffers are intentional: each occurrence gets balanced references.
+ */
+static size_t
+hk_cmd_collect_pins(const struct vk_queue_submit *submit,
+                    struct hk_cmd_pin *pins)
+{
+   size_t count = 0;
+
+   for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
+      struct hk_cmd_buffer *cmd = (void *)submit->command_buffers[i];
+      struct list_head *lists[] = {
+         &cmd->uploader.main.bos,
+         &cmd->uploader.usc.bos,
+         &cmd->uploader.root.bos,
+      };
+
+      /* uploader.streams uses main.bos; uploader.vdm owns the leases below. */
+      for (unsigned l = 0; l < ARRAY_SIZE(lists); ++l) {
+         list_for_each_entry(struct hk_cmd_bo, bo, lists[l], link)
+            hk_cmd_add_pin(pins, &count, HK_PIN_BO, bo);
+      }
+
+      list_for_each_entry(struct hk_vdm_allocation, span,
+                          &cmd->vdm_allocations, link)
+         hk_cmd_add_pin(pins, &count, HK_PIN_SPAN, span);
+
+      if (cmd->ioto.span)
+         hk_cmd_add_pin(pins, &count, HK_PIN_SPAN, cmd->ioto.span);
+
+      util_dynarray_foreach(&cmd->large_bos, struct agx_bo *, bo)
+         hk_cmd_add_pin(pins, &count, HK_PIN_LARGE, *bo);
+
+      /* Native M5 only so far. The separate G17P AS-table allocator needs
+       * its own ownership pin before enabling it there.
+       */
+      assert(list_is_empty(&cmd->gen1_as_table_chunks));
+   }
+
+   return count;
+}
+
+static void
+hk_cmd_pin_ref(struct hk_cmd_pin pin)
+{
+   switch (pin.kind) {
+   case HK_PIN_BO:
+      p_atomic_inc(&((struct hk_cmd_bo *)pin.object)->refcount);
+      break;
+   case HK_PIN_SPAN:
+      p_atomic_inc(&((struct hk_vdm_allocation *)pin.object)->refcount);
+      break;
+   case HK_PIN_LARGE:
+      agx_bo_reference(pin.object);
+      break;
+   }
+}
+
+static struct agx_bo *
+hk_cmd_pin_backing(struct hk_cmd_pin pin)
+{
+   switch (pin.kind) {
+   case HK_PIN_BO:
+      return ((struct hk_cmd_bo *)pin.object)->bo;
+   case HK_PIN_SPAN:
+      return ((struct hk_vdm_allocation *)pin.object)->slab->bo;
+   case HK_PIN_LARGE:
+      return pin.object;
+   }
+   UNREACHABLE("command pin kind");
+}
+
+static void
+hk_cmd_pending_release(struct hk_device *dev, struct hk_cmd_pending *p,
+                       bool teardown)
+{
+   for (unsigned i = 0; i < p->count; ++i) {
+      struct hk_cmd_pin pin = p->pins[i];
+
+      /* Teardown is not a success witness. Do not make uncertain backing
+       * available to the BO cache, even briefly while other objects die.
+       * Kernel-owned mapping pins, not an error fence, protect GPU accesses
+       * after the final userspace reference is dropped.
+       */
+      if (teardown)
+         hk_cmd_pin_backing(pin)->flags |= AGX_BO_NO_CACHE;
+
+      switch (pin.kind) {
+      case HK_PIN_BO:
+         hk_cmd_bo_destroy(dev, &dev->vk.alloc, pin.object);
+         break;
+      case HK_PIN_SPAN:
+         hk_device_free_span(dev, pin.object);
+         break;
+      case HK_PIN_LARGE:
+         agx_bo_unreference(&dev->dev, pin.object);
+         break;
+      }
+   }
+
+   for (unsigned i = 0; i < p->chunks; ++i)
+      drmSyncobjDestroy(dev->dev.fd, p->signals[i]);
+
+   vk_free(&dev->vk.alloc, p->signals);
+   vk_free(&dev->vk.alloc, p);
+}
+
+enum hk_cmd_pending_state {
+   HK_PENDING_BUSY,
+   HK_PENDING_SUCCEEDED,
+   HK_PENDING_FAILED,
+};
+
+/* A signalled ERROR is deliberately not completion for ownership purposes.
+ * A private binary syncobj keeps the original fence, including its error;
+ * exporting a pruned queue timeline point could instead yield a success
+ * stub. One zero-timeout wait rejects a submission that is still running;
+ * the status of each signalled fence is then read once and remembered.
+ */
+static enum hk_cmd_pending_state
+hk_cmd_pending_poll(struct hk_device *dev, struct hk_cmd_pending *p)
+{
+   unsigned unknown_count = 0;
+
+   for (unsigned i = 0; i < p->attempted; ++i) {
+      if (!p->succeeded[i])
+         p->unknown[unknown_count++] = p->signals[i];
+   }
+
+   if (unknown_count &&
+       drmSyncobjWait(dev->dev.fd, p->unknown, unknown_count, 0,
+                      DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL)) {
+      /* A failed ioctl may have left a syncobj without any fence. That
+       * never changes: keep the memory, but stop polling it.
+       */
+      return errno == EINVAL ? HK_PENDING_FAILED : HK_PENDING_BUSY;
+   }
+
+   for (unsigned i = 0; i < p->attempted; ++i) {
+      if (p->succeeded[i])
+         continue;
+
+      int fd = -1;
+      if (drmSyncobjExportSyncFile(dev->dev.fd, p->signals[i], &fd))
+         return HK_PENDING_BUSY;
+
+      struct sync_file_info info = {0};
+      int ret = ioctl(fd, SYNC_IOC_FILE_INFO, &info);
+      close(fd);
+      if (ret || info.status == 0)
+         return HK_PENDING_BUSY;
+      if (info.status < 0)
+         return HK_PENDING_FAILED;
+
+      p->succeeded[i] = true;
+   }
+
+   return HK_PENDING_SUCCEEDED;
+}
+
+void
+hk_cmd_pending_reap(struct hk_device *dev)
+{
+   /* Meta command pools can be destroyed during device-init failure. */
+   if (!dev->cmd_pending_ready)
+      return;
+
+   struct list_head ready;
+   list_inithead(&ready);
+
+   simple_mtx_lock(&dev->cmd_pending_lock);
+   list_for_each_entry_safe(struct hk_cmd_pending, p, &dev->cmd_pending,
+                            link) {
+      switch (hk_cmd_pending_poll(dev, p)) {
+      case HK_PENDING_BUSY:
+         break;
+      case HK_PENDING_SUCCEEDED:
+         list_del(&p->link);
+         list_addtail(&p->link, &ready);
+         break;
+      case HK_PENDING_FAILED:
+         /* Its memory stays out of reuse until device destruction. */
+         list_del(&p->link);
+         list_addtail(&p->link, &dev->cmd_pending_failed);
+         break;
+      }
+   }
+   simple_mtx_unlock(&dev->cmd_pending_lock);
+
+   /* Releasing a span takes vdm.lock; never do it under the pending lock. */
+   list_for_each_entry_safe(struct hk_cmd_pending, p, &ready, link) {
+      list_del(&p->link);
+      hk_cmd_pending_release(dev, p, false);
+   }
+}
+
+VkResult
+hk_cmd_pending_begin(struct hk_device *dev,
+                     const struct vk_queue_submit *submit, unsigned chunks,
+                     struct hk_cmd_pending **out)
+{
+   *out = NULL;
+   hk_cmd_pending_reap(dev);
+
+   size_t count = hk_cmd_collect_pins(submit, NULL);
+   if (count > UINT32_MAX ||
+       count > (SIZE_MAX - sizeof(struct hk_cmd_pending)) /
+                  sizeof(struct hk_cmd_pin))
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   struct hk_cmd_pending *p =
+      vk_zalloc(&dev->vk.alloc, sizeof(*p) + count * sizeof(p->pins[0]), 8,
+                VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+   if (!p)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   /* The polling scratch and success flags share the handle allocation. */
+   p->signals = vk_zalloc(&dev->vk.alloc,
+                          (size_t)chunks * (2 * sizeof(uint32_t) + sizeof(bool)),
+                          8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+   if (!p->signals) {
+      vk_free(&dev->vk.alloc, p);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   p->unknown = p->signals + chunks;
+   p->succeeded = (bool *)(p->unknown + chunks);
+
+   for (; p->chunks < chunks; ++p->chunks) {
+      if (drmSyncobjCreate(dev->dev.fd, 0, &p->signals[p->chunks])) {
+         hk_cmd_pending_release(dev, p, false);
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+   }
+
+   p->count = hk_cmd_collect_pins(submit, p->pins);
+   assert(p->count == count);
+   for (unsigned i = 0; i < p->count; ++i)
+      hk_cmd_pin_ref(p->pins[i]);
+
+   *out = p;
+   return VK_SUCCESS;
+}
+
+uint32_t
+hk_cmd_pending_signal(struct hk_cmd_pending *p)
+{
+   assert(p->attempted < p->chunks);
+   return p->signals[p->attempted++];
+}
+
+void
+hk_cmd_pending_end(struct hk_device *dev, struct hk_cmd_pending *p)
+{
+   if (!p)
+      return;
+
+   if (!p->attempted) {
+      hk_cmd_pending_release(dev, p, false);
+      return;
+   }
+
+   simple_mtx_lock(&dev->cmd_pending_lock);
+   list_addtail(&p->link, &dev->cmd_pending);
+   simple_mtx_unlock(&dev->cmd_pending_lock);
+}
+
+void
+hk_cmd_pending_finish(struct hk_device *dev)
+{
+   /* Called only at device teardown, after all common submit workers joined
+    * and kernel queues were destroyed. No application command recording is
+    * allowed concurrently with DestroyDevice. This does not claim that queue
+    * destruction drained the GPU: outstanding kernel mapping pins must
+    * survive the unbind/close operations below.
+    */
+   struct list_head *lists[] = {&dev->cmd_pending, &dev->cmd_pending_failed};
+
+   for (unsigned l = 0; l < ARRAY_SIZE(lists); ++l) {
+      list_for_each_entry_safe(struct hk_cmd_pending, p, lists[l], link) {
+         list_del(&p->link);
+         hk_cmd_pending_release(dev, p, true);
+      }
+   }
 }

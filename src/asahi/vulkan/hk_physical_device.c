@@ -246,6 +246,7 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_extended_dynamic_state2 = true,
       .EXT_extended_dynamic_state3 = true,
       .EXT_external_memory_dma_buf = true,
+      .EXT_fragment_shader_interlock = agx_native_graphics(dev),
       .EXT_global_priority = true,
       .EXT_global_priority_query = true,
       .EXT_graphics_pipeline_library = true,
@@ -673,6 +674,16 @@ hk_get_device_features(
       .inheritedConditionalRendering =
          supported_extensions->EXT_conditional_rendering,
 
+      /* VK_EXT_fragment_shader_interlock */
+      .fragmentShaderSampleInterlock =
+         supported_extensions->EXT_fragment_shader_interlock,
+      /* Pixel ordering covers only the samples a fragment covers, so two
+       * pixel-rate fragments splitting one MSAA pixel overlap
+       * (fragment_shader_interlock.basic.*.pixel_*.4xaa.no_sample_shading).
+       */
+      .fragmentShaderPixelInterlock = false,
+      .fragmentShaderShadingRateInterlock = false,
+
       /* VK_EXT_custom_border_color */
       .customBorderColors = true,
       .customBorderColorWithoutFormat = true,
@@ -1044,6 +1055,9 @@ hk_get_device_properties(const struct agx_device *dev,
    const bool texel_buffer_single_texel_alignment =
       hk_descriptor_generation_is_agx2(descriptor_generation) ||
       agx_chip_native_agx3(dev->chip);
+   /* G17P: what agx_nir_lower_gen1_mesh accepts and the CTS runs there
+    * (misc.maximize_invocations_256); no larger mesh workgroup was run. */
+   const uint32_t mesh_threads = dev->chip == AGX_CHIP_G17P ? 256 : 1024;
 
    /* Note: update nir_shader_compiler_options.max_samples when changing this. */
    const VkSampleCountFlagBits sample_counts =
@@ -1269,11 +1283,11 @@ hk_get_device_properties(const struct agx_device *dev,
          g13_mesh ? HK_G13_MESH_MAX_GROUP_COUNT : (mesh ? 65535 : 0),
       },
       .maxMeshWorkGroupInvocations =
-         g13_mesh ? HK_G13_MESH_MAX_INVOCATIONS : (mesh ? 1024 : 0),
+         g13_mesh ? HK_G13_MESH_MAX_INVOCATIONS : (mesh ? mesh_threads : 0),
       .maxMeshWorkGroupSize = {
-         g13_mesh ? HK_G13_MESH_MAX_WORKGROUP_X : (mesh ? 1024 : 0),
-         g13_mesh ? HK_G13_MESH_MAX_WORKGROUP_Y : (mesh ? 1024 : 0),
-         g13_mesh ? HK_G13_MESH_MAX_WORKGROUP_Z : (mesh ? 1024 : 0),
+         g13_mesh ? HK_G13_MESH_MAX_WORKGROUP_X : (mesh ? mesh_threads : 0),
+         g13_mesh ? HK_G13_MESH_MAX_WORKGROUP_Y : (mesh ? mesh_threads : 0),
+         g13_mesh ? HK_G13_MESH_MAX_WORKGROUP_Z : (mesh ? mesh_threads : 0),
       },
       .maxMeshSharedMemorySize =
          g13_mesh ? HK_G13_MESH_MAX_SHARED_SIZE : (mesh ? 28672 : 0),
@@ -1638,6 +1652,15 @@ hk_get_device_properties(const struct agx_device *dev,
     * afterwards, which strict residency forbids. Report it only where the
     * driconf asks (vkd3d-proton, for tiled resources tier 2). */
    if (dev->chip == AGX_CHIP_G17P)
+      properties->sparseResidencyNonResidentStrict =
+         instance->drirc.misc.sparse_strict_residency;
+
+   /* G13 and G14 back the writable alias of an unbound page with the shared
+    * fill page, as G17P does: a store or copy into an unbound page is read
+    * back afterwards, and through the writable alias any unbound page returns
+    * what another one received.  Same rule as G17P. */
+   if (dev->chip == AGX_CHIP_G13G || dev->chip == AGX_CHIP_G13X ||
+       dev->chip == AGX_CHIP_G14G || dev->chip == AGX_CHIP_G14X)
       properties->sparseResidencyNonResidentStrict =
          instance->drirc.misc.sparse_strict_residency;
 
@@ -2488,7 +2511,6 @@ static const VkQueueGlobalPriorityKHR hk_global_queue_priorities[] = {
    VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR,
    VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR,
    VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR,
-   VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR,
 };
 
 VKAPI_ATTR void VKAPI_CALL
@@ -2516,9 +2538,11 @@ hk_GetPhysicalDeviceQueueFamilyProperties2(
          if (prio) {
             STATIC_ASSERT(ARRAY_SIZE(hk_global_queue_priorities) <=
                           VK_MAX_GLOBAL_PRIORITY_SIZE_KHR);
-            prio->priorityCount = ARRAY_SIZE(hk_global_queue_priorities);
+            /* The native kernel reserves REALTIME and only accepts HIGH on
+             * M5. Report the same classes that queue creation can admit. */
+            prio->priorityCount = agx_chip_g17_m5(pdev->dev.chip) ? 3 : 2;
             memcpy(&prio->priorities, hk_global_queue_priorities,
-                   sizeof(hk_global_queue_priorities));
+                   prio->priorityCount * sizeof(hk_global_queue_priorities[0]));
          }
       }
    }

@@ -4,7 +4,7 @@
 libasahi_noop_drm_shim = shared_library(
   'asahi_noop_drm_shim',
   ['asahi_noop.c', 'asahi_g15s_stream_gate.c',
-   'asahi_g17p_stream_validator.c'],
+   'asahi_g17p_stream_validator.c', 'asahi_m5_submit_gate.c'],
   objects : libasahi_decode.extract_objects(
     'agx3_cdm_decode_core.c',
     'agx_ioto_core.c',
@@ -29,3 +29,21 @@ libasahi_noop_drm_shim = shared_library(
   gnu_symbol_visibility : 'hidden',
   install : true,
 )
+
+if with_tests
+  asahi_vm_limits_test = executable(
+    'asahi-vm-limits', 'test-vm-limits.c',
+    include_directories : [inc_include],
+    dependencies : [dep_libdrm],
+  )
+  foreach hal : ['legacy', 'hal200']
+    test(
+      'asahi-vm-limits-' + hal, prog_python,
+      args : [files('../../gallium/drivers/asahi/tests/run-shim.py'),
+              libasahi_noop_drm_shim, asahi_vm_limits_test],
+      env : ['ASAHI_SHIM_CHIP=g15g',
+             'ASAHI_SHIM_G15G_HAL200=' + (hal == 'hal200' ? '1' : '0')],
+      suite : ['asahi'],
+    )
+  endforeach
+endif

@@ -40,6 +40,7 @@
 #include "hk_image_view.h"
 #include "hk_physical_device.h"
 #include "hk_shader.h"
+#include "hk_queue.h"
 #include "libagx_shaders.h"
 
 #include "util/cache_ops.h"
@@ -268,6 +269,7 @@ hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd)
 
    struct hk_cmd_pool *pool = hk_cmd_buffer_pool(cmd);
    struct hk_device *dev = hk_cmd_pool_device(pool);
+   hk_cmd_pending_reap(dev);
 
    /* The cached span is only valid while this recording owns its leases. */
    cmd->g17p_vdm_last_allocation = NULL;
@@ -304,6 +306,7 @@ hk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
       container_of(vk_cmd_buffer, struct hk_cmd_buffer, vk);
    struct hk_cmd_pool *pool = hk_cmd_buffer_pool(cmd);
 
+   hk_device_quiesce_lost_submissions(hk_cmd_pool_device(pool));
    hk_free_resettable_cmd_buffer(cmd);
    util_dynarray_fini(&cmd->large_bos);
    free(cmd->retained_set);
@@ -367,6 +370,7 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
    struct hk_cmd_buffer *cmd =
       container_of(vk_cmd_buffer, struct hk_cmd_buffer, vk);
 
+   hk_device_quiesce_lost_submissions(hk_cmd_pool_device(hk_cmd_buffer_pool(cmd)));
    vk_command_buffer_reset(&cmd->vk);
    hk_free_resettable_cmd_buffer(cmd);
 
@@ -1833,7 +1837,7 @@ hk_g17p_basic_fragment_layout(struct hk_cmd_buffer *cmd)
 
 /* Keep native interpolation bounded to the f32 UVS layout already supported
  * by hk_agx3_g17p_vertex_program_info: position plus up to 64 user words.
- * HAL200 updateVaryingTable (0x3efa58) uses the same CF entry encoding for
+ * The HAL200 varying table uses the same CF entry encoding for
  * smooth, linear and flat inputs, including their mixture in one shader.
  * Flat inputs select C. Native G17P Point and Triangle pipelines have identical
  * complete fragment text for flat vec2/vec3/vec4 inputs. The provoking selector
@@ -2725,12 +2729,12 @@ hk_g17p_graphics_uniform_ranges(
       if (!hk_agx3_g17p_combined_sampler_pointers(&heap, pointers))
          return hk_g17p_graphics_ranges_refused(range_count, count);
 
-      /* HAL200 FragmentProgramVariant::finalize (374968..3749c0) maps
-       * compiler bindpoints 0x31/0x35 to driver qwords +0xc0/+0xe0.
-       * encodeAndEmitRenderState writes the raw texture/sampler table VAs
-       * there (4c5580/4c5598); ESL copies them to uniform dwords 0..3.
-       * Keep this upload immutable for the command-buffer lifetime, just
-       * like the per-draw graphics state. Both shader indices are zero.
+      /* On HAL200 compiler bindpoints 0x31/0x35 are the texture and sampler
+       * table addresses, at driver qwords +0xc0/+0xe0. Render state carries
+       * the raw texture/sampler table VAs there; ESL copies them to uniform
+       * dwords 0..3. Keep this upload immutable for the command-buffer
+       * lifetime, just like the per-draw graphics state. Both shader indices
+       * are zero.
        */
       const unsigned cache_index =
          ((pointers[0] >> 4) ^ (pointers[0] >> 32) ^
@@ -2815,9 +2819,9 @@ hk_g17p_graphics_uniform_ranges(
    if (s->info.agx3_indexed_sampler_valid || native_spills) {
       if ((s->b.info.stage != MESA_SHADER_FRAGMENT &&
            s->b.info.stage != MESA_SHADER_VERTEX &&
+           s->b.info.stage != MESA_SHADER_MESH &&
            !(agx_chip_g17_m5(dev->dev.chip) &&
-             (s->b.info.stage == MESA_SHADER_MESH ||
-              s->b.info.stage == MESA_SHADER_TASK))) ||
+             s->b.info.stage == MESA_SHADER_TASK)) ||
           !dev->sampled_images.base_va || !dev->samplers.table.bo ||
           !dev->rodata.indexed_heap_pointers)
          return hk_g17p_graphics_ranges_refused(range_count, count);
@@ -4316,7 +4320,7 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 
    if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip) ||
        g18g) {
-      /* The kext preserves a zero final VDM word when this selector is the
+      /* The final VDM word stays zero when this selector is the
        * UINT32_MAX sentinel.  This reproduces m1n1's direct-triangle prefix. */
       cs->agx3_active_context_selector_valid = true;
       cs->agx3_raw_active_context_selector = UINT32_MAX;

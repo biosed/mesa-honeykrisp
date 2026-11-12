@@ -194,7 +194,7 @@ check_gen9_srgb_vector(void)
 static int
 check_exact_gen9_array_vector(void)
 {
-   /* PBEStateEncoderGen9<HAL200> keeps the ordinary 2D words, changes the
+   /* The HAL200 Gen9 PBE keeps the ordinary 2D words, changes the
     * dimension nibble to3, and writes layers-1/page alignment at word1
     * bits44..60. This exact two-layer vector exercises every changed field. */
    const struct agx_pbe_agx3_2d_fields fields = {
@@ -445,10 +445,10 @@ check_fail_closed_axes(void)
 static int
 check_gen9_single_layer_packet(void)
 {
-   /* Matching Gen9 MTL80 table878fa8[79] ->818c40 supplies channels0x28,
-    * type0, bytes-per-pixel4. StateFields34edf4 takes depth1/base-slice0,
-    * sparsePageSize0: layout2, no high control bits or extended words.
-    * This is a constructor-derived vector, not a native32x32 capture.
+   /* Gen9 pixel format 80 has channels 0x28, type 0 and 4 bytes per pixel.
+    * With depth 1, base slice 0 and sparse page size 0 it packs as layout 2,
+    * with no high control bits or extended words. This vector is derived from
+    * the format rules, not a native 32x32 capture.
     */
    static const uint8_t expected[32] = {
       0x22, 0x0a, 0xe4, 0x1f, 0xc0, 0x07, 0x00, 0x00,
@@ -542,12 +542,11 @@ check_gen9_native_mips(void)
 static int
 check_gen9_multisample_vector(void)
 {
-   /* PBEStateEncoderGen9<kAGXRevHAL200>::StateFields derives its dimension
-    * nibble as `2 + ((flags >> 16) & 2)`, so a non-array multisample write
-    * target is dimension 4 rather than 2, and deposits `(samples >> 2) & 3`
-    * at word0[57:56] -- the two-bit Sample Count selector, 2x=0 4x=1 8x=2.
-    * Every other field keeps its single-sample placement, including the
-    * logical (not sample-expanded) width and height.
+   /* In the HAL200 Gen9 PBE a non-array multisample write target is dimension
+    * 4 rather than 2, and `(samples >> 2) & 3` sits at word0[57:56] -- the
+    * two-bit Sample Count selector, 2x=0 4x=1 8x=2. Every other field keeps
+    * its single-sample placement, including the logical (not sample-expanded)
+    * width and height.
     *
     * Same field vector as the array case above, so the only differences from
     * that packet are the ones the encoder actually makes.

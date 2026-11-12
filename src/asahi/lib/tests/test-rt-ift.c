@@ -13,8 +13,7 @@ int main(void)
    uint8_t out[16];
    assert(agx_rt_ift_entry_pack(out, UINT64_C(0x1000188640), 0, 0, 0, 4, 0, false));
    assert(!memcmp(out, expected, 16));
-   /* G17P HAL200 setFunction at 0x216c088d4..0x216c08910:
-    * ordinary Gen1 entries additionally set bit 39. */
+   /* G17P HAL200: ordinary Gen1 entries additionally set bit 39. */
    uint8_t gen1_expected[16];
    memcpy(gen1_expected, expected, sizeof(gen1_expected));
    gen1_expected[12] = 0xe0;
