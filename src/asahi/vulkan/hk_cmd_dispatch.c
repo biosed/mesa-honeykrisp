@@ -684,7 +684,7 @@ void
 hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
                             struct agx_cdm_launch_word_0_packed launch,
                             uint32_t usc, struct agx_grid grid,
-                            struct agx_workgroup wg)
+                            struct agx_workgroup wg, bool app_dispatch)
 {
    switch (agx_chip_command_stream_generation(dev->dev.chip)) {
    case AGX_CS_GENERATION_AGX2:
@@ -713,11 +713,25 @@ hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
    }
 
    hk_ensure_cs_has_space(cs->cmd, cs, 0x2000 /* TODO */);
+
+   /* AGX2 application launches historically ended in the strongest cache
+    * barrier even when Vulkan supplied no dependency. Keep a trailing barrier
+    * at every stream boundary, but let a directly following zero-scratch
+    * application dispatch overwrite the preceding barrier. A pipeline barrier
+    * ends this stream before the next dispatch, and every internal, meta and
+    * software-graphics launch keeps the established flush. */
+   hk_cs_elide_app_dispatch_barrier(cs, app_dispatch);
+
    cs->stats.cmds++;
    cs->current =
       agx_cdm_launch(cs->current, dev->dev.chip, grid, wg, launch, usc);
 
+   void *barrier = cs->current;
    hk_cdm_cache_flush(dev, cs);
+   if (app_dispatch) {
+      cs->app_dispatch_barrier = barrier;
+      cs->app_dispatch_end = cs->current;
+   }
 }
 
 void
@@ -734,7 +748,18 @@ hk_dispatch_with_usc(struct hk_device *dev, struct hk_cs *cs,
       cfg.preshader_register_count = info->nr_preamble_gprs;
    }
 
-   hk_dispatch_with_usc_launch(dev, cs, launch, usc, grid, local_size);
+   /* HK_APP_DISPATCH_OVERLAP=1 (diagnostic, default off): only then may a
+    * zero-scratch application dispatch drop the barrier ending the previous
+    * one. Dropping CDM barriers around scratch-using launches hard-hung G13;
+    * off, every launch keeps its flush exactly as before. */
+   static int overlap = -1;
+   if (overlap < 0)
+      overlap = debug_get_bool_option("HK_APP_DISPATCH_OVERLAP", false);
+   const bool app_dispatch = overlap && hk_app_dispatch_overlap_eligible(
+      cs->cmd->in_meta, info->stage, info->scratch_size,
+      info->preamble_scratch_size);
+   hk_dispatch_with_usc_launch(dev, cs, launch, usc, grid, local_size,
+                               app_dispatch);
 }
 
 static bool

@@ -174,6 +174,49 @@ check_merge_memory_scope(void)
    assert(a.memory_flush_end == a.current);
 }
 
+/* The AGX2 optimization may overwrite only a barrier which is still the
+ * precise tail of an application dispatch.  It must preserve that barrier if
+ * any record followed it or the next launch is internal/meta. */
+static void
+check_app_dispatch_barrier_elision(void)
+{
+   uint8_t bytes[64];
+   struct hk_cs cs = {
+      .type = HK_CS_CDM,
+      .start = bytes,
+      .current = bytes + 24,
+      .end = bytes + sizeof(bytes),
+      .app_dispatch_barrier = bytes + 20,
+      .app_dispatch_end = bytes + 24,
+      .stats.flushes = 3,
+   };
+
+   assert(hk_cs_elide_app_dispatch_barrier(&cs, true));
+   assert(cs.current == bytes + 20);
+   assert(cs.stats.flushes == 2);
+   assert(!cs.app_dispatch_barrier && !cs.app_dispatch_end);
+
+   cs.current = bytes + 28;
+   cs.app_dispatch_barrier = bytes + 20;
+   cs.app_dispatch_end = bytes + 24;
+   assert(!hk_cs_elide_app_dispatch_barrier(&cs, true));
+   assert(cs.current == bytes + 28 && cs.stats.flushes == 2);
+   assert(!cs.app_dispatch_barrier && !cs.app_dispatch_end);
+
+   cs.current = bytes + 24;
+   cs.app_dispatch_barrier = bytes + 20;
+   cs.app_dispatch_end = bytes + 24;
+   assert(!hk_cs_elide_app_dispatch_barrier(&cs, false));
+   assert(cs.current == bytes + 24 && cs.stats.flushes == 2);
+   assert(!cs.app_dispatch_barrier && !cs.app_dispatch_end);
+
+   assert(hk_app_dispatch_overlap_eligible(false, MESA_SHADER_COMPUTE, 0, 0));
+   assert(!hk_app_dispatch_overlap_eligible(true, MESA_SHADER_COMPUTE, 0, 0));
+   assert(!hk_app_dispatch_overlap_eligible(false, MESA_SHADER_VERTEX, 0, 0));
+   assert(!hk_app_dispatch_overlap_eligible(false, MESA_SHADER_COMPUTE, 1, 0));
+   assert(!hk_app_dispatch_overlap_eligible(false, MESA_SHADER_COMPUTE, 0, 1));
+}
+
 static void
 check_as_contracts(void)
 {
@@ -233,5 +276,6 @@ int main(void)
          for (unsigned link = 0; link < 2; ++link)
             check_merge(a, b, link);
    check_merge_memory_scope();
+   check_app_dispatch_barrier_elision();
    return 0;
 }
