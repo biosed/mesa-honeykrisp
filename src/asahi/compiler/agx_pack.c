@@ -818,12 +818,15 @@ agx_pack_instr(struct util_dynarray *emission, struct util_dynarray *fixups,
          (((uint64_t)I->mask) << 36) | (((uint64_t)(O >> 6)) << 48) |
          (((uint64_t)(A >> 6)) << 58) | (((uint64_t)(R >> 6)) << 60);
 
-      /* AGX_LOCAL_BIT47=1 (diagnostic, off by default): set bit 47 of local
-       * load/store, which every Metal-compiled binary sets and whose meaning is
-       * unknown (Mesa MR !42482 measured +13% on llama.cpp matmuls on G13). */
+      /* Bit 47 of local load/store: every Metal-compiled binary sets it; its
+       * meaning is unknown. Mesa MR !42482 measured +13% on llama.cpp matmuls
+       * on G13, and Ocarina of Time's NDSR tensor shader runs 11% faster
+       * (4.405 -> 3.918 ms) with byte-identical shared-memory results, so it
+       * is on by default. AGX_LOCAL_BIT47=0 clears it (diagnostic; the pinned
+       * G13 shader UUID differs then, hk_physical_device.c). */
       static int bit47 = -1;
       if (bit47 < 0)
-         bit47 = debug_get_bool_option("AGX_LOCAL_BIT47", false);
+         bit47 = debug_get_bool_option("AGX_LOCAL_BIT47", true);
       if (bit47)
          raw |= BITFIELD64_BIT(47);
 
