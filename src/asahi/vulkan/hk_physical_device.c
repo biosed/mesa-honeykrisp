@@ -1894,15 +1894,16 @@ hk_physical_device_init_pipeline_cache(struct hk_physical_device *pdev)
     * shader objects.  Pin this experimental profile to the established
     * F6/G1 compiler contract and bump the UUID only when that contract or a
     * shader rewrite changes.  A NIR/AGX compiler or mesh-lowering commit
-    * changes generated code, so it must change these bytes too (last: local
-    * load/store bit 47 on by default, 2026-11-12); otherwise binaries from an
-    * older compiler keep being loaded. AGX_LOCAL_BIT47=0 (agx_pack.c) emits
+    * changes generated code, so it must change these bytes too (last: the merge
+    * of aurora-wip 5a0c2dc9aaa, whose compiler and lowering commits include
+    * 912ff036c89, 2026-11-12); otherwise binaries from an older compiler keep
+    * being loaded. AGX_LOCAL_BIT47=0 (agx_pack.c) emits
     * other code, so it gets a UUID of its own. */
    if (hk_g13_software_mesh_supported(pdev->dev.chip) &&
        debug_get_bool_option("ASAHI_G13_SOFTWARE_MESH", false)) {
       static const uint8_t g13_swmesh_shader_uuid[VK_UUID_SIZE] = {
          0x1d, 0xbe, 0xb6, 0xea, 0x98, 0x37, 0x91, 0x57,
-         0xbc, 0x8b, 0xd5, 0xec, 0x4a, 0x82, 0x01, 0x6a,
+         0xbc, 0x8b, 0xd5, 0xec, 0x4a, 0x82, 0x01, 0x6b,
       };
       memcpy(pdev->vk.properties.shaderBinaryUUID,
              g13_swmesh_shader_uuid, VK_UUID_SIZE);
