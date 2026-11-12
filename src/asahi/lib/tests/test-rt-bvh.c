@@ -1491,7 +1491,7 @@ test_gen3_qtb_type2_vertices(void)
            "Gen3 type2 refuses null inputs");
 
    /* Complete block from native encodeNodesKernelTriFastRia3 on M5 for
-    * (-1,-1,0), (1,-1,0), (0,1,0). The CPU extractor separately verifies
+    * (-1,-1,0), (1,-1,0), (0,1,0). A separate CPU decode verifies
     * the builder's root and full-precision record for this same triangle. */
    static const uint8_t native_block[64] = {
       0x02, 0x01, 0x80, 0xbf, 0x80, 0xbf, 0x00, 0x00,

@@ -194,3 +194,34 @@ TEST_F(LowerPseudo, Agx3DivergentShuffleUsesFullRegisterLane)
    agx_lower_divergent_shuffle(actual->shader);
    ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
 }
+
+TEST_F(LowerPseudo, DivergentShuffleZeroesScratchAfterLastShuffle)
+{
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   agx_index result = agx_register(12, AGX_SIZE_32);
+   agx_index value = agx_register(4, AGX_SIZE_32);
+   agx_index lane = agx_register(8, AGX_SIZE_32);
+
+   /* A vertex output after the shuffle must stay last before STOP. */
+   agx_builder *actual = agx_test_builder(mem_ctx);
+   actual->shader->key = &key;
+   actual->shader->any_cf = true;
+   actual->shader->any_quad_divergent_shuffle = true;
+   agx_shuffle_to(actual, result, value, lane);
+   agx_st_vary(actual, agx_immediate(4), result);
+
+   agx_builder *expected = agx_test_builder(mem_ctx);
+   expected->shader->key = &key;
+   expected->shader->any_cf = true;
+   expected->shader->any_quad_divergent_shuffle = true;
+   agx_index scratch = agx_register(2, AGX_SIZE_32);
+   agx_mov_imm_to(expected, scratch, 0);
+   agx_mov_to(expected, scratch, lane);
+   agx_shuffle_to(expected, result, value, scratch);
+   agx_mov_imm_to(expected, scratch, 0);
+   agx_st_vary(expected, agx_immediate(4), result);
+
+   agx_lower_divergent_shuffle(actual->shader);
+   ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+}

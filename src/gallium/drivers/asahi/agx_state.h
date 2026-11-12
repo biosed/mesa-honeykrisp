@@ -31,11 +31,37 @@
 #include "util/hash_table.h"
 #include "util/rwlock.h"
 #include "util/set.h"
+#include "util/u_atomic.h"
 #include "util/u_range.h"
 #include "agx_bg_eot.h"
 #include "agx_helpers.h"
 #include "agx_native_descriptor.h"
 #include "agx_nir_texture.h"
+
+/* Diagnostic environment switches. Some are tested on every draw or upload,
+ * so each is read from the environment once and cached; getenv() scans the
+ * whole environment on every call.
+ */
+enum agx_env_flag {
+   AGX_ENV_NEO_DRAW_DIAGNOSTICS,
+   AGX_ENV_NEO_UNIFORM_DIAGNOSTICS,
+   AGX_ENV_NEO_BINARY_DIAGNOSTICS,
+   AGX_ENV_G18_RESOURCE_TRACE,
+   AGX_ENV_FLAG_COUNT,
+};
+
+/* -1 until first read, then 0 or 1. */
+extern int agx_env_flags[AGX_ENV_FLAG_COUNT];
+
+bool agx_env_flag_init(enum agx_env_flag flag);
+
+static inline bool
+agx_env_flag(enum agx_env_flag flag)
+{
+   int v = p_atomic_read_relaxed(&agx_env_flags[flag]);
+
+   return likely(v >= 0) ? v : agx_env_flag_init(flag);
+}
 
 #ifdef __GLIBC__
 #include <errno.h>
@@ -216,7 +242,8 @@ struct PACKED agx_stage_uniforms {
    /* LOD bias as float16 */
    uint16_t lod_bias[PIPE_MAX_SAMPLERS];
 
-   /* G17P shadow-gather border comparison, in pipe_compare_func order. Kept
+   /* G16G/G17P shadow-gather border comparison (see
+    * agx_shadow_gather_custom_border), in pipe_compare_func order. Kept
     * after the existing fields so classic shader bindings do not move. Each
     * halfword has padding for Ioto's dword upload, including sampler 31. */
    uint32_t custom_border_compare_func[PIPE_MAX_SAMPLERS];
@@ -576,6 +603,20 @@ struct agx_batch {
     * still needs its render. */
    unsigned draws_refused;
 
+   /* M5 on the G17 kernel runtime (agx_m5_render_resources): the storage
+    * the programs of this batch need, sent ahead of its render and compute
+    * commands. m5_render_programs holds one drm_asahi_render_program_v2 per
+    * distinct linked vertex or fragment program demand, m5_tile_program the
+    * background and end-of-tile programs' record, m5_compute_programs one
+    * drm_asahi_compute_program per distinct dispatch demand. The kernel takes
+    * the maximum over each list, so they are sets. */
+   struct util_dynarray m5_render_programs;
+   struct util_dynarray m5_compute_programs;
+   struct drm_asahi_render_program m5_tile_program;
+
+   /* A graphics program of this render writes memory (its kernel write
+    * class, DRM_ASAHI_RENDER_SHADER_WRITES). */
+   bool m5_shader_writes;
 
    uint64_t uploaded_clear_color[PIPE_MAX_COLOR_BUFS];
    union pipe_color_union clear_color[PIPE_MAX_COLOR_BUFS];
@@ -1412,6 +1453,19 @@ bool agx_nir_lower_custom_border_native(nir_shader *shader, bool shadow_gather,
                                         bool g18, bool *fully_supported);
 bool agx_nir_lower_custom_border_g17g(nir_shader *shader);
 bool agx_nir_rebind_g17p_texture_crawls(nir_shader *shader);
+
+/* Chips whose shadow gathers rebuild the API border depth comparison: the
+ * native custom-border sampler returns one, so border taps would otherwise
+ * compare against 1.0. This selects the probe sampler bank, the comparison
+ * uniforms and the shadow-gather lowering together, and with them the
+ * recovery of native sampler indices (handle i+1) in custom-border
+ * lowering. */
+static inline bool
+agx_shadow_gather_custom_border(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P || chip == AGX_CHIP_G16G;
+}
+
 bool agx_nir_lower_g17p_storage_records(nir_shader *shader,
                                         unsigned record_size_B);
 bool agx_nir_rebind_g17g_image_loads(nir_shader *shader);
@@ -1504,6 +1558,8 @@ agx_batch_is_compute(struct agx_batch *batch)
 struct agx_batch *agx_get_batch(struct agx_context *ctx);
 struct agx_batch *agx_get_compute_batch(struct agx_context *ctx);
 void agx_batch_reset(struct agx_context *ctx, struct agx_batch *batch);
+void agx_batch_retire_faulted(struct agx_context *ctx,
+                              struct agx_batch *batch);
 int agx_cleanup_batches(struct agx_context *ctx);
 
 void agx_batch_add_timestamp_query(struct agx_batch *batch,
@@ -1570,6 +1626,11 @@ void agx_batch_init_state(struct agx_batch *batch);
 struct asahi_bg_eot {
    uint64_t usc;
    uint64_t rsrc_spec;
+
+   /* M5: the program's primary (thread-private) and staging storage, for
+    * the render's tile record (agx_m5_render_resources). */
+   uint32_t primary_storage_B;
+   uint32_t staging_storage_B;
 };
 
 /* Per-field maxima. Page-count descriptor words are exact under this merge;
@@ -1603,6 +1664,14 @@ agx_g18_note_tile(struct agx_batch *batch, bool store, unsigned registers_16,
    r->tile_registers_16[slot] = MAX2(r->tile_registers_16[slot], registers_16);
    r->tile_staging_16[slot] = MAX2(r->tile_staging_16[slot], staging_16);
 }
+
+void agx_batch_note_m5_render_program(
+   struct agx_batch *batch, const struct drm_asahi_render_program_v2 *program);
+void agx_batch_note_m5_compute_program(
+   struct agx_batch *batch, const struct drm_asahi_compute_program *program);
+void agx_batch_set_m5_tile_program(struct agx_batch *batch,
+                                   const struct asahi_bg_eot *const *programs,
+                                   unsigned count);
 
 struct asahi_bg_eot agx_build_bg_eot(struct agx_batch *batch, bool store,
                                      bool partial_render);

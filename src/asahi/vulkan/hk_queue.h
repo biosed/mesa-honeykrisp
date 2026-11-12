@@ -20,6 +20,19 @@ struct hk_queue {
       /* Asahi kernel queue ID, UINT32_MAX until the first GPU submission. */
       uint32_t id;
 
+      /* Whether the kernel queue reserves render ray-query scratch, which
+       * sizes its render free list for ray queries in vertex and fragment
+       * shaders. Only a queue that runs such a render gets one: the
+       * reservation multiplies the free list several times over, and the
+       * kernel places every queue's free list in one bounded window. */
+      bool render_rq;
+
+      /* The kernel queue a render ray query replaced, UINT32_MAX if none.
+       * It is destroyed once the queue timeline reaches retired_point, the
+       * last point submitted to it, or with the queue. */
+      uint32_t retired_id;
+      uint64_t retired_point;
+
       /* Timeline syncobj backing the queue */
       uint32_t syncobj;
 
@@ -56,3 +69,10 @@ VkResult hk_queue_init(struct hk_device *dev,
                        uint32_t index_in_family);
 
 void hk_queue_finish(struct hk_device *dev, struct hk_queue *queue);
+
+void hk_device_quiesce_lost_submissions(struct hk_device *dev);
+
+VkResult hk_queue_submit_bind_sparse_memory(struct hk_device *device,
+                                            struct vk_queue_submit *submission);
+
+void hk_queue_share(struct hk_device *dev, struct hk_queue *queue);

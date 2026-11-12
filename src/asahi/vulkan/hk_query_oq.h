@@ -15,11 +15,18 @@
  * Native AGX3 occlusion availability.
  *
  * A render's retirement record carries four timestamp slots (vertex start
- * and end, fragment start and end). The G17 kernel writes every requested
- * slot when it retires the render, which is after the end-of-render cache
- * maintenance that makes the render's occlusion counts visible, and before
- * it signals the submission. A nonzero timestamp in a query's 64-bit
- * availability slot is therefore exactly "available" there.
+ * and end, fragment start and end). The G17 kernel writes the vertex start,
+ * vertex end and fragment start slots when it retires the render, which is
+ * after the end-of-render cache maintenance that makes the render's
+ * occlusion counts visible, and before it signals the submission. A nonzero
+ * timestamp written there in a query's 64-bit availability slot is
+ * therefore exactly "available".
+ *
+ * The fragment end slot is different: the kernel hands its address to the
+ * firmware, which writes it at the end of the fragment pass. That can land
+ * before the counts are visible (a depth-only pass on G17P read a stamped
+ * query as 0 that held the full count once the submission completed), so
+ * availability never rides on it.
  *
  * That holds only for a kernel that publishes the slots at retirement (see
  * hk_oq_render_stamps_supported()). The G15 firmware writes each slot from

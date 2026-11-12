@@ -12,10 +12,9 @@
  * exactly right -- see the rounding note on
  * agx_rt_bvh_gen1_quantize_child_bounds().
  *
- * These accessors are an independent implementation of the six pure
- * RIANodeHeaderGen5 child-layout accessors in AGXMetalG17X.  They were
- * validated against the Apple implementation over 64,000,000 randomized
- * 64-byte headers with no mismatches.  Keep the two still-unidentified bit
+ * These accessors decode the six child-layout fields of a Gen5 node header.
+ * They were checked against a reference decoder over 64,000,000 randomized
+ * 64-byte headers with no mismatches. Keep the two still-unidentified bit
  * ranges (w0[8:15] and w7[13:15]) out of this interface: none participates in
  * a child-section address.
  *
@@ -23,12 +22,10 @@
  * Its encoded child-space base is a signed 32-bit count of 64-byte slots.
  *
  * Gen1 is the node format used by RIA BVH versions 1 through 4.  The accessors
- * below are a direct transcription of AGXMetalG17X's
- * extractDataFromBVH<RIANodeHeaderGen1> and
- * RIANodeHeaderGen1::getQuantizedChildBounds.  In particular, the two ends of
- * the eight-way branching range have special encodings: control 0 means eight
- * inner children and no leaf boxes, while control 0x3f means no inner children
- * and eight leaf boxes.
+ * below decode the Gen1 node header: its child layout and its quantized child
+ * bounds. In particular, the two ends of the eight-way branching range have
+ * special encodings: control 0 means eight inner children and no leaf boxes,
+ * while control 0x3f means no inner children and eight leaf boxes.
  *
  * This header intentionally depends only on the C standard library so it can
  * be shared by Vulkan, Gallium and the native D3D12 frontend.
@@ -66,9 +63,9 @@ struct agx_rt_bvh_gen5_header {
 };
 
 struct agx_rt_bvh_gen1_hw_triangle_leaf {
-   /* Historical API name: this is the full-precision geometry record read by
-    * the native CPU extractor, not a QuantizedTriangleBlock. The native
-    * layout reserves separate traversal blocks before these records. */
+   /* Historical API name: this is the full-precision geometry record of the
+    * Gen1 format, not a quantized triangle block. The native layout reserves
+    * separate traversal blocks before these records. */
    /* Four-lane structure-of-arrays vertex payload: X, Y, then Z.  An
     * unpaired triangle duplicates its third vertex in lane three. */
    float coordinate[3][4];
@@ -307,7 +304,7 @@ agx_rt_bvh_gen1_leaf_type(const struct agx_rt_bvh_gen1_header *header)
 }
 
 /* The low halves are deliberately ordered w5:w6.  Unlike the Gen5 byte
- * address accessors, Apple's Gen1 extractor treats this as an unsigned wide
+ * address accessors, the Gen1 format treats this as an unsigned wide
  * node index. */
 static inline uint32_t
 agx_rt_bvh_gen1_child_space_slot(
@@ -319,7 +316,7 @@ agx_rt_bvh_gen1_child_space_slot(
    return high | low;
 }
 
-/* The four-bit field is the divisor used by Apple's extractor when it rounds
+/* The four-bit field is the divisor the Gen1 format uses when it rounds
  * the decoded leaf extent into 64-byte child-space slots. */
 static inline uint32_t
 agx_rt_bvh_gen1_leaf_slot_capacity(
@@ -423,10 +420,10 @@ agx_rt_bvh_gen1_quantized_child_bounds(
  * The quantisation frame.
  *
  * A Gen1 node stores its children's bounds as six seven-bit numbers in a grid
- * whose origin and per-axis step live in the node header itself.  Measured
- * from Apple's own dequantiser inside extractDataFromBVH<RIANodeHeaderGen1>
- * (AGXMetalG17P), and confirmed independently on the encode side by the
- * shipped gen-2 build kernels:
+ * whose origin and per-axis step live in the node header itself.  The
+ * decode below agrees with the encode side of the shipped gen-2 build
+ * kernels:
+ *
  *
  *   origin.x = words[1][0:15]   origin.y = words[2][0:15]
  *   origin.z = words[3][0:15]   -- each a bfloat16, i.e. the top half of a

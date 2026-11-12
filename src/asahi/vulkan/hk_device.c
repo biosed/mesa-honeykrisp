@@ -933,7 +933,8 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
              dev->dev.user_timestamp_to_ns.den &&
           "user timestamps are in ns");
 
-   if (agx_chip_g17_m5(dev->dev.chip) &&
+   if ((agx_chip_g17_m5(dev->dev.chip) ||
+        hk_sparse_texel_residency_from_map(&dev->dev)) &&
        dev->vk.enabled_features.sparseResidencyBuffer) {
       const uint64_t pages = dev->dev.main_heap_size / AIL_PAGESIZE;
       const uint64_t bytes = align64(16 + DIV_ROUND_UP(pages, 8), AIL_PAGESIZE);
@@ -1077,6 +1078,10 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
 
    *pDevice = hk_device_to_handle(dev);
 
+   simple_mtx_init(&dev->cmd_pending_lock, mtx_plain);
+   list_inithead(&dev->cmd_pending);
+   list_inithead(&dev->cmd_pending_failed);
+   dev->cmd_pending_ready = true;
    simple_mtx_init(&dev->vdm.lock, mtx_plain);
    for (unsigned class = 0; class < HK_CMD_SLAB_COUNT; ++class) {
       list_inithead(&dev->vdm.slabs[class]);
@@ -1108,7 +1113,11 @@ fail_accel_struct:
 fail_mem_cache:
    vk_pipeline_cache_destroy(dev->vk.mem_cache, NULL);
 fail_queues:
-   vk_foreach_queue_safe(iter, &dev->vk) {
+   /* Aliases were created after their backing queues. Finish
+    * them first so a submit worker cannot refer to a freed backing queue. */
+   while (!list_is_empty(&dev->vk.queues)) {
+      struct vk_queue *iter =
+         list_last_entry(&dev->vk.queues, struct vk_queue, link);
       struct hk_queue *queue = container_of(iter, struct hk_queue, vk);
       hk_queue_finish(dev, queue);
    }
@@ -1176,13 +1185,21 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    /* Retire pending profiler records while the queue syncobjs exist. */
    hk_frame_anatomy_finish(dev);
 
-   vk_foreach_queue_safe(iter, &dev->vk) {
+   /* Aliases were created after their backing queues. Finish
+    * them first so a submit worker cannot refer to a freed backing queue. */
+   while (!list_is_empty(&dev->vk.queues)) {
+      struct vk_queue *iter =
+         list_last_entry(&dev->vk.queues, struct vk_queue, link);
       struct hk_queue *queue = container_of(iter, struct hk_queue, vk);
       hk_queue_finish(dev, queue);
    }
 
    vk_device_finish(&dev->vk);
 
+   /* All submit workers/queues are gone. No command bytes can be handed to
+    * a new recording during teardown. Kernel job pins retain failed work. */
+   hk_cmd_pending_finish(dev);
+   simple_mtx_destroy(&dev->cmd_pending_lock);
    hk_device_finish_vdm_slabs(dev);
    simple_mtx_destroy(&dev->vdm.lock);
 

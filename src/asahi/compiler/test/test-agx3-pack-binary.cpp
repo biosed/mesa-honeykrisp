@@ -7181,19 +7181,68 @@ TEST_F(AGX3PackBinary, CentroidInterpolationStaysFailClosed)
       agx_stop(b);
       EXPECT_TRUE(pack(b, /*expect_ok=*/false).empty());
    }
-   {
-      /* A sample token does not name a centroid. */
-      agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
-      b->shader->stage = MESA_SHADER_FRAGMENT;
-      agx_itrcoords_agx3_to(b, agx_register(4, AGX_SIZE_32),
-                            agx_register(2, AGX_SIZE_16),
-                            AGX_INTERPOLATION_SAMPLE);
-      agx_interp_agx3_to(b, agx_register(0, AGX_SIZE_32), agx_immediate(3),
-                         agx_register(4, AGX_SIZE_32),
-                         AGX_INTERPOLATION_CENTROID, false);
-      agx_stop(b);
-      EXPECT_TRUE(pack(b, /*expect_ok=*/false).empty());
+}
+
+/* Token provenance is an SSA property, checked before register allocation. */
+TEST_F(AGX3PackBinary, InterpolationTokensComeFromTheirITRCOORDS)
+{
+   for (enum agx_interpolation interp :
+        {AGX_INTERPOLATION_SAMPLE, AGX_INTERPOLATION_CENTROID}) {
+      for (unsigned producer = 0; producer < 3; ++producer) {
+         agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
+         b->shader->stage = MESA_SHADER_FRAGMENT;
+         agx_index input = agx_temp(b->shader, AGX_SIZE_16);
+         agx_get_sr_to(b, input, AGX_SR_INPUT_SAMPLE_MASK);
+         agx_index token = agx_temp(b->shader, AGX_SIZE_32);
+         /* 0: the matching ITRCOORDS; 1: a sample token named as a
+          * centroid or the reverse; 2: an arithmetic value. */
+         if (producer == 2) {
+            agx_mov_to(b, token, agx_immediate(0));
+         } else {
+            agx_itrcoords_agx3_to(b, token, input,
+                                  producer == 0 ? interp
+                                  : interp == AGX_INTERPOLATION_SAMPLE
+                                     ? AGX_INTERPOLATION_CENTROID
+                                     : AGX_INTERPOLATION_SAMPLE);
+         }
+         agx_interp_agx3_to(b, agx_temp(b->shader, AGX_SIZE_32),
+                            agx_immediate(3), token, interp, false);
+         agx_stop(b);
+         EXPECT_EQ(agx3_interp_coords_from_itrcoords(b->shader),
+                   producer == 0);
+      }
    }
+}
+
+/* RA may move a token between ITRCOORDS and its consumers; the copy holds
+ * the same 32 bits, so the consumer encodes the register it reads. Astro
+ * Bot's constant-program fragment variants were refused at this shape. */
+TEST_F(AGX3PackBinary, CentroidInterpolationReadsAMovedToken)
+{
+   agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
+   b->shader->stage = MESA_SHADER_FRAGMENT;
+
+   agx_get_sr_to(b, agx_register(0, AGX_SIZE_16), AGX_SR_INPUT_SAMPLE_MASK);
+   agx_index coverage = agx_register(0, AGX_SIZE_16);
+   coverage.discard = true;
+   agx_itrcoords_agx3_to(b, agx_register(6, AGX_SIZE_32), coverage,
+                         AGX_INTERPOLATION_CENTROID);
+   /* A register copy, as agx_lower_pseudo leaves it for the packer. */
+   agx_bitop_to(b, agx_register(132, AGX_SIZE_32), agx_register(6, AGX_SIZE_32),
+                agx_zero(), UTIL_LUT2(a));
+   agx_index coords = agx_register(132, AGX_SIZE_32);
+   coords.discard = true;
+   agx_interp_agx3_to(b, agx_register(86, AGX_SIZE_32), agx_immediate(7),
+                      coords, AGX_INTERPOLATION_CENTROID, true);
+   agx_stop(b);
+
+   uint8_t interp[AGX3_VARY_MAX_LENGTH], len = 0;
+   ASSERT_TRUE(agx3_vary_interp_sample(AGX_ISA_ENCODING_AGX3B, 86, 7, true,
+                                       132, true, interp, &len));
+   const std::vector<uint8_t> code = pack(b);
+   EXPECT_NE(std::search(code.begin(), code.end(), interp, interp + len),
+             code.end())
+      << agx3_last_pack_refusal();
 }
 
 TEST_F(AGX3PackBinary, VertexStagingProducerMatchesAppleAndPreservesLiveness)
@@ -12743,7 +12792,8 @@ TEST_F(AGX3PackBinary, CachedHalfIdentityUnconditionalLoopBreak)
    const size_t branch_offset = want.size();
    ASSERT_TRUE(agx3_cf_branch(AGX_ISA_ENCODING_AGX3B, false, bytes, &len));
    ASSERT_TRUE(agx3_cf_patch_branch(AGX_ISA_ENCODING_AGX3B, false, bytes,
-                                    body_offset - branch_offset));
+                                    (int64_t)body_offset -
+                                       (int64_t)branch_offset));
    append(want, bytes, len);
    ASSERT_TRUE(agx3_cf_cndend(AGX_ISA_ENCODING_AGX3B, 2, bytes, &len));
    append(want, bytes, len);
@@ -14940,6 +14990,42 @@ TEST_F(AGX3PackBinary, StorageImageBankAndSlotMatchNative)
       AGX_ISA_ENCODING_AGX3B, &d, 0, 4, bytes, &len));
    ASSERT_EQ(len, sizeof(second));
    EXPECT_EQ(memcmp(bytes, second, sizeof(second)), 0);
+}
+
+/* Array layers stay constant across mip levels, unlike 3D depth, so G17C keeps
+ * array and 3D stores distinct. G17G drops the layer operand and still writes
+ * layered images as 3D. */
+TEST_F(AGX3PackBinary, LayeredStorageImageWritesFollowTheChip)
+{
+   const struct {
+      enum agx_isa_encoding enc;
+      enum agx_chip chip;
+      bool distinct;
+   } cases[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, true},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17C, true},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17G, false},
+   };
+   for (const auto &c : cases) {
+      key.dev.chip = c.chip;
+      std::vector<uint8_t> code[2];
+      for (unsigned i = 0; i < 2; ++i) {
+         agx_builder *b = builder(c.enc);
+         b->shader->stage = MESA_SHADER_COMPUTE;
+         agx_index data = agx_register(8, AGX_SIZE_32);
+         data.channels_m1 = 3;
+         agx_index coords = agx_register(0, AGX_SIZE_32);
+         coords.channels_m1 = 2;
+         agx_image_write(b, data, coords, agx_immediate(0),
+                         agx_uniform(20, AGX_SIZE_64),
+                         agx_register(6, AGX_SIZE_32),
+                         i ? AGX_DIM_3D : AGX_DIM_2D_ARRAY, false);
+         agx_stop(b);
+         code[i] = pack(b);
+         ASSERT_FALSE(code[i].empty());
+      }
+      EXPECT_EQ(code[0] != code[1], c.distinct) << "chip " << c.chip;
+   }
 }
 
 TEST_F(AGX3PackBinary, InFlightStorageImageWritesUseDisjointBanks)

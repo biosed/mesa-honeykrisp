@@ -550,15 +550,52 @@ lower_preamble(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 }
 
 /*
+ * The flag a preamble store exports: the 1-bit value itself, or, once
+ * widen_half_exports() has run, the bool of its word bcsel(flag, 1, 0), which
+ * sets *word.
+ */
+static nir_scalar
+flag_store_value(nir_intrinsic_instr *store, bool *word)
+{
+   nir_def *value = store->src[0].ssa;
+   *word = false;
+   if (value->num_components != 1)
+      return (nir_scalar){NULL, 0};
+   if (value->bit_size == 1)
+      return nir_get_scalar(value, 0);
+
+   nir_alu_instr *sel = nir_def_as_alu_or_null(value);
+   if (value->bit_size == 32 && sel && sel->op == nir_op_bcsel &&
+       nir_src_bit_size(sel->src[0].src) == 1 &&
+       nir_src_is_const(sel->src[1].src) &&
+       nir_src_as_uint(sel->src[1].src) == 1 &&
+       nir_src_is_const(sel->src[2].src) &&
+       nir_src_as_uint(sel->src[2].src) == 0) {
+      *word = true;
+      return nir_get_scalar(sel->src[0].src.ssa, sel->src[0].swizzle[0]);
+   }
+   return (nir_scalar){NULL, 0};
+}
+
+/*
  * A preamble boolean that the main program only selects on is exported as the
  * half 1.0 or 0.0 and compared against zero where it is used. This is Apple's
  * G17P shape for a select on a constant-program flag: the constant program
  * converts the flag once, and every select reads the uniform directly as its
  * comparand (agx3_alu_fcmp_select, f42 = 3), instead of copying the 0/1 half
  * into a register for each integer select.
+ *
+ * With @branches, a flag the main program also branches on is exported the
+ * same way when its store is already a word with zeroes on top
+ * (widen_half_exports(), G17P): the word is nonzero exactly when the flag is
+ * set, and a branch compares that aligned word against zero in place, as
+ * Apple's loop guard does (agx_lower_uniform_sources.c, uniform_imm_compare),
+ * instead of copying the half into a register for each branch. Called again
+ * after nir_opt_peephole_select, which turns most early flag branches into
+ * selects, so each use takes the form it ends up with.
  */
-static bool
-agx_nir_export_select_flags_as_halves(nir_shader *nir)
+bool
+agx_nir_export_select_flags_as_halves(nir_shader *nir, bool branches)
 {
    nir_function_impl *main = nir_shader_get_entrypoint(nir);
    if (!main->preamble)
@@ -567,8 +604,12 @@ agx_nir_export_select_flags_as_halves(nir_shader *nir)
 
    BITSET_DECLARE(flag, 512);
    BITSET_DECLARE(other, 512);
+   BITSET_DECLARE(branch, 512);
+   BITSET_DECLARE(word, 512);
    BITSET_ZERO(flag);
    BITSET_ZERO(other);
+   BITSET_ZERO(branch);
+   BITSET_ZERO(word);
 
    nir_foreach_block(block, main) {
       nir_foreach_instr(instr, block) {
@@ -590,8 +631,9 @@ agx_nir_export_select_flags_as_halves(nir_shader *nir)
             if (!selects_only)
                break;
             if (nir_src_is_if(use)) {
-               selects_only = false;
-               break;
+               selects_only = branches;
+               BITSET_SET(branch, base);
+               continue;
             }
             nir_instr *parent = nir_src_use_instr(use);
             selects_only =
@@ -615,13 +657,20 @@ agx_nir_export_select_flags_as_halves(nir_shader *nir)
              nir_intrinsic_preamble_class(intr) != nir_preamble_class_general)
             continue;
          const unsigned base = nir_intrinsic_base(intr);
-         nir_def *value = intr->src[0].ssa;
-         if (base < 512 && (value->bit_size != 1 || value->num_components != 1))
+         bool is_word;
+         if (base >= 512)
+            continue;
+         if (!flag_store_value(intr, &is_word).def)
             BITSET_SET(other, base);
+         else if (is_word)
+            BITSET_SET(word, base);
       }
    }
 
    BITSET_ANDNOT(flag, flag, other);
+   /* A branch reads the whole word: only a word with zeroes on top. */
+   BITSET_ANDNOT(branch, branch, word);
+   BITSET_ANDNOT(flag, flag, branch);
    if (BITSET_IS_EMPTY(flag))
       return false;
 
@@ -635,11 +684,13 @@ agx_nir_export_select_flags_as_halves(nir_shader *nir)
              nir_intrinsic_base(intr) >= 512 ||
              !BITSET_TEST(flag, nir_intrinsic_base(intr)))
             continue;
+         bool is_word;
+         nir_scalar value = flag_store_value(intr, &is_word);
          nir_builder b = nir_builder_at(nir_before_instr(instr));
-         nir_def *half = nir_bcsel(&b, intr->src[0].ssa,
+         nir_def *half = nir_bcsel(&b, nir_mov_scalar(&b, value),
                                    nir_imm_float16(&b, 1.0),
                                    nir_imm_float16(&b, 0.0));
-         nir_src_rewrite(&intr->src[0], half);
+         nir_src_rewrite(&intr->src[0], is_word ? nir_u2u32(&b, half) : half);
       }
    }
 
@@ -650,10 +701,23 @@ agx_nir_export_select_flags_as_halves(nir_shader *nir)
          nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
          if (intr->intrinsic != nir_intrinsic_load_preamble ||
              nir_intrinsic_preamble_class(intr) != nir_preamble_class_general ||
-             !BITSET_TEST(flag, nir_intrinsic_base(intr)))
+             !BITSET_TEST(flag, nir_intrinsic_base(intr)) ||
+             intr->def.bit_size != 1 /* or the word added below */)
             continue;
-         intr->def.bit_size = 16;
          nir_builder b = nir_builder_at(nir_after_instr(instr));
+         nir_def *word_value = NULL;
+         nir_foreach_use_including_if_safe(use, &intr->def) {
+            if (!nir_src_is_if(use))
+               continue;
+            if (!word_value) {
+               word_value = nir_load_preamble(&b, 1, 32,
+                                              .base = nir_intrinsic_base(intr));
+            }
+            b.cursor = nir_before_src(use);
+            nir_src_rewrite(use, nir_ine_imm(&b, word_value, 0));
+         }
+         b.cursor = nir_after_instr(instr);
+         intr->def.bit_size = 16;
          nir_def *set = nir_fneu_imm(&b, &intr->def, 0.0);
          nir_def_rewrite_uses_after(&intr->def, set);
       }
@@ -850,7 +914,7 @@ agx_nir_opt_preamble(nir_shader *nir, unsigned *sizes, bool g17p,
    }
 
    if (progress && g17p)
-      NIR_PASS(_, nir, agx_nir_export_select_flags_as_halves);
+      NIR_PASS(_, nir, agx_nir_export_select_flags_as_halves, false);
    if (progress && g17p && !agx3c)
       NIR_PASS(_, nir, widen_half_exports);
 

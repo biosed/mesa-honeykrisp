@@ -41,12 +41,12 @@ struct agx3_cdm_launch_info {
 
 /* Exact compact launch carrying a GPU address for indirect parameters.
  *
- * The pinned performEnqueueKernel implementations all use the same six-word
- * store sequence: G15G 0x210f2d4d4, G15X 0x2125b16c8, G16G 0x2147b875c,
- * G16X 0x2152bd768, G17P 0x216ac876c, G17G 0x215e9e760, and G17X
- * 0x217626b78.  The upper half of word 4 comes from an adjacent program-
- * variant template while its lower half carries indirect_parameters[47:32].
- * Complete semantics of the raw/template words remain intentionally unnamed. */
+ * G15G, G15X, G16G, G16X, G17P, G17G and G17X all use this launch: the same
+ * six words in the same order, for a kernel dispatch whose parameters are read
+ * indirectly from GPU memory. The upper half of word 4 comes from an adjacent
+ * program-variant template while its lower half carries
+ * indirect_parameters[47:32]. Complete semantics of the raw/template words
+ * remain intentionally unnamed. */
 struct agx3_cdm_indirect_launch_info {
    enum agx_chip chip;
    uint32_t word0_payload;
@@ -57,12 +57,12 @@ struct agx3_cdm_indirect_launch_info {
    uint64_t indirect_parameters;
 };
 
-/* Exact nine-word indirect launch form.  The pinned performEnqueueKernel
- * implementations use the same store order at G15G 0x210f2d508, G15X
- * 0x2125b16fc, G16G 0x2147b8790, G16X 0x2152bd79c, G17P 0x216ac87a0,
- * G17G 0x215e9e794, and G17X 0x217626bac.  Words 0..5 have the compact
- * indirect-launch layout above; words 6..8 are three independently masked
- * 11-bit values.  Their higher-level meaning is intentionally left unnamed. */
+/* Exact nine-word indirect launch form.  G15G, G15X, G16G, G16X, G17P,
+ * G17G and G17X all use the same word order for it.
+ *
+ * Words 0..5 have the compact indirect-launch layout above; words 6..8 are
+ * three independently masked 11-bit values.  Their higher-level meaning is
+ * intentionally left unnamed. */
 struct agx3_cdm_indirect_launch_36_info {
    enum agx_chip chip;
    uint32_t word0_payload;
@@ -90,9 +90,8 @@ struct agx3_cdm_barrier_info {
    /* G17 Gen7 drives bits 12, 11, 10 and 1 from flags 0..3.  Earlier
     * inspected emitters expose only canonical flag sets 0 and 0b0101. */
    uint8_t flags;
-   /* The G15 and G16G ComputeContext::encodeBarrier emit 0x600201fe and
-    * 0x600215fe for a nonzero visibility: the ordinary word with 0x2009e
-    * set. */
+   /* The G15 and G16G compute barriers are 0x600201fe and 0x600215fe for a
+    * nonzero visibility: the ordinary word with 0x2009e set. */
    bool wide_visibility;
    /* Memory-scope flush (AGX3_CDM_BARRIER_FLUSH_MEMORY): the strong flush
     * (flags 5) alone makes writes visible only to later reads through the
@@ -161,8 +160,8 @@ static inline bool
 agx3_cdm_indirect_launch_target_grounded(enum agx_chip chip)
 {
    switch (chip) {
-   /* G18G: performEnqueueKernel's six-word store, AGXMetalG18G 0x219484680;
-    * the template's upper half of word 4 is 0. */
+   /* G18G: the same six-word launch; the template's upper half of word 4
+    * is 0. */
    case AGX_CHIP_G18G:
    case AGX_CHIP_G15G:
    case AGX_CHIP_G15S:
@@ -181,14 +180,14 @@ agx3_cdm_indirect_launch_target_grounded(enum agx_chip chip)
    }
 }
 
-/* Keep the nine-word family independently gated: its presence was checked at
- * each store site cited above and must not be inferred from the six-word
+/* Keep the nine-word family independently gated: its presence was checked
+ * per family as listed above and must not be inferred from the six-word
  * family even though their prefixes have the same byte formula. */
 static inline bool
 agx3_cdm_indirect_launch_36_target_grounded(enum agx_chip chip)
 {
    switch (chip) {
-   /* G18G: the nine-word store, AGXMetalG18G 0x2194846b4. */
+   /* G18G: the same nine-word launch. */
    case AGX_CHIP_G18G:
    case AGX_CHIP_G15G:
    case AGX_CHIP_G15S:
@@ -207,10 +206,9 @@ agx3_cdm_indirect_launch_36_target_grounded(enum agx_chip chip)
    }
 }
 
-/* The pinned patchCDMControlStreamAndReset sites prove the 48-bit link form
- * in every scoped base and aggregate family.  The base paths extract exactly
- * 16 high address bits before ORing type 1: G15G 0x210f7aaa4,
- * G16G 0x2147fd6f8, G17P 0x216b0d708 and G17G 0x215ee94ec. */
+/* The 48-bit link form holds in every scoped base and aggregate family.
+ * The link word carries exactly 16 high address bits ORed with type 1 on
+ * G15G, G16G, G17P and G17G. */
 static inline bool
 agx3_cdm_stream_link_target_grounded(enum agx_chip chip)
 {
@@ -620,15 +618,15 @@ agx3_cdm_barrier_flags_grounded(enum agx_chip chip, uint8_t flags)
    }
 }
 
-/* The wide-visibility barrier forms are witnessed in the G15S (AGXG15SDevice)
- * and G16G CommandEncodingNext emitters only. */
+/* The wide-visibility barrier forms are only known on G15S and G16G with
+ * the AGX3 compute command encoding. */
 static inline bool
 agx3_cdm_barrier_wide_visibility_grounded(enum agx_chip chip)
 {
    /* G15C (M3 Max) is G15S's generation with more clusters and takes the
     * same forms. */
-   return chip == AGX_CHIP_G15S || chip == AGX_CHIP_G15C ||
-          chip == AGX_CHIP_G16G;
+   return chip == AGX_CHIP_G15G || chip == AGX_CHIP_G15S ||
+          chip == AGX_CHIP_G15C || chip == AGX_CHIP_G16G;
 }
 
 #define AGX3_CDM_BARRIER_WIDE_VISIBILITY UINT32_C(0x0002009e)
@@ -876,7 +874,7 @@ agx3_cdm_secondary_barrier_validate(enum agx_chip chip, const void *packed,
              UINT32_C(0x60000502);
 }
 
-/* Every inspected classic and CommandEncodingNext encoder advances the CDM
+/* With both the classic and the AGX3 compute command encoding, the CDM
  * cursor by exactly four bytes and stores this single terminate word. */
 static inline bool
 agx3_cdm_stream_terminate_pack(

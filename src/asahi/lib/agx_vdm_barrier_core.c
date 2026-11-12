@@ -9,17 +9,15 @@
 #include <string.h>
 
 /*
- * Pack/unpack only the exact four-byte type-1 VDM memory barrier emitted by
- * the inspected G15G/G15X, G16G/G16X, G17P, and G17G/G17X Apple Metal
- * plugins.  The target allowlist contains only identities directly served by
- * those plugins; G16P and G17A remain closed.
+ * Pack/unpack only the exact four-byte type-1 VDM memory barrier used on
+ * G15G/G15X, G16G/G16X, G17P, and G17G/G17X.  The target allowlist contains
+ * only those identities; G16P and G17A remain closed.
  *
- * The inspected aggregate G15X path can set word bits 2..4 when the separate
- * DeviceConstants::hasMultipleAGCs property is true.  No per-identity value
- * for that property is pinned, so this helper deliberately rejects that
- * alternate form on every target.  This is a representation/validation
- * helper only and does not emit a live command, submit work, or admit a
- * device.
+ * The aggregate G15X family can set word bits 2..4 on multi-cluster parts.  No
+ * per-identity value for that property is pinned, so this helper deliberately
+ * rejects that alternate form on every target.  This is a
+ * representation/validation helper only and does not emit a live command,
+ * submit work, or admit a device.
  */
 bool
 agx_vdm_barrier_core_supported(enum agx_chip chip)
@@ -36,8 +34,7 @@ agx_vdm_barrier_core_supported(enum agx_chip chip)
    case AGX_CHIP_G17G:
    case AGX_CHIP_G17S:
    case AGX_CHIP_G17C:
-   /* 26A428 AGXMetalG18G RenderContext::memoryBarrier appends the same word
-    * (0x219642398..3a0). */
+   /* G18G memory barriers use the same word. */
    case AGX_CHIP_G18G:
       return true;
 

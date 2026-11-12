@@ -325,9 +325,8 @@ main()
                   tri[v][a] = DEREF(src).coords[v][a];
          }
          my_geometry_id = geometry_flags & ~VK_GEOMETRY_OPAQUE;
-         /* Native Gen1 extractor 0x218e084c4..0x218e087f4 accepts the
-          * same triangle record for types8 and16, then compares type8
-          * to set the extracted geometry's opaque field. */
+         /* The Gen1 triangle record is the same for types 8 and 16;
+          * type 8 marks the geometry opaque. */
          my_type = (geometry_flags & VK_GEOMETRY_OPAQUE) != 0 ? 8u : 16u;
          for (uint v = 0; v < 3; ++v) {
             for (uint a = 0; a < 3; ++a)

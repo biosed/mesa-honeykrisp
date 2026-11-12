@@ -209,7 +209,7 @@ agx_rt_blas_gen3_single_triangle(void *packed, size_t available, uint64_t gpu_va
    if (!agx_rt_qtb_gen3_type2_from_triangle(result + 0xc0, 64, vertices))
       return false;
 
-   /* Compact unindexed geometry record. Unlike the older extractor fixture,
+   /* Compact unindexed geometry record. Unlike the older full-data fixture,
     * this native variant starts with 0x08, not the 0x50 full-data marker. */
    agx_store_le32(result + 0x100, 8);
    for (unsigned a = 0; a < 3; ++a)

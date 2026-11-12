@@ -397,10 +397,15 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
           I->op == AGX_OPCODE_STORE_OBJECT_CHILDCOUNT_M5)
          continue;
 
-      /* M5 reductions read a register even when every active lane contributes
-       * the same constant, as for the active invocation count. */
-      if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-          I->op == AGX_OPCODE_SIMD_REDUCE)
+      /* AGX3 reductions and scans read a register even when every active
+       * lane contributes the same constant. Uniform-address atomics can
+       * introduce exclusive scans of constants; inlining those constants
+       * leaves an operand the subgroup encoder cannot encode. */
+      if (ctx->key && agx_isa_is_agx3(ctx->key->dev.encoding) &&
+          (I->op == AGX_OPCODE_SIMD_REDUCE ||
+           I->op == AGX_OPCODE_SIMD_PREFIX ||
+           I->op == AGX_OPCODE_QUAD_REDUCE ||
+           I->op == AGX_OPCODE_QUAD_PREFIX))
          continue;
 
       /* Coverage-stack address/data operands, traversal addresses, and UVB
@@ -462,6 +467,16 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
        * M6 only. */
       if (ctx->key && agx_is_g18g(&ctx->key->dev) &&
           I->op == AGX_OPCODE_FCMPSEL && I->dest[0].size == AGX_SIZE_16)
+         continue;
+
+      /* AGX3's FMA takes a minifloat for one multiplicand (beside an optional
+       * minifloat addend) and has no form that multiplies two immediates, so
+       * the packer refused the whole shader (Cyberpunk 2077's benchmark
+       * vertex shaders: ffma r32, #k16, #k16, r32). Keep the second constant
+       * multiplicand in its register. */
+      if (ctx->key && ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX2 &&
+          I->op == AGX_OPCODE_FFMA && s < 2 &&
+          I->src[1 - s].type == AGX_INDEX_IMMEDIATE)
          continue;
 
       agx_instr *def = defs[src.value];
@@ -1708,7 +1723,7 @@ agx_optimizer_bitop(agx_context *ctx, agx_instr **defs, agx_instr *I)
 }
 
 /*
- * Fuse sign-extends into addition-like instructions:
+ * Fuse sign-extends into addition-like instructions.
  */
 static void
 agx_optimizer_signext(agx_context *ctx, agx_instr **defs, agx_instr *I)
@@ -1717,7 +1732,7 @@ agx_optimizer_signext(agx_context *ctx, agx_instr **defs, agx_instr *I)
       agx_index src = I->src[s];
       agx_instr *def = defs[src.value];
 
-      if (def == NULL || def->op != AGX_OPCODE_SIGNEXT)
+      if (def == NULL || def->op != AGX_OPCODE_SIGNEXT || src.abs)
          continue;
 
       /* Integer abs means zero extension. Keep the intermediate signed
@@ -1729,7 +1744,6 @@ agx_optimizer_signext(agx_context *ctx, agx_instr **defs, agx_instr *I)
          continue;
 
       agx_replace_src(I, s, def->src[0]);
-      assert(!I->src[s].abs && "sign-extended");
    }
 }
 

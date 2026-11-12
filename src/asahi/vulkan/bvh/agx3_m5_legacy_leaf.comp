@@ -11,9 +11,9 @@
  * minimum at 4, maximum at 16, geometry id/opaque bit at 28, primitive id at
  * 32) captured from public Metal on M5 Pro and read at those offsets by the
  * native runtime's agx.bounding_box_test. Records are packed at a 48-byte
- * stride directly in the child region: Apple's Gen1 extractor derives the
- * record stride from root word0 bits 5..7 (class 4 = 48 bytes) and dispatches
- * on record marker low five bits (24 = bounding box).
+ * stride directly in the child region: the Gen1 format derives the record
+ * stride from root word0 bits 5..7 (class 4 = 48 bytes) and identifies the
+ * record by the marker's low five bits (24 = bounding box).
  */
 #version 460
 #extension GL_GOOGLE_include_directive : require
@@ -248,7 +248,7 @@ main()
    bool aabbs = job.node_kind == HK_AGX3_NODE_AABBS;
    /* Bounding-box record stride: 48 (native record class 4) by default; 64
     * (class 5, one record per slot) is the ASAHI_M5_AABB_RECORD_STRIDE
-    * diagnostic. Both decode in Apple's extractor; only hardware traversal
+    * diagnostic. Both are valid Gen1 encodings; only hardware traversal
     * distinguishes them. */
    uint aabb_stride = HK_AGX3_GEN1 != 0 || args.slot_bias == 64u ? 64u : 48u;
    if (count < 1u || count > 8 ||
@@ -293,9 +293,8 @@ main()
             OFFSET(job.intermediate_bvh, job.triangle_offsets[lane]));
          uint geometry_flags = DEREF(src).geometry_id_and_flags;
          geometry_id[lane] = geometry_flags & ~VK_GEOMETRY_OPAQUE;
-         /* Native Gen1 extractor 0x218e084c4..0x218e087f4 accepts the
-          * same triangle record for types8 and16, then compares type8
-          * to set the extracted geometry's opaque field. */
+         /* The Gen1 triangle record is the same for types 8 and 16;
+          * type 8 marks the geometry opaque. */
          triangle_type[lane] =
             (geometry_flags & VK_GEOMETRY_OPAQUE) != 0 ? 8u : 16u;
          primitive[lane] = DEREF(src).triangle_id;

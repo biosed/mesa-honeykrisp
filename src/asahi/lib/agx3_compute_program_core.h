@@ -133,7 +133,7 @@ agx3_native_indirect_compute_dispatch_size(enum agx_chip chip)
 }
 
 /* Caller-owned command-stream span.  A successful append writes one exact
- * direct launch followed by CommandEncodingNext's strong flags=5 barrier. */
+ * direct launch followed by the AGX3 encoding's strong flags=5 barrier. */
 struct agx3_compute_dispatch_sink {
    uint8_t *data;
    size_t capacity;
@@ -197,10 +197,10 @@ bool agx3_g17g_native_compute_dispatch_append(
    const struct agx3_compute_direct_grid *grid, uint8_t barrier_flags,
    struct agx3_compute_dispatch_sink *sink);
 
-/* 26A428 AGXMetalG18G indirect launches. Mode 2
- * reads six u32 at grid_va: three global thread counts, then three local
- * sizes. Mode 1 reads three threadgroup counts at groups_va and carries the
- * local size in the record. Both append the caller's barrier. */
+/* G18G indirect launches. Mode 2 reads six u32 at grid_va: three global thread
+ * counts, then three local sizes. Mode 1 reads three threadgroup counts at
+ * groups_va and carries the local size in the record. Both append the caller's
+ * barrier. */
 #define AGX3_G17G_NATIVE_INDIRECT_GROUPS_MODE UINT32_C(0x08000000)
 #define AGX3_G17G_NATIVE_INDIRECT_LOCAL_MODE  UINT32_C(0x10000000)
 #define AGX3_G17G_NATIVE_INDIRECT_LOCAL_LAUNCH_SIZE  24u

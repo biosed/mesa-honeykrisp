@@ -842,6 +842,20 @@ struct vk_meta_image_copy_key {
    bool block_based;
 };
 
+/* Texels each thread of an image-to-buffer copy moves. At one 4-byte texel a
+ * thread the copy costs per thread, not per byte (1280x720 RGBA8 on G17P:
+ * 72 us; the same bytes as 16-byte texels: 25 us). A thread takes texels a
+ * tile width apart, so each store of a SIMD group stays one contiguous run.
+ */
+static unsigned
+copy_texels_per_thread(const struct vk_meta_image_copy_key *key)
+{
+   return key->type == IMG2BUF && key->block_size <= 4 &&
+                key->nr_samples == 1 && !key->block_based
+             ? 4
+             : 1;
+}
+
 static nir_def *
 linearize_coords(nir_builder *b, nir_def *coord,
                  const struct vk_meta_image_copy_key *key)
@@ -1016,7 +1030,15 @@ build_image_copy_shader(const struct vk_meta_image_copy_key *key,
       b, 2, 32, nir_imm_int(b, offsetof(struct vk_meta_push_data, grid_el)));
 
    /* We're done setting up variables, do the copy */
-   nir_def *coord = nir_load_global_invocation_id(b, 32);
+   unsigned tpt = copy_texels_per_thread(key);
+   nir_def *coord0 = nir_load_global_invocation_id(b, 32);
+   if (tpt > 1) {
+      /* A group covers tpt tiles along x: wg.x * TILE_WIDTH * tpt + lid.x */
+      nir_def *x = nir_channel(b, coord0, 0);
+      nir_def *lx = nir_channel(b, nir_load_local_invocation_id(b), 0);
+      x = nir_iadd(b, nir_imul_imm(b, nir_isub(b, x, lx), tpt), lx);
+      coord0 = nir_vector_insert_imm(b, coord0, x, 0);
+   }
 
    /* The destination format is already canonical, convert to an ISA format */
    enum pipe_format isa_format = PIPE_FORMAT_NONE;
@@ -1030,100 +1052,107 @@ build_image_copy_shader(const struct vk_meta_image_copy_key *key,
    nir_def *lid = nir_trim_vector(b, nir_load_local_invocation_id(b), 2);
    lid = nir_u2u16(b, lid);
 
-   nir_def *src_coord = src_is_buf ? coord : nir_iadd(b, coord, src_offset_el);
-   nir_def *dst_coord = dst_is_buf ? coord : nir_iadd(b, coord, dst_offset_el);
-
    nir_def *image_deref = &nir_build_deref_var(b, image)->def;
+   nir_def *dst_coord = NULL;
 
-   nir_def *coord_2d_el = nir_trim_vector(b, coord, 2);
-   nir_def *in_bounds;
-   if (key->block_based) {
-      nir_def *offset_in_block_el =
-         nir_umod_imm(b, nir_trim_vector(b, dst_offset_el, 2), TILE_WIDTH);
+   for (unsigned t = 0; t < tpt; ++t) {
+      nir_def *coord =
+         t ? nir_iadd(b, coord0, nir_imm_ivec3(b, TILE_WIDTH * t, 0, 0))
+           : coord0;
+      nir_def *src_coord =
+         src_is_buf ? coord : nir_iadd(b, coord, src_offset_el);
+      dst_coord = dst_is_buf ? coord : nir_iadd(b, coord, dst_offset_el);
 
-      dst_coord =
-         nir_vector_insert_imm(b, nir_isub(b, dst_coord, offset_in_block_el),
-                               nir_channel(b, dst_coord, 2), 2);
+      nir_def *coord_2d_el = nir_trim_vector(b, coord, 2);
+      nir_def *in_bounds;
+      if (key->block_based) {
+         nir_def *offset_in_block_el =
+            nir_umod_imm(b, nir_trim_vector(b, dst_offset_el, 2), TILE_WIDTH);
 
-      src_coord =
-         nir_vector_insert_imm(b, nir_isub(b, src_coord, offset_in_block_el),
-                               nir_channel(b, src_coord, 2), 2);
+         dst_coord =
+            nir_vector_insert_imm(b, nir_isub(b, dst_coord, offset_in_block_el),
+                                  nir_channel(b, dst_coord, 2), 2);
 
-      in_bounds = nir_uge(b, coord_2d_el, offset_in_block_el);
-      in_bounds = nir_iand(
-         b, in_bounds,
-         nir_ult(b, coord_2d_el, nir_iadd(b, offset_in_block_el, grid_2d_el)));
-   } else {
-      in_bounds = nir_ult(b, coord_2d_el, grid_2d_el);
-   }
+         src_coord =
+            nir_vector_insert_imm(b, nir_isub(b, src_coord, offset_in_block_el),
+                                  nir_channel(b, src_coord, 2), 2);
 
-   /* Special case handle buffer indexing */
-   if (dst_is_buf) {
-      assert(!key->block_based);
-      dst_coord = linearize_coords(b, dst_coord, key);
-   } else if (src_is_buf) {
-      src_coord = linearize_coords(b, src_coord, key);
-   }
+         in_bounds = nir_uge(b, coord_2d_el, offset_in_block_el);
+         in_bounds = nir_iand(
+            b, in_bounds,
+            nir_ult(b, coord_2d_el, nir_iadd(b, offset_in_block_el, grid_2d_el)));
+      } else {
+         in_bounds = nir_ult(b, coord_2d_el, grid_2d_el);
+      }
 
-   for (unsigned s = 0; s < key->nr_samples; ++s) {
-      nir_def *ms_index = nir_imm_int(b, s);
-      nir_def *value1 = NULL, *value2 = NULL;
+      /* Special case handle buffer indexing */
+      if (dst_is_buf) {
+         assert(!key->block_based);
+         dst_coord = linearize_coords(b, dst_coord, key);
+      } else if (src_is_buf) {
+         src_coord = linearize_coords(b, src_coord, key);
+      }
 
-      nir_push_if(b, nir_ball(b, in_bounds));
-      {
-         /* Copy formatted texel from texture to storage image */
-         nir_deref_instr *deref = nir_build_deref_var(b, texture);
+      for (unsigned s = 0; s < key->nr_samples; ++s) {
+         nir_def *ms_index = nir_imm_int(b, s);
+         nir_def *value1 = NULL, *value2 = NULL;
 
-         if (src_is_buf) {
-            value1 = load_store_formatted(b, get_push(b, buffer), src_coord,
-                                          NULL, key->dst_format, native_formatted_memory);
-         } else {
-            value1 = nir_txf(b, src_coord, .texture_deref = deref,
-                             .ms_index = msaa ? ms_index : NULL);
-            nir_def_as_tex(value1)->backend_flags = AGX_TEXTURE_FLAG_NO_CLAMP;
+         nir_push_if(b, nir_ball(b, in_bounds));
+         {
+            /* Copy formatted texel from texture to storage image */
+            nir_deref_instr *deref = nir_build_deref_var(b, texture);
 
-            /* Munge according to the implicit conversions so we get a bit copy */
-            if (key->src_format != key->dst_format) {
-               nir_def *packed =
-                  nir_format_pack_rgba(b, key->src_format, value1);
+            if (src_is_buf) {
+               value1 = load_store_formatted(b, get_push(b, buffer), src_coord,
+                                             NULL, key->dst_format, native_formatted_memory);
+            } else {
+               value1 = nir_txf(b, src_coord, .texture_deref = deref,
+                                .ms_index = msaa ? ms_index : NULL);
+               nir_def_as_tex(value1)->backend_flags = AGX_TEXTURE_FLAG_NO_CLAMP;
 
-               value1 = nir_format_unpack_rgba(b, packed, key->dst_format);
+               /* Munge according to the implicit conversions so we get a bit copy */
+               if (key->src_format != key->dst_format) {
+                  nir_def *packed =
+                     nir_format_pack_rgba(b, key->src_format, value1);
+
+                  value1 = nir_format_unpack_rgba(b, packed, key->dst_format);
+               }
+            }
+
+            if (dst_is_buf) {
+               load_store_formatted(b, get_push(b, buffer), dst_coord, value1,
+                                    key->dst_format, native_formatted_memory);
+            } else if (!key->block_based) {
+               nir_image_deref_store(b, image_deref, nir_pad_vec4(b, dst_coord),
+                                     ms_index, value1, nir_imm_int(b, 0),
+                                     .image_dim = dim_dst,
+                                     .image_array = !dst_is_buf,
+                                     /* G18G derives the imgwci format from the
+                                      * stored type; this kernel always writes
+                                      * the canonical 4x32 uint texel. */
+                                     .src_type = g18g ? nir_type_uint
+                                                      : nir_type_invalid);
             }
          }
-
-         if (dst_is_buf) {
-            load_store_formatted(b, get_push(b, buffer), dst_coord, value1,
-                                 key->dst_format, native_formatted_memory);
-         } else if (!key->block_based) {
-            nir_image_deref_store(b, image_deref, nir_pad_vec4(b, dst_coord),
-                                  ms_index, value1, nir_imm_int(b, 0),
-                                  .image_dim = dim_dst,
-                                  .image_array = !dst_is_buf,
-                                  /* G18G derives the imgwci format from the
-                                   * stored type; this kernel always writes
-                                   * the canonical 4x32 uint texel. */
-                                  .src_type = g18g ? nir_type_uint
-                                                   : nir_type_invalid);
+         nir_push_else(b, NULL);
+         if (key->block_based) {
+            /* Copy back the existing destination content */
+            value2 = nir_image_deref_load(b, 4, 32, image_deref,
+                                          nir_pad_vec4(b, dst_coord), ms_index,
+                                          nir_imm_int(b, 0), .image_dim = dim_dst,
+                                          .image_array = !dst_is_buf);
          }
-      }
-      nir_push_else(b, NULL);
-      if (key->block_based) {
-         /* Copy back the existing destination content */
-         value2 = nir_image_deref_load(b, 4, 32, image_deref,
-                                       nir_pad_vec4(b, dst_coord), ms_index,
-                                       nir_imm_int(b, 0), .image_dim = dim_dst,
-                                       .image_array = !dst_is_buf);
-      }
-      nir_pop_if(b, NULL);
+         nir_pop_if(b, NULL);
 
-      if (key->block_based) {
-         /* Must define the phi first so we validate. */
-         nir_def *phi = nir_if_phi(b, value1, value2);
-         nir_def *mask = nir_imm_intN_t(b, 1 << s, 16);
+         if (key->block_based) {
+            /* Must define the phi first so we validate. */
+            nir_def *phi = nir_if_phi(b, value1, value2);
+            nir_def *mask = nir_imm_intN_t(b, 1 << s, 16);
 
-         nir_store_local_pixel_agx(b, phi, mask, lid, .base = 0,
-                                   .write_mask = 0xf, .format = isa_format,
-                                   .explicit_coord = true);
+            nir_store_local_pixel_agx(b, phi, mask, lid, .base = 0,
+                                      .write_mask = 0xf, .format = isa_format,
+                                      .explicit_coord = true);
+         }
       }
    }
 
@@ -1467,7 +1496,8 @@ hk_meta_copy_image_to_buffer2(struct vk_command_buffer *cmd,
                                 sizeof(push), &push);
 
          disp->CmdDispatch(vk_command_buffer_to_handle(cmd),
-                           DIV_ROUND_UP(push.grid_el[0], 32),
+                           DIV_ROUND_UP(push.grid_el[0],
+                                        32 * copy_texels_per_thread(&key)),
                            DIV_ROUND_UP(push.grid_el[1], 32), push.grid_el[2]);
       }
    }

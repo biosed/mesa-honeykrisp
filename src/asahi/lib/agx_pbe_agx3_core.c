@@ -18,8 +18,8 @@
 #define AGX_PBE_LAYOUT_TWIDDLED 1u
 #define AGX_PBE_LAYOUT_GPU 2u
 /* G17P Interchange, Gen9 2D only: the Linear row-stride field, in macroblocks
- * per row (HAL200 PBEStateEncoderGen9::StateFields handles layouts 0 and 3 on
- * one path; Texture::getStride returns macroblocks for Interchange). */
+ * per row (the HAL200 Gen9 PBE treats layouts 0 and 3 the same way; the
+ * Interchange stride is counted in macroblocks). */
 #define AGX_PBE_LAYOUT_INTERCHANGE 3u
 
 static void
@@ -160,31 +160,30 @@ agx_pbe_agx3_2d_pack(uint32_t generation,
       word0 |= UINT64_C(1) <<
                (generation == AGX_PBE_AGX3_GENERATION_10 ? 61 : 59);
 
-   /* Gen9 StateFields (0x34f188..0x34f1f8) only writes word1 bit60 for
-    * array/type-flagged or kind3/4 images. This codec admits ordinary kind2,
-    * one layer only: its implicit extent and bit60 remain zero, even when
-    * the allocator padded that layer to a page. The legacy allocator flag
-    * is not that Gen9 field. Preserve the existing Gen10 encoding.
+   /* The Gen9 PBE descriptor only sets word1 bit60 for array/type-flagged or
+    * kind3/4 images. This codec admits ordinary kind2, one layer only: its
+    * implicit extent and bit60 remain zero, even when the allocator padded
+    * that layer to a page. The legacy allocator flag is not that Gen9 field.
+    * Preserve the existing Gen10 encoding.
     */
    const bool layer_flag = generation == AGX_PBE_AGX3_GENERATION_10 &&
                            fields->page_aligned_layers;
    uint64_t word1 = fields->buffer >> 4;
-   /* HAL300 StateFields 0x3e1a14..0x3e1a90 inserts stride-in-16-byte-units
-    * minus one at word1[59:44]. getStride at 0x566c3c divides bytes by 16.
-    * This shares the shifted-byte expression with Gen9, but retains four
-    * more address bits and one fewer stride bit. */
+   /* The HAL300 PBE descriptor holds stride-in-16-byte-units minus one at
+    * word1[59:44], the byte stride divided by 16. This shares the shifted-byte
+    * expression with Gen9, but retains four more address bits and one fewer
+    * stride bit. */
    if (fields->layout == AGX_PBE_LAYOUT_LINEAR ||
        fields->layout == AGX_PBE_LAYOUT_INTERCHANGE)
       word1 |= (uint64_t)(fields->stride_B - 16) << 40;
    else
       word1 |= (uint64_t)layer_flag << 60;
 
-   /* PBEStateEncoderGen9<kAGXRevHAL200>::StateFields sets word1 bit 61 in
-    * every layout whenever the texture format's gamma encoding (format
-    * descriptor +0x54) is nonzero, except for a few extended pixel formats
-    * that select bit 62 as well (+0x22c..+0x2dc). TextureGen4's
-    * encodeImageReadState turns the same field into the texture descriptor's
-    * sRGB bits, and AGX2's PBE keeps its sRGB store conversion at this bit. */
+   /* The HAL200 Gen9 PBE descriptor sets word1 bit 61 in every layout whenever
+    * the texture format is sRGB-encoded, except for a few extended pixel
+    * formats that select bit 62 as well. The texture descriptor carries the
+    * same property as its sRGB bits, and AGX2's PBE keeps its sRGB store
+    * conversion at this bit. */
    /* Gen10 (M5) converts stores to sRGB at the same word1 bit 61: an
     * R8G8B8A8_SRGB storage image and storage texel buffer stored
     * vec4(0.5, 0.2, 0.735, 0.5) as bc 7c df 80 with it and as the linear
@@ -200,16 +199,14 @@ agx_pbe_agx3_2d_pack(uint32_t generation,
    return true;
 }
 
-/* PBEStateEncoderGen9::StateFields 0x34ef68 and 0x34f00c..0x34f028:
- * level | (levels - 1) selects the extended descriptor. The level is
- * word2[47:44], levels-1 is word2[51:48], with word0 bit58 and word1 bit63
- * marking the extension. Using the native chain fields preserves the
- * allocation's mip tail addressing rather than pretending each level is a
+/* Gen9 PBE mip chains: level | (levels - 1) selects the extended descriptor.
+ * The level is word2[47:44], levels-1 is word2[51:48], with word0 bit58 and
+ * word1 bit63 marking the extension. Using the native chain fields preserves
+ * the allocation's mip tail addressing rather than pretending each level is a
  * standalone image.
  *
- * In the macOS 27 AGXMetalG17P the deposit is StateFields+0x1ec..+0x21c. It
- * reads only the level arguments, and nothing later on the tiled 2D-array or
- * 3D path rewrites word2 (their layer count lands in word1 at +0x374), so
+ * On G17P these fields depend only on the level arguments, and a tiled
+ * 2D-array or 3D target keeps word2 as is (its layer count lands in word1), so
  * layered targets take the same extension.
  */
 static void
@@ -227,13 +224,11 @@ mark_mip_chain(uint32_t generation, struct agx_pbe_agx3_descriptor *out, uint32_
               ((uint64_t)level << 44) | ((uint64_t)(levels - 1) << 48));
 }
 
-/* PBEStateEncoderGen9<kAGXRevHAL200>::StateFields (AGXMetalG17P, macOS 27)
- * deposits a layer count at word1[59:44] and page-aligned layers at bit60 for
- * every layered write target, keeping the 2D geometry. A texture's own write
- * descriptor (WriteType 1, from TextureGen4::texBaseAddressesUpdated) takes
- * arrayLength - 1 for an array dimension whatever the length (+0x32c..+0x374),
- * so a one-layer array is still dimension 3, and depth - 1 for a 3D texture
- * (+0x4ac, reached from the kind-3 dimension select at +0x4a4).
+/* The HAL200 Gen9 PBE descriptor (G17P) holds a layer count at word1[59:44]
+ * and page-aligned layers at bit60 for every layered write target, keeping the
+ * 2D geometry. A texture's own write descriptor (write type 1) takes
+ * arrayLength - 1 for an array dimension whatever the length, so a one-layer
+ * array is still dimension 3, and depth - 1 for a 3D texture.
  */
 bool
 agx_pbe_g18_layered_pack(const struct agx_pbe_agx3_2d_fields *fields,
@@ -260,12 +255,12 @@ agx_pbe_g18_layered_mip_pack(const struct agx_pbe_agx3_2d_fields *fields,
        !agx_pbe_g18_2d_mip_pack(fields, level, levels, out))
       return false;
 
-   /* Original G18 storage producer: dimension at 0x219546a60..a64,
-    * layer/depth count at 0x219546da4..e10/f28..f38. Native replay528
-    * covers both tiled layouts, one-layer arrays and nonzero depth planes.
-    * Native612 adds selected levels in mip chains: the dimension/count and
-    * page flag compose with the ordinary 2D mip fields without rebasing the
-    * address or dimensions. The base codec preserves the layer flag. */
+   /* G18 storage targets carry the dimension and the layer/depth count the
+    * same way. Native replay528 covers both tiled layouts, one-layer arrays
+    * and nonzero depth planes. Native612 adds selected levels in mip chains:
+    * the dimension/count and page flag compose with the ordinary 2D mip fields
+    * without rebasing the address or dimensions. The base codec preserves the
+    * layer flag. */
    uint64_t word0 = load_le64(&out->bytes[0]);
    uint64_t word1 = load_le64(&out->bytes[8]);
    word0 = (word0 & ~UINT64_C(0xf)) | dimension;
@@ -357,10 +352,10 @@ agx_pbe_agx3_3d_mip_pack(
                        levels, out);
 }
 
-/* G18 StateFields (0x219546988..0x219547150) keeps Gen10's base geometry
- * but places sample selection at word0[59:58] and compression at bit61.
- * Scalar multisample targets do not inherit the page-aligned-layer flag;
- * arrays retain both that flag and their dimension even with one layer.
+/* The G18 PBE descriptor keeps Gen10's base geometry but places sample
+ * selection at word0[59:58] and compression at bit61. Scalar multisample
+ * targets do not inherit the page-aligned-layer flag; arrays retain both that
+ * flag and their dimension even with one layer.
  */
 static bool
 pack_gen10_multisample(const struct agx_pbe_agx3_2d_fields *fields,
@@ -480,7 +475,7 @@ agx_pbe_agx3_2d_multisample_pack(
        !agx_pbe_agx3_2d_pack(generation, fields, out))
       return false;
 
-   /* PBEStateEncoderGen9 clears word0[59:53] before depositing the selector,
+   /* The Gen9 PBE leaves word0[59:53] clear apart from the selector,
     * so the two selector bits are the only ones this adds on top of the
     * single-sample packet.
     */
@@ -561,10 +556,10 @@ agx_pbe_g18_2d_mip_pack(
        !agx_pbe_agx3_2d_pack(AGX_PBE_AGX3_GENERATION_10, fields, out))
       return false;
 
-   /* AGXMetalG18G 26A428 StateFields, native375: unlike Gen9's bit58,
-    * G18 marks the chain at word0 bit60. The level and levels-minus-one
-    * nibbles are word2[47:44] and [51:48]. Preserve the base address and
-    * dimensions so the hardware performs native mip-tail addressing. */
+   /* G18 PBE, native375: unlike Gen9's bit58, G18 marks the chain at word0
+    * bit60. The level and levels-minus-one nibbles are word2[47:44] and
+    * [51:48]. Preserve the base address and dimensions so the hardware
+    * performs native mip-tail addressing. */
    if (level || levels != 1) {
       store_le64(&out->bytes[0], load_le64(&out->bytes[0]) | (UINT64_C(1) << 60));
       store_le64(&out->bytes[8], load_le64(&out->bytes[8]) | (UINT64_C(1) << 63));

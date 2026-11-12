@@ -14,7 +14,7 @@
  *   update_bvh       8B, AGX3c witness only -- AGX3b is refused
  *
  * Everything here is encoded through the generic table encoder
- * (agx3_compose, generated from Apple's own llvm::AGX3 encoder tables) from
+ * (agx3_compose, over the AGX3 instruction encoding tables) from
  * per-form baselines recovered by decoding the witnessed corpus bytes, so a
  * wrong baseline cannot silently produce a valid-looking instruction.  The
  * witnesses are the same ones the byte-level codecs in agx3_pack.c pin:

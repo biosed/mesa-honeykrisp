@@ -7,6 +7,8 @@
 
 #include <stddef.h>
 
+#include "util/bitscan.h"
+
 enum agx_chip
 agx_chip_from_params(const struct drm_asahi_params_global *params)
 {
@@ -168,7 +170,7 @@ agx_chip_isa_encoding(enum agx_chip chip)
    case AGX_CHIP_G17C:
       return AGX_ISA_ENCODING_AGX3C;
 
-   /* Apple's "g18g-encodings" table, shared with G18M and G19P. */
+   /* The agx3d encoding table, shared with G18M and G19P. */
    case AGX_CHIP_G18G:
       return AGX_ISA_ENCODING_AGX3D;
 
@@ -345,9 +347,8 @@ agx_chip_submission_model(enum agx_chip chip)
    case AGX_CHIP_G17C:
       return AGX_SUBMISSION_MODEL_SKSM;
 
-   /* The only channel classes of the 26A428 mac18g kernelcache's
-    * AGX::PI_400::G::A0 accelerator are 3DChannelSKSM, TAChannelSKSM and
-    * CLChannelSKSM; there is no classic queue. */
+   /* On macOS 26A428 the G18G GPU has only SKSM channels, for 3D, TA
+    * and compute work; there is no classic queue. */
    case AGX_CHIP_G18G:
       return AGX_SUBMISSION_MODEL_SKSM;
 
@@ -423,6 +424,7 @@ agx_chip_driver_supported(enum agx_chip chip)
              agx_chip_sampler_generation(chip) ==
                 AGX_SAMPLER_GENERATION_GEN4_HAL200 &&
              agx_chip_submission_model(chip) == AGX_SUBMISSION_MODEL_DUAL;
+   case AGX_CHIP_G15G:
    case AGX_CHIP_G15S:
    case AGX_CHIP_G15C:
       return agx_chip_command_stream_generation(chip) ==
@@ -439,6 +441,41 @@ agx_chip_driver_supported(enum agx_chip chip)
    default:
       return false;
    }
+}
+
+/* The firmware interface version does not determine the GPU record layout.
+ * Both T8122 interfaces consume G15 records and Gen4 sampler words. Keep the
+ * physical chip as G15G so compiler scheduling and hardware workarounds agree.
+ */
+static bool
+agx_t8122_params_supported(const struct drm_asahi_params_global *params)
+{
+   if (params->chip_id != 0x8122 || params->num_dies != 1 ||
+       params->num_clusters_total != 1 ||
+       params->usc_generation != AGX_ISA_AGX3)
+      return false;
+
+   if (params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_LEGACY)
+      return true;
+
+   if (params->gpu_hal_generation != DRM_ASAHI_GPU_HAL_200 ||
+       params->gpu_revision != 0x20 || params->num_cores_per_cluster != 10)
+      return false;
+
+   const uint64_t mask = params->core_masks[0];
+   const unsigned cores = util_bitcount64(mask);
+   if ((mask >> 10) || (cores != 8 && cores != 10))
+      return false;
+   for (unsigned i = 1; i < DRM_ASAHI_MAX_CLUSTERS; ++i) {
+      if (params->core_masks[i])
+         return false;
+   }
+
+   return agx_chip_command_stream_generation(AGX_CHIP_G15G) ==
+             AGX_CS_GENERATION_G15 &&
+          agx_chip_sampler_generation(AGX_CHIP_G15G) ==
+             AGX_SAMPLER_GENERATION_GEN4 &&
+          agx_chip_sampler_heap_element_size(AGX_CHIP_G15G) == 32;
 }
 
 bool
@@ -466,6 +503,8 @@ agx_params_driver_supported(const struct drm_asahi_params_global *params)
              params->usc_generation == AGX_ISA_AGX3 &&
              params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_200;
    }
+   case AGX_CHIP_G15G:
+      return agx_t8122_params_supported(params);
    case AGX_CHIP_G15S:
       /* T6030/M3 Pro: one die, two clusters, AGX3 shaders on the legacy
        * (pre-HAL200) firmware interface. */
@@ -489,6 +528,33 @@ agx_params_driver_supported(const struct drm_asahi_params_global *params)
    default:
       return true;
    }
+}
+
+/* G15G uses the separately admitted T8122 runtime: its baseline advertises
+ * VM_STATUS and SCHEDULED_QUEUES, not exact-prior barriers. Other native
+ * profiles use the unified high-bit prior-command contract. Refuse a known
+ * mismatch before VM creation; these checks are not general ABI negotiation.
+ */
+bool
+agx_params_native_kernel_abi_supported(
+   const struct drm_asahi_params_global *params)
+{
+   if (!params)
+      return false;
+
+   const enum agx_chip chip = agx_chip_from_params(params);
+   if (!agx_chip_native_agx3(chip))
+      return true;
+
+   if (chip == AGX_CHIP_G15G) {
+      const uint64_t required = DRM_ASAHI_FEATURE_VM_STATUS |
+                                DRM_ASAHI_FEATURE_SCHEDULED_QUEUES;
+      return (params->features & required) == required;
+   }
+
+   const uint64_t required = DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS |
+                             DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS;
+   return (params->features & required) == required;
 }
 
 bool
@@ -522,11 +588,17 @@ agx_chip_exact_product_name(enum agx_chip chip)
 bool
 agx_params_m5_supported(const struct drm_asahi_params_global *params)
 {
-   return params && agx_chip_from_params(params) == AGX_CHIP_G17G &&
-          params->chip_id == 0x8142 && params->num_dies == 1 &&
-          params->num_clusters_total == 1 &&
-          params->usc_generation == AGX_ISA_AGX3 &&
-          params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_300;
+   if (!params || params->num_dies != 1 ||
+       params->usc_generation != AGX_ISA_AGX3 ||
+       params->gpu_hal_generation != DRM_ASAHI_GPU_HAL_300)
+      return false;
+
+   const enum agx_chip chip = agx_chip_from_params(params);
+   return (chip == AGX_CHIP_G17G && params->chip_id == 0x8142 &&
+           params->num_clusters_total == 1) ||
+          /* T6050 M5 Max (J716c): G17C, one die, four clusters. */
+          (chip == AGX_CHIP_G17C && params->chip_id == 0x6050 &&
+           params->num_clusters_total == 4);
 }
 
 bool

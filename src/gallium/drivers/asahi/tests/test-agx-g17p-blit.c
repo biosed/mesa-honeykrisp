@@ -1743,7 +1743,7 @@ main(void)
       status = 1;
    }
 
-   /* CommandEncodingNext parts must not take Gallium's AGX2 compute blitter.
+   /* AGX3-encoding parts must not take Gallium's AGX2 compute blitter.
     * The render blitter binds a vertex stage; the compute one never does, so
     * a null ctx->vs here means asahi_compute_blit() ran. */
    if (!agx2 && ctx->vs == NULL) {

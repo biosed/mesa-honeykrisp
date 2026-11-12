@@ -128,9 +128,9 @@ extern "C" {
  *
  * THE BANK-AND-OFFSET ASSIGNMENT IS PER SHADER, NOT ARCHITECTURAL.
  * agc.scs.get_layout() returns a packed i64 that agx.scs.get_unpacked_layout
- * splits into five fields, and Apple's own layout printer inside
- * libapplegpu-nt.dylib carries the note "The layout above only applies to this
- * shader in isolation."  Measured consequence: the curve parameter lands at
+ * splits into five fields, and that layout is only valid for the one
+ * shader it was produced for.
+ * Measured consequence: the curve parameter lands at
  * (bank 2, 896) under <instancing, curve_data> while the barycentrics land at
  * (bank 3, 512) under <instancing, triangle_data>.  Across all 27 kernels the
  * ONLY invariant placement was bank 0 offset 0, the staged ray.  So none of

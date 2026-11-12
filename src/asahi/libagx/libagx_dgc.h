@@ -658,13 +658,12 @@ agx_vdm_draw_size(enum agx_chip chip, struct agx_draw draw)
 static inline GLOBAL uint32_t *
 agx_vdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
 {
-   /* CommandEncodingNext emits this exact type-1 memory-barrier word on every
+   /* The AGX3 encoding uses this exact type-1 memory-barrier word on every
     * byte-witnessed G15--G17 identity.  Do not feed those chips through the
     * legacy genxml packet below: that packet is AGX2 and has a different
     * opcode/field layout.  Keep the unwitnessed G16P/G17A identities closed
-    * instead of guessing from their neighbouring families.  G18G's
-    * RenderContext::memoryBarrier appends the same word (26A428
-    * AGXMetalG18G 0x219642398..3a0). */
+    * instead of guessing from their neighbouring families.  G18G memory
+    * barriers use the same word. */
    switch (chip) {
    case AGX_CHIP_G15G:
    case AGX_CHIP_G15S:

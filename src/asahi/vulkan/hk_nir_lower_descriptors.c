@@ -50,6 +50,9 @@ struct lower_descriptors_ctx {
    /* Whether the hardware sampler word applies the API LOD bias. */
    bool sampler_has_lod_bias;
    bool d3d_nearest_mip;
+   /* Coherent image loads and stores access memory directly instead of the
+    * texture cache and PBE (see image_access_needs_memory_path()). */
+   bool coherent_images_in_memory;
    mesa_shader_stage stage;
 };
 
@@ -497,6 +500,163 @@ lower_g17p_r32_3d_diagnostic(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
+/*
+ * On GPUs with several clusters and the AGX2 cache operations (G13 and G14
+ * Pro/Max/Ultra), PBE stores and texture-path loads are not coherent between
+ * clusters: with the full device-scope release/acquire barrier train, an
+ * image texel written on one cluster can still read stale on another (the
+ * message-passing memory-model tests fail there and pass on the
+ * single-cluster G14G). Device memory accesses that are encoded coherent do
+ * reach the other clusters. So coherent and volatile image loads and stores
+ * (ACCESS_COHERENT also marks the accesses that MakeAvailable/MakeVisible
+ * cover, see nir_lower_memory_model) access the texel in memory directly,
+ * through the address computation that image atomics use. Only plain
+ * 32-bit-channel formats, whose texels are their memory words, take this
+ * path; storage images are never compressed.
+ */
+static bool
+image_access_needs_memory_path(nir_intrinsic_instr *intr,
+                               const struct lower_descriptors_ctx *ctx,
+                               enum pipe_format *format_out)
+{
+   if (!ctx->coherent_images_in_memory)
+      return false;
+
+   if (intr->intrinsic != nir_intrinsic_image_deref_load &&
+       intr->intrinsic != nir_intrinsic_image_deref_store)
+      return false;
+
+   if (!(nir_intrinsic_access(intr) & (ACCESS_COHERENT | ACCESS_VOLATILE)))
+      return false;
+
+   switch (nir_intrinsic_image_dim(intr)) {
+   case GLSL_SAMPLER_DIM_1D:
+   case GLSL_SAMPLER_DIM_2D:
+   case GLSL_SAMPLER_DIM_3D:
+      break;
+   default:
+      return false;
+   }
+
+   enum pipe_format format = nir_intrinsic_format(intr);
+   if (format == PIPE_FORMAT_NONE) {
+      nir_variable *var = nir_intrinsic_get_var(intr, 0);
+      if (var)
+         format = var->data.image.format;
+   }
+
+   switch (format) {
+   case PIPE_FORMAT_R32_FLOAT:
+   case PIPE_FORMAT_R32_SINT:
+   case PIPE_FORMAT_R32_UINT:
+   case PIPE_FORMAT_R32G32_FLOAT:
+   case PIPE_FORMAT_R32G32_SINT:
+   case PIPE_FORMAT_R32G32_UINT:
+   case PIPE_FORMAT_R32G32B32A32_FLOAT:
+   case PIPE_FORMAT_R32G32B32A32_SINT:
+   case PIPE_FORMAT_R32G32B32A32_UINT:
+      *format_out = format;
+      return true;
+   default:
+      return false;
+   }
+}
+
+static void
+lower_image_load_from_memory(nir_builder *b, nir_intrinsic_instr *intr,
+                             enum pipe_format format,
+                             const struct lower_descriptors_ctx *ctx)
+{
+   const struct hk_storage_image_descriptor_layout native =
+      hk_storage_image_descriptor_layout(ctx->descriptor_generation);
+   const enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
+   const bool array = nir_intrinsic_image_array(intr);
+   const unsigned coord_comps =
+      glsl_get_sampler_dim_coordinate_components(dim) + (array ? 1 : 0);
+   const unsigned channels = util_format_get_nr_components(format);
+   const enum gl_access_qualifier access = nir_intrinsic_access(intr);
+
+   nir_def *pbe = load_image_handle(b, ctx, intr->src[0], native.pbe);
+   nir_def *texture = load_image_handle(b, ctx, intr->src[0], native.texture);
+   nir_def *coord = nir_trim_vector(b, intr->src[1].ssa, coord_comps);
+
+   /* Out-of-bounds texels read as zero, as robust image loads do. */
+   nir_def *size = nir_bindless_image_size(b, coord_comps, 32, texture,
+                                           nir_imm_int(b, 0),
+                                           .image_dim = dim,
+                                           .image_array = array);
+   nir_def *in_bounds = nir_ball(b, nir_ult(b, coord, size));
+   nir_def *zero = nir_imm_zero(b, channels, 32);
+
+   nir_push_if(b, in_bounds);
+   nir_def *address = nir_bindless_image_texel_address(
+      b, 64, pbe, intr->src[1].ssa, intr->src[2].ssa, .image_dim = dim,
+      .image_array = array, .format = format, .access = access);
+   nir_def *texel = nir_load_global(b, channels, 32, address, .align_mul = 4,
+                                    .access = access & (ACCESS_COHERENT |
+                                                        ACCESS_VOLATILE));
+   nir_pop_if(b, NULL);
+   texel = nir_if_phi(b, texel, zero);
+
+   /* Missing channels read as 0, 0, 1. */
+   const bool is_float =
+      nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr)) ==
+      nir_type_float;
+   nir_def *chans[4];
+   for (unsigned c = 0; c < 4; ++c) {
+      if (c < channels)
+         chans[c] = nir_channel(b, texel, c);
+      else if (c == 3)
+         chans[c] = is_float ? nir_imm_float(b, 1.0) : nir_imm_int(b, 1);
+      else
+         chans[c] = nir_imm_int(b, 0);
+   }
+
+   nir_def_replace(&intr->def,
+                   nir_vec(b, chans, intr->def.num_components));
+}
+
+static void
+lower_image_store_to_memory(nir_builder *b, nir_intrinsic_instr *intr,
+                            enum pipe_format format,
+                            const struct lower_descriptors_ctx *ctx)
+{
+   const struct hk_storage_image_descriptor_layout native =
+      hk_storage_image_descriptor_layout(ctx->descriptor_generation);
+   const enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
+   const bool array = nir_intrinsic_image_array(intr);
+   const unsigned coord_comps =
+      glsl_get_sampler_dim_coordinate_components(dim) + (array ? 1 : 0);
+   const unsigned channels = util_format_get_nr_components(format);
+   const enum gl_access_qualifier access = nir_intrinsic_access(intr);
+
+   nir_def *pbe = load_image_handle(b, ctx, intr->src[0], native.pbe);
+   nir_def *texture = load_image_handle(b, ctx, intr->src[0], native.texture);
+   nir_def *coord = nir_trim_vector(b, intr->src[1].ssa, coord_comps);
+
+   /* Out-of-bounds stores are dropped, as robust image stores are. */
+   nir_def *size = nir_bindless_image_size(b, coord_comps, 32, texture,
+                                           nir_imm_int(b, 0),
+                                           .image_dim = dim,
+                                           .image_array = array);
+   nir_push_if(b, nir_ball(b, nir_ult(b, coord, size)));
+   nir_def *address = nir_bindless_image_texel_address(
+      b, 64, pbe, intr->src[1].ssa, intr->src[2].ssa, .image_dim = dim,
+      .image_array = array, .format = format, .access = access);
+   nir_store_global(b, nir_trim_vector(b, intr->src[3].ssa, channels),
+                    address, .align_mul = 4,
+                    .write_mask = BITFIELD_MASK(channels),
+                    .access = access & (ACCESS_COHERENT | ACCESS_VOLATILE));
+   nir_pop_if(b, NULL);
+
+   /* Later texture-path reads of the image in this invocation must see the
+    * store, as after an image atomic. */
+   if (!(access & ACCESS_NON_READABLE))
+      nir_fence_mem_to_tex_agx(b);
+
+   nir_instr_remove(&intr->instr);
+}
+
 static bool
 lower_image_intrin(nir_builder *b, nir_intrinsic_instr *intr,
                    const struct lower_descriptors_ctx *ctx)
@@ -505,6 +665,15 @@ lower_image_intrin(nir_builder *b, nir_intrinsic_instr *intr,
 
    if (lower_g17p_r32_3d_diagnostic(b, intr, ctx))
       return true;
+
+   enum pipe_format memory_format;
+   if (image_access_needs_memory_path(intr, ctx, &memory_format)) {
+      if (intr->intrinsic == nir_intrinsic_image_deref_load)
+         lower_image_load_from_memory(b, intr, memory_format, ctx);
+      else
+         lower_image_store_to_memory(b, intr, memory_format, ctx);
+      return true;
+   }
 
    /* Reads and queries use the texture descriptor; writes and atomics PBE. */
    const struct hk_storage_image_descriptor_layout native =
@@ -1781,10 +1950,12 @@ hk_nir_lower_descriptors(nir_shader *nir,
                          bool sparse_buffer_residency,
                          bool sparse_soft_unmapped,
                          uint64_t sparse_ro_offset, bool scaled_sampling,
-                         bool sampler_has_lod_bias, bool d3d_nearest_mip)
+                         bool sampler_has_lod_bias, bool d3d_nearest_mip,
+                         bool coherent_images_in_memory)
 {
    struct lower_descriptors_ctx ctx = {
       .stage = nir->info.stage,
+      .coherent_images_in_memory = coherent_images_in_memory,
       .scaled_sampling = scaled_sampling,
       .sampler_has_lod_bias = sampler_has_lod_bias,
       .d3d_nearest_mip = d3d_nearest_mip,
@@ -1827,8 +1998,9 @@ hk_nir_lower_descriptors(nir_shader *nir,
     * Apple. This is inherited from NVK.
     */
    const nir_metadata preserved =
-      ctx.descriptor_generation == 9 &&
-      debug_get_bool_option("ASAHI_G17P_R32_3D_ADDRESS_DIAGNOSTIC", false)
+      ctx.coherent_images_in_memory ||
+      (ctx.descriptor_generation == 9 &&
+       debug_get_bool_option("ASAHI_G17P_R32_3D_ADDRESS_DIAGNOSTIC", false))
          ? nir_metadata_none : nir_metadata_control_flow;
    const bool lower_sparse =
       ctx.sparse_buffer_residency &&

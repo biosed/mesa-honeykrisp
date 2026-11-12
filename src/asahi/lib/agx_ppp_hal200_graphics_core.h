@@ -47,8 +47,8 @@ bool agx_ppp_hal200_cull_mode_pack(enum agx_chip chip, unsigned cull_mode,
                                   bool front_face_ccw, uint32_t original,
                                   uint32_t *out);
 
-/* Native setProvokingVertexMode (458b4c..458b60): CULL bits7..8
- * encode raw vertex selector+1 independently of VDM and the VIT. */
+/* Provoking vertex: CULL bits7..8 encode raw vertex selector+1 independently
+ * of VDM and the VIT. */
 bool agx_ppp_hal200_cull_provoking_pack(enum agx_chip chip, unsigned selector,
                                        uint32_t original, uint32_t *out);
 
@@ -182,8 +182,8 @@ bool agx_ppp_hal200_output_select_pack(enum agx_chip chip,
                                       bool fragment_reads_z,
                                       uint32_t *out);
 
-/* Native vertex-state update writes viewport_count - 1 to context+0x1f94;
- * the HAL200 output bundle consumes that word unchanged. */
+/* The vertex state holds viewport_count - 1, and the HAL200 output bundle
+ * consumes that word unchanged. */
 bool agx_ppp_hal200_viewport_count_pack(enum agx_chip chip,
                                        unsigned viewport_count,
                                        uint32_t *out);

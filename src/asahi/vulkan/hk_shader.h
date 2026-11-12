@@ -212,6 +212,11 @@ struct hk_shader {
    /* G17P-only root prefix; serialized separately in its version-35 payload.
     * Keep hk_shader_info and version-34 payloads unchanged on other chips. */
    uint32_t root_descriptor_size;
+   /* G17P mesh: 32-bit words each varying slot takes in the per-primitive
+    * record (agx_gen1_mesh_record_layout()), serialized like the root prefix.
+    * A fragment shader compiled without this mesh shader reads its
+    * per-primitive inputs through hk_mesh_fs_twin(). */
+   uint8_t g17p_mesh_primitive_comps[64];
    struct agx_fragment_face_2_packed frag_face;
    struct agx_counts_packed counts;
 
@@ -422,6 +427,15 @@ struct hk_api_shader {
     * there, so a cache never hands it out unneeded). */
    bool border_emulating;
 
+   /* G17P: non-NULL for a fragment shader compiled without its mesh shader
+    * that reads per-primitive inputs, gl_PrimitiveID, gl_Layer or
+    * gl_ViewportIndex. A mesh shader stores those in per-primitive records
+    * whose layout it alone knows, so mesh draws use a twin compiled for that
+    * layout from this source (same inputs as a border source); mesh_twins
+    * holds the twins built so far, under mesh_source->lock. */
+   struct hk_border_source *mesh_source;
+   struct hk_mesh_fs_twin *mesh_twins;
+
    struct hk_shader variants[];
 };
 
@@ -429,6 +443,13 @@ struct hk_api_shader {
  * on first use. Thread-safe; NULL if it cannot be built. */
 struct hk_api_shader *hk_border_twin(struct hk_device *dev,
                                      struct hk_api_shader *obj);
+
+/* The twin of a fragment shader with a mesh source that reads per-primitive
+ * inputs from the records of this G17P mesh variant, built on first use.
+ * Thread-safe; NULL if it cannot be built. */
+struct hk_api_shader *hk_mesh_fs_twin(struct hk_device *dev,
+                                      struct hk_api_shader *obj,
+                                      const struct hk_shader *mesh);
 
 /* Make the `samples` variant of a dynamic-sample-count G17P fragment shader
  * available to hk_fs_variant(). Thread-safe; a no-op for other shaders. */
@@ -729,7 +750,8 @@ hk_nir_lower_descriptors(nir_shader *nir,
                          bool sparse_buffer_residency,
                          bool sparse_soft_unmapped,
                          uint64_t sparse_ro_offset, bool scaled_sampling,
-                         bool sampler_has_lod_bias, bool d3d_nearest_mip);
+                         bool sampler_has_lod_bias, bool d3d_nearest_mip,
+                         bool coherent_images_in_memory);
 
 VkResult hk_compile_shader(struct hk_device *dev,
                            struct vk_shader_compile_info *info,

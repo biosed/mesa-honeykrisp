@@ -6,6 +6,7 @@
  */
 #pragma once
 
+#include "hk_device.h"
 #include "hk_device_memory.h"
 #include "hk_private.h"
 
@@ -106,6 +107,25 @@ static inline bool
 hk_sparse_buffer_unmapped(const struct agx_device *dev)
 {
    return agx_chip_g17_m5(dev->chip) && agx_has_soft_fault(dev);
+}
+
+/* G13 and G14 build a texel buffer as a plain linear texture, which has no
+ * residency to report, so a sparse texel fetch reads the device-wide map of
+ * non-resident pages (hk_device::physical_sparse_map) instead. */
+static inline bool
+hk_sparse_texel_residency_from_map(const struct agx_device *dev)
+{
+   return dev->chip == AGX_CHIP_G13G || dev->chip == AGX_CHIP_G13X ||
+          dev->chip == AGX_CHIP_G14G || dev->chip == AGX_CHIP_G14X;
+}
+
+/* Whether the buffer's unbound pages are published to the device-wide map. */
+static inline bool
+hk_buffer_in_physical_sparse_map(const struct hk_device *dev,
+                                 const struct hk_buffer *buffer)
+{
+   return dev->physical_sparse_map && buffer->va &&
+          (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT);
 }
 
 VkResult hk_bind_scratch(struct hk_device *dev, struct agx_va *va,

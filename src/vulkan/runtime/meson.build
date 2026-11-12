@@ -368,3 +368,18 @@ if with_tests and dep_libdrm.found()
     timeout : 10,
   )
 endif
+
+if with_tests
+  test(
+    'vk_queue_lost_submit',
+    executable(
+      'vk_queue_lost_submit_test',
+      'tests/vk_queue_lost_submit_test.c',
+      include_directories : [inc_include, inc_src],
+      dependencies : [vulkan_lite_runtime_deps, idep_vulkan_lite_runtime_headers],
+      link_with : [libvulkan_lite_runtime, libvulkan_lite_instance],
+    ),
+    suite : ['vulkan'],
+    timeout : 10,
+  )
+endif

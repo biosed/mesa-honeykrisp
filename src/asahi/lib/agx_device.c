@@ -198,6 +198,17 @@ agx_drm_vm_status(struct agx_device *dev, int32_t *error)
    return true;
 }
 
+/* True once the kernel has failed this VM (a GPU recovery blamed our work).
+ * Every later bind and submission on it is refused.
+ */
+bool
+agx_device_vm_failed(struct agx_device *dev)
+{
+   int32_t error = 0;
+
+   return agx_drm_vm_status(dev, &error) && error != 0;
+}
+
 static int
 agx_drm_bo_bind(struct agx_device *dev, struct drm_asahi_gem_bind_op *ops,
                 uint32_t count)
@@ -433,6 +444,19 @@ agx_bo_alloc(struct agx_device *dev, size_t size, size_t align,
 
    ret = agx_bo_bind(dev, bo, bo->va->addr, bo->size, 0, bind);
    if (ret) {
+      int32_t vm_error = 0;
+
+      /* Once a GPU recovery has failed this VM, every bind is refused and
+       * every later submission fails, which the context already reports as
+       * a reset. Keep the BO, mapped for the CPU but unbound, so drivers
+       * that do not check every allocation keep running until the
+       * application notices the reset and recreates its context (Zen died
+       * in agx_batch_init's encoder allocation). Nothing that references it
+       * can execute on this VM.
+       */
+      if (agx_drm_vm_status(dev, &vm_error) && vm_error != 0)
+         return bo;
+
       agx_bo_free(dev, bo);
       return NULL;
    }
@@ -979,6 +1003,16 @@ agx_open_device(void *memctx, struct agx_device *dev)
       goto fail;
    }
 
+   if (dev->chip == AGX_CHIP_G15G &&
+       !agx_params_native_kernel_abi_supported(&dev->params)) {
+      fprintf(stderr,
+              "Incompatible native AGX3 kernel contract (features %#llx); "
+              "use the kernel matched to this Mesa build; see its "
+              "compatibility documentation\n",
+              (unsigned long long)dev->params.features);
+      goto fail;
+   }
+
    /* The M4 Pro runs as G17P too; it takes the M-series name below. */
    const char *product = dev->params.chip_id == 0x8140
                             ? agx_chip_exact_product_name(dev->chip)
@@ -1095,6 +1129,9 @@ agx_open_device(void *memctx, struct agx_device *dev)
    }
 
    uint64_t shader_size = 0x100000000ull;
+   /* T8122: only the lower half of the 2^40 window is free. */
+   if (dev->chip == AGX_CHIP_G15G)
+      shader_size = AGX_T8122_RUNTIME_WINDOW_HIGH - dev->shader_base;
 
    /*
     * Where the user heap goes relative to the USC window.
@@ -1190,7 +1227,8 @@ agx_open_device(void *memctx, struct agx_device *dev)
    const uint64_t user_limit =
       agx_chip_g17_m5(dev->chip) || dev->chip == AGX_CHIP_G18G
          ? AGX_M5_DATA_END
-         : heap_below_usc ? AGX_G17P_USER_LIMIT : vm_create.kernel_start;
+         : agx_va_user_limit(dev->chip, heap_below_usc,
+                             vm_create.kernel_start);
    uint64_t user_size = user_limit - user_start;
 
    int ret = dev->ops.simple_ioctl(dev, DRM_IOCTL_ASAHI_VM_CREATE, &vm_create);
@@ -1278,6 +1316,16 @@ agx_open_device(void *memctx, struct agx_device *dev)
    }
    if (agx_chip_native_agx3(dev->chip))
       initialized |= AGX_INIT_ALIAS_HEAP;
+   /* The compact alias heap starts inside the T8122 runtime USC base; keep
+    * out of it (the rest of that range is already outside the heap). */
+   if (dev->chip == AGX_CHIP_G15G &&
+       !util_vma_heap_alloc_addr(&dev->g17p_vdm_alias_heap,
+                                 AGX_G17P_VDM_ALIAS_BASE,
+                                 AGX_G17P_VDM_ALIAS_RESERVED_START -
+                                    AGX_G17P_VDM_ALIAS_BASE)) {
+      fprintf(stderr, "Failed to reserve the T8122 runtime USC base\n");
+      goto fail;
+   }
 
    if (!agx_va_reserve_runtime_graph_hole(
           dev->chip, &dev->main_heap, user_start, user_size,
@@ -1288,9 +1336,11 @@ agx_open_device(void *memctx, struct agx_device *dev)
    }
 
    /* Keep captured addresses unavailable to ordinary allocations between
-    * capture and replay. Reserve after all fixed firmware/alias holes, and
-    * for native AGX3 and M5 using the common allocator; other winsyses own their VA. */
-   if (agx_chip_native_agx3(dev->chip) || agx_chip_g17_m5(dev->chip)) {
+    * capture and replay, on every chip that uses the common allocator: on
+    * G13/G14 too, a captured address freed by the application is otherwise
+    * handed to the next ordinary allocation, and replaying it fails.
+    * Reserve after all fixed firmware/alias holes; virtio owns its VA. */
+   if (!dev->is_virtio) {
       dev->replay_heap_initialized = agx_capture_replay_heap_init(
          &dev->main_heap, &dev->replay_heap, user_size);
       if (!dev->replay_heap_initialized) {
@@ -1315,6 +1365,9 @@ agx_open_device(void *memctx, struct agx_device *dev)
       /* Compiled as G17G and re-encoded as agx3d (asahi_clc), launched
        * through the M5 compute profile (agx_launch_precomp). */
       dev->libagx_programs = libagx_g18g;
+   } else if (dev->chip == AGX_CHIP_G15G) {
+      /* Its own build: G15G needs the scheduling stalls G15S does not. */
+      dev->libagx_programs = libagx_g15g;
    } else if (dev->chip == AGX_CHIP_G15S || dev->chip == AGX_CHIP_G15C) {
       /* G15C executes the same AGX3B encoding as G15S with no extra
        * scheduling rules, so it runs the G15S build of the programs. */

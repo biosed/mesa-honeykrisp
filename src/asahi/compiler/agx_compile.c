@@ -4133,9 +4133,15 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
    }
 
    case nir_intrinsic_begin_invocation_interlock: {
+      b->shader->any_interlock = true;
       agx_wait_pixel_mask(b, 0xC);
       return NULL;
    }
+
+   case nir_intrinsic_end_invocation_interlock:
+      /* The end of the fragment releases class 12, which only lengthens the
+       * critical section. */
+      return NULL;
 
    case nir_intrinsic_ddx:
    case nir_intrinsic_ddx_coarse:
@@ -10138,6 +10144,8 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    if (progress) {
       if (byte_indices)
          NIR_PASS(_, nir, agx_nir_lower_subgroups_g17p);
+      else if (m5)
+         NIR_PASS(_, nir, agx_nir_lower_subgroups_m5);
       else
          NIR_PASS(_, nir, agx_nir_lower_subgroups);
    }
@@ -10311,6 +10319,10 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    if (byte_indices)
       NIR_PASS(_, nir, agx_nir_scalarize_int64);
    NIR_PASS(_, nir, nir_lower_int64);
+
+   /* Constant-program flags, now that their trivial branches are selects. */
+   if (byte_indices && !m5)
+      NIR_PASS(_, nir, agx_nir_export_select_flags_as_halves, true);
 
    /* After the selects of trivial if-else statements exist. */
    if (m5) {
@@ -12086,7 +12098,7 @@ agx3_merge_unread_pixel_waits(agx_context *ctx)
 {
    if (!agx_isa_is_agx3(ctx->key->dev.encoding) ||
        ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble ||
-       ctx->key->fs.ignore_tib_dependencies)
+       ctx->key->fs.ignore_tib_dependencies || ctx->any_interlock)
       return false;
 
    bool stores = false;
@@ -12567,7 +12579,6 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
        !agx3_reg_float_consts)
       NIR_PASS(_, nir, nir_move_output_stores_to_end);
 
-   struct agx_ioto_cprog_inputs preamble_inputs = {0};
    nir_index_blocks(impl);
    nir_index_ssa_defs(impl);
 
@@ -12818,9 +12829,8 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
 
    /* A preamble runs before the main shader and is not supplied with its
     * per-invocation GPR inputs. Check this after DCE so a dead preload does
-    * not reject the shader, and before RA lowers PRELOAD away. Uniform
-    * sources are recorded separately; this does not qualify the AGX3
-    * loader/constant-program entry ABI. G18G only. */
+    * not reject the shader, and before RA lowers PRELOAD away. This does
+    * not qualify the AGX3 loader/constant-program entry ABI. G18G only. */
    if (ctx->is_preamble && agx_is_g18g(&ctx->key->dev)) {
       STATIC_ASSERT(AGX_NUM_UNIFORMS == AGX_IOTO_CPROG_UNIFORM_HALFS);
       agx_foreach_instr_global(ctx, I) {
@@ -12892,6 +12902,17 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
 
    if (agx3_reserve_cube_scratch(ctx))
       agx_validate(ctx, "cube-array scratch");
+
+   /* Interpolation tokens are checked on SSA: RA may move them. */
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX2 &&
+       ctx->stage == MESA_SHADER_FRAGMENT &&
+       !agx3_interp_coords_from_itrcoords(ctx)) {
+      agx_set_refusal(ctx, "interpolation token without its ITRCOORDS",
+                      __LINE__);
+      binary->size = initial_binary_size;
+      ralloc_free(ctx);
+      return false;
+   }
 
    /* Record provenance before RA can create stack instructions. */
    const bool imports_only_before_ra = agx3_cprog_spill_provenance(ctx);
@@ -13074,29 +13095,6 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
       return false;
    }
 
-   /* Record the final encoded input set, after all lowering and allocation.
-    * Main-shader uniforms and eliminated preamble reads must not enter it. */
-   if (ctx->is_preamble && key->dev.encoding != AGX_ISA_ENCODING_AGX2) {
-      agx_foreach_instr_global(ctx, I) {
-         agx_foreach_src(I, s) {
-            agx_index src = I->src[s];
-            if (src.type != AGX_INDEX_UNIFORM)
-               continue;
-
-            const unsigned halves = agx_index_size_16(src);
-            if (src.value >= AGX_NUM_UNIFORMS ||
-                halves > AGX_NUM_UNIFORMS - src.value) {
-               ralloc_free(ctx);
-               return false;
-            }
-            for (unsigned h = src.value; h < src.value + halves; ++h)
-               preamble_inputs.uniform_halfs[h / 64] |=
-                  UINT64_C(1) << (h % 64);
-         }
-      }
-      preamble_inputs.known = true;
-   }
-
    if (agx_should_dump(nir, AGX_DBG_SHADERS))
       agx_print_shader(ctx, stdout);
 
@@ -13174,7 +13172,6 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
       out->nr_preamble_gprs = legacy_scratch ? 256 : nr_gprs;
       out->agx3_preamble_staging_halfs = ctx->agx3_staging_halfs;
       out->agx3_preamble_staging_known = ctx->agx3_staging_known;
-      out->agx3_preamble_encoded_inputs = preamble_inputs;
    }
    else {
       out->nr_gprs = nr_gprs;
@@ -13227,18 +13224,6 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
    bool selftest = false;
 #endif
 
-
-   /* There is no AGX3 disassembler, so dump the bytes instead: this is the
-    * only way to see what the packer actually emitted for a shader that
-    * compiles but renders wrongly, and the scratch decoder reads it
-    * directly. */
-   if (dump_shaders && ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX2) {
-      fprintf(stdout, "agx3 binary (%u bytes):\n",
-              (unsigned)(binary->size - offset));
-      for (unsigned i = offset; i < binary->size; ++i)
-         fprintf(stdout, "%02x", ((const uint8_t *)binary->data)[i]);
-      fprintf(stdout, "\n\n");
-   }
 
    if ((dump_shaders || selftest) &&
        ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX2) {
@@ -13495,7 +13480,7 @@ agx_preserve_quad_control(nir_shader *nir)
 
 static void
 agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_depth,
-                            bool g18g)
+                            bool g18g, bool m5)
 {
    if (!nir)
       return;
@@ -13565,6 +13550,8 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
       NIR_PASS(_, nir, agx_nir_lower_g18_subgroups);
    if (g17p)
       NIR_PASS(_, nir, agx_nir_lower_subgroups_g17p);
+   else if (m5)
+      NIR_PASS(_, nir, agx_nir_lower_subgroups_m5);
    else
       NIR_PASS(_, nir, agx_nir_lower_subgroups);
    NIR_PASS(_, nir, nir_lower_all_phis_to_scalar);
@@ -13650,20 +13637,20 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
 void
 agx_preprocess_nir(nir_shader *nir)
 {
-   agx_preprocess_nir_internal(nir, false, false, false);
+   agx_preprocess_nir_internal(nir, false, false, false, false);
 }
 
 void
 agx_preprocess_nir_g17p(nir_shader *nir)
 {
-   agx_preprocess_nir_internal(nir, true, true, false);
+   agx_preprocess_nir_internal(nir, true, true, false, false);
 }
 
 void
 agx_preprocess_nir_g18g(nir_shader *nir)
 {
    /* Select G18 trig without inheriting G17P subgroup/shared-memory rules. */
-   agx_preprocess_nir_internal(nir, false, false, true);
+   agx_preprocess_nir_internal(nir, false, false, true, false);
 }
 
 static bool
@@ -15429,6 +15416,36 @@ agx_validate_scs_nir(nir_shader *nir, const struct agx_shader_key *key,
    return true;
 }
 
+/* Whether a fragment shader takes a derivative: ddx/ddy or a texture
+ * operation with an implicit one. */
+static bool
+agx_fs_takes_derivatives(nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_tex &&
+                nir_tex_instr_has_implicit_derivative(nir_instr_as_tex(instr)))
+               return true;
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+            case nir_intrinsic_ddx:
+            case nir_intrinsic_ddx_fine:
+            case nir_intrinsic_ddx_coarse:
+            case nir_intrinsic_ddy:
+            case nir_intrinsic_ddy_fine:
+            case nir_intrinsic_ddy_coarse:
+               return true;
+            default:
+               break;
+            }
+         }
+      }
+   }
+   return false;
+}
+
 bool
 agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
                        struct agx_shader_part *out)
@@ -15556,7 +15573,8 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
    NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
 
    NIR_PASS(_, nir, agx_nir_lower_denorm_preserve);
-   if (key->dev.chip == AGX_CHIP_G17P)
+   if (key->dev.chip == AGX_CHIP_G17P ||
+       key->dev.encoding == AGX_ISA_ENCODING_AGX3C)
       NIR_PASS(_, nir, agx_nir_lower_fma_rte);
 
    /* Sin/cos that agx_preprocess_nir_g17p left for an explicit-RTE shader.
@@ -15979,8 +15997,16 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
          nir->info.fs.needs_coarse_quad_helper_invocations ||
          nir->info.writes_memory;
 
+      /* Quad intrinsics alone do not count: they read another lane's own
+       * value, which stays correct when a merged quad holds two primitives,
+       * and a merged quad is still full. spirv_to_nir sets require_full_quads
+       * for every quad operation, so only QuadDerivativesKHR counts here. */
       info->needs_quad_derivatives =
-         nir->info.fs.needs_coarse_quad_helper_invocations ||
+         (nir->info.fs.needs_coarse_quad_helper_invocations ||
+          nir->info.fs.needs_full_quad_helper_invocations) &&
+         (nir->info.fs.quad_derivatives || agx_fs_takes_derivatives(nir));
+
+      info->needs_full_quads =
          nir->info.fs.needs_full_quad_helper_invocations;
 
       /* Writing the sample mask requires tag writes */
@@ -16019,5 +16045,5 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
 void
 agx_preprocess_nir_m5(nir_shader *nir)
 {
-   agx_preprocess_nir_internal(nir, false, true, false);
+   agx_preprocess_nir_internal(nir, false, true, false, true);
 }

@@ -63,7 +63,7 @@ bool agx_pbe_agx3_2d_pack(
    const struct agx_pbe_agx3_2d_fields *fields,
    struct agx_pbe_agx3_descriptor *out);
 
-/* Gen9 HAL200 2D-array extension. PBEStateEncoderGen9 keeps the 2D field
+/* Gen9 HAL200 2D-array extension. The Gen9 PBE keeps the 2D field
  * geometry, selects dimension3, and places layers-1 at word1[59:44] with
  * page-aligned-layers at bit60. A one-layer array keeps dimension3. */
 bool agx_pbe_agx3_2d_array_pack(
@@ -87,16 +87,15 @@ bool agx_pbe_agx3_3d_mip_pack(
    uint32_t depth, uint32_t level, uint32_t levels,
    struct agx_pbe_agx3_descriptor *out);
 
-/* Multisample colour target. PBEStateEncoderGen9<kAGXRevHAL200>::StateFields
- * derives the dimension nibble as `2 + ((flags >> 16) & 2)`, so an ordinary
- * non-array multisample write target selects dimension 4, and deposits the
- * two-bit sample selector as `(samples >> 2) & 3` at word0[57:56] -- the same
- * Sample Count enum the texture descriptor uses (2x=0, 4x=1, 8x=2). Every
- * other field keeps its single-sample placement: the encoder writes the
+/* Multisample colour target. In the HAL200 Gen9 PBE an ordinary non-array
+ * multisample write target selects dimension 4 (2 when single-sampled), and
+ * the two-bit sample selector `(samples >> 2) & 3` sits at word0[57:56] -- the
+ * same Sample Count enum the texture descriptor uses (2x=0, 4x=1, 8x=2). Every
+ * other field keeps its single-sample placement: the descriptor holds the
  * logical width and height, not sample-expanded ones.
  *
  * Bounded to the tiled 2x/4x colour shapes G17P's tilebuffer admits. 8x has
- * the same encoder path but no tilebuffer or layout qualification, so it is
+ * the same field layout but no tilebuffer or layout qualification, so it is
  * refused here rather than guessed.
  */
 bool agx_pbe_agx3_2d_multisample_pack(
@@ -136,16 +135,16 @@ bool agx_pbe_agx3_2d_mip_pack(
    uint32_t generation, const struct agx_pbe_agx3_2d_fields *fields,
    uint32_t level, uint32_t levels, struct agx_pbe_agx3_descriptor *out);
 
-/* G18 StateFields (26A428) ordinary tiled 2D mip chain. G17G is not
- * admitted by this entry point's evidence. Width/height/buffer describe
- * the base allocation, not the selected level. */
+/* G18 PBE ordinary tiled 2D mip chain. G17G is not admitted by this entry
+ * point's evidence. Width/height/buffer describe the base allocation, not the
+ * selected level. */
 bool agx_pbe_g18_2d_mip_pack(
    const struct agx_pbe_agx3_2d_fields *fields, uint32_t level,
    uint32_t levels, struct agx_pbe_agx3_descriptor *out);
 
-/* G18 StateFields (26A428), storage-write mode: one-level uncompressed
- * tiled array (dimension3) or 3D (dimension5). Buffer is already rebased to
- * the first addressed slice; layers is the remaining layer/depth count. */
+/* G18 PBE, storage-write mode: one-level uncompressed tiled array (dimension3)
+ * or 3D (dimension5). Buffer is already rebased to the first addressed slice;
+ * layers is the remaining layer/depth count. */
 bool agx_pbe_g18_layered_pack(
    const struct agx_pbe_agx3_2d_fields *fields, uint32_t dimension,
    uint32_t layers, struct agx_pbe_agx3_descriptor *out);

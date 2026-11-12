@@ -383,11 +383,10 @@ agx3_g17p_store_native_program_pointer(uint8_t *packed, uint64_t program_va)
       UINT32_C(0x40000000) | (uint32_t)((program_va >> 40) & 0xff));
 }
 
-/* ComputeProgramVariant::finalize adds only bit 27 or 28 to the direct
- * template (AGXMetalG18G 0x21956f5b0, 0x21956f608; G17G 0x216031960,
- * 0x2160319c0). performEnqueueKernel never 1D-masks these templates and puts
- * the grid address in words 4..5 (0x2194846b4 nine words, 0x219484680 six).
- * Words 1..3 are the direct record's program pointer. */
+/* An indirect launch adds only bit 27 or 28 to the direct template, on both
+ * G18G and G17G. These templates are never 1D-masked, and the grid address
+ * goes in words 4..5 of both the nine-word and the six-word forms. Words 1..3
+ * are the direct record's program pointer. */
 static bool
 agx3_g17g_native_indirect_append(const struct agx3_compute_program *program,
                                  uint32_t mode, uint64_t grid_va,
@@ -506,8 +505,8 @@ agx3_m5_native_indirect_dispatch_append(
  * global and three local size words with words 4..5, the 48-bit address of a
  * six-u32 grid the GPU reads for itself (three global THREAD counts followed
  * by three local sizes).  That is why the record is 24 bytes where the direct
- * one is 40: the pinned performEnqueueKernel emitter at G17P 0x216ac876c
- * stores exactly these six words and advances its write cursor by 0x18. */
+ * one is 40: on G17P the launch is exactly these six words, and the
+ * command stream advances by 0x18. */
 static bool
 agx3_g17p_native_indirect_launch_pack(
    const struct agx3_compute_program *program, uint64_t geometry_va,
@@ -694,11 +693,10 @@ agx3_g17s_minimal_compute_program_prepare(
    if (!desc || !output || !written || !program)
       return false;
 
-   /* G17S live witness, ProgramVariantESLState::ProgramVariantESLState
-    * +12508 -> EslBuilder::loadFromUserBuffer.  Exact arguments are
-    * (w1..w6) = (4, 1, 0, 0x20000001, 0, 0).  The binding tag is constructed
-    * from user-buffer index one; keep only caller-visible/raw UniformData
-    * axes here and fail closed on every other layout. */
+   /* G17S live witness: a uniform load from a user buffer.  Exact arguments
+    * are (w1..w6) = (4, 1, 0, 0x20000001, 0, 0).  The binding tag is
+    * constructed from user-buffer index one; keep only caller-visible/raw
+    * UniformData axes here and fail closed on every other layout. */
    if (desc->root_uniform.user_buffer_binding != 1 ||
        desc->root_uniform.byte_offset != 0 ||
        desc->root_uniform.uniform_data_destination != 4 ||

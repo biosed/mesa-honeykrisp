@@ -397,6 +397,42 @@ libagx_buffer_texture_offset(constant struct agx_texture_packed *ptr, uint x)
    return x + d.buffer_offset_sw;
 }
 
+/*
+ * Whether texel x of a texel buffer lies in an unbound sparse page, from the
+ * device-wide map of non-resident pages: a 16-byte header, then one bit per
+ * 16 KiB page of [heap_base, heap_base + heap_size), set while the page is
+ * not resident.  The descriptor is the plain linear 2D texture hk builds over
+ * the buffer's read-only alias, AGX_TEXTURE_BUFFER_WIDTH texels wide, so the
+ * texel size is its row stride over its width.  Out-of-bounds texels, RGB32
+ * views and buffers outside the heap count as resident.
+ */
+uint
+libagx_buffer_texture_nonresident(constant struct agx_texture_packed *ptr,
+                                  uint x, constant uint *map,
+                                  uint64_t heap_base, uint64_t heap_size,
+                                  uint64_t ro_offset)
+{
+   agx_unpack(NULL, ptr, TEXTURE, d);
+
+   if (map == NULL || x >= d.buffer_size_sw ||
+       d.channels == AGX_CHANNELS_R32G32B32_EMULATED)
+      return 0;
+
+   uint texel_B = (d.stride + 16) / d.width;
+   uint64_t addr = (d.address & ~ro_offset) +
+                   (uint64_t)(x + d.buffer_offset_sw) * texel_B;
+   uint64_t offset = addr - heap_base;
+   if (offset >= heap_size)
+      return 0;
+
+   uint64_t page = offset >> 14;
+   uint word = map[4 + (page >> 5)];
+
+   /* A variable mask rather than (word >> page) & 1, which would fold into a
+    * bitfield extract whose offset is not masked to 0..31. */
+   return (word & (1u << (uint)(page & 31))) != 0;
+}
+
 uint
 libagx_buffer_image_offset(constant struct agx_pbe_packed *ptr, uint x)
 {

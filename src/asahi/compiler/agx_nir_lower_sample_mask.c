@@ -260,11 +260,6 @@ lower_sample_mask(nir_shader *shader, bool uniform_tests)
    return true;
 }
 
-bool
-agx_nir_lower_sample_mask(nir_shader *shader)
-{
-   return lower_sample_mask(shader, false);
-}
 
 /* M5 shader parts: one uniformly selected final coverage update. */
 bool
@@ -1087,7 +1082,8 @@ kill_alpha_coverage_at_update(nir_function_impl *impl, nir_def *slot,
  */
 static bool
 lower_sample_mask_deferred(nir_shader *shader, bool uniform_tests,
-                           bool early_update, bool *a2c_in_main)
+                           bool early_update, bool *a2c_in_main,
+                           bool keep_demoted)
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(shader);
 
@@ -1118,7 +1114,8 @@ lower_sample_mask_deferred(nir_shader *shader, bool uniform_tests,
     * colour export: pipeline.*.multisample.z_export.*_static_atc and
     * samplemask_early_fragment_tests_depth lost their depth writes with a
     * kill at the end of the shader. */
-   if (!shader->info.fs.needs_coarse_quad_helper_invocations &&
+   if (!keep_demoted &&
+       !shader->info.fs.needs_coarse_quad_helper_invocations &&
        !shader->info.fs.needs_full_quad_helper_invocations &&
        !lanes_reach_sensitive_work)
       return lower_sample_mask(shader, uniform_tests);
@@ -1128,8 +1125,8 @@ lower_sample_mask_deferred(nir_shader *shader, bool uniform_tests,
       (BITFIELD64_BIT(FRAG_RESULT_STENCIL) | BITFIELD64_BIT(FRAG_RESULT_DEPTH));
 
    const bool early = shader->info.fs.early_fragment_tests;
-   if (!early && !writes_zs && shader->info.fs.uses_discard &&
-       !lanes_reach_sensitive_work)
+   if (!keep_demoted && !early && !writes_zs &&
+       shader->info.fs.uses_discard && !lanes_reach_sensitive_work)
       return lower_sample_mask(shader, uniform_tests);
 
    if (early) {
@@ -1225,7 +1222,7 @@ lower_sample_mask_deferred(nir_shader *shader, bool uniform_tests,
 bool
 agx_nir_lower_sample_mask_deferred(nir_shader *shader)
 {
-   return lower_sample_mask_deferred(shader, false, false, NULL);
+   return lower_sample_mask_deferred(shader, false, false, NULL, false);
 }
 
 /* G17P: the final coverage update right after the last demote on each path.
@@ -1234,14 +1231,35 @@ agx_nir_lower_sample_mask_deferred(nir_shader *shader)
 bool
 agx_nir_lower_sample_mask_deferred_g17p(nir_shader *shader, bool *a2c_in_main)
 {
-   return lower_sample_mask_deferred(shader, false, true, a2c_in_main);
+   return lower_sample_mask_deferred(shader, false, true, a2c_in_main, false);
+}
+
+/*
+ * G13/G14 and other parts without the deferred lowering kill demoted samples
+ * where the demote happens. The kill ends a quad once none of its non-helper
+ * lanes is left, and its rasterizer helper lanes go with it although they
+ * never demoted. Non-quad subgroup operations of the lanes that keep running
+ * would then miss those helpers (a ballot taken after another quad's lanes
+ * were terminated counts fewer lanes than a ballot of the same lanes taken
+ * before). Such shaders apply every kill at the end instead, after the last
+ * subgroup operation.
+ */
+bool
+agx_nir_lower_sample_mask(nir_shader *shader)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+   if (shader->info.fs.uses_discard &&
+       cf_list_has(&impl->body, subgroup_instr))
+      return lower_sample_mask_deferred(shader, false, false, NULL, true);
+
+   return lower_sample_mask(shader, false);
 }
 
 /* M5: one uniformly selected final coverage update (final_coverage_update). */
 bool
 agx_nir_lower_sample_mask_deferred_m5(nir_shader *shader)
 {
-   return lower_sample_mask_deferred(shader, true, false, NULL);
+   return lower_sample_mask_deferred(shader, true, false, NULL, false);
 }
 
 bool

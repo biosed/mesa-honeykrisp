@@ -340,6 +340,9 @@ struct hk_sync_state {
    struct hk_cs *pass_tile_wait[HK_SYNC_NUM_SQ];
    /* Attachment producers, including a compute replacement of a clear. */
    struct hk_cs *pass_tile_first, *pass_tile_last;
+   /* The last attachment producer of a suspended pass instance, which the
+    * resuming instance continues from. */
+   struct hk_cs *suspended_last;
 };
 
 /* Per-queue state: kinds of streams ever submitted on each subqueue. A
@@ -468,7 +471,7 @@ void hk_sync_order_xfer(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 /* Render pass instance boundaries. */
 void hk_sync_begin_rendering(struct hk_cmd_buffer *cmd, bool resuming);
 void hk_sync_first_render_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
-void hk_sync_end_rendering(struct hk_cmd_buffer *cmd);
+void hk_sync_end_rendering(struct hk_cmd_buffer *cmd, bool suspending);
 
 /* A new render pass instance continues in cs, the render stream of the
  * instance that just ended, instead of a stream of its own: the stream takes

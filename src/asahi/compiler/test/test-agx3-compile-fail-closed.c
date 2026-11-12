@@ -937,6 +937,52 @@ check_device_atomic_compute(enum agx_isa_encoding encoding)
 }
 
 static bool
+check_uniform_atomic_tcs(enum agx_isa_encoding encoding)
+{
+   static const struct {
+      nir_atomic_op op;
+      unsigned value;
+   } cases[] = {
+      {nir_atomic_op_iadd, 2}, {nir_atomic_op_imin, 3},
+      {nir_atomic_op_imax, 4}, {nir_atomic_op_iand, 0},
+      {nir_atomic_op_ior, 7},  {nir_atomic_op_ixor, 4},
+   };
+
+   for (unsigned i = 0; i < ARRAY_SIZE(cases); ++i) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_TESS_CTRL, &agx_nir_options, "uniform TCS atomic");
+      b.shader->info.workgroup_size[0] = 1;
+      b.shader->info.workgroup_size[1] = 1;
+      b.shader->info.workgroup_size[2] = 1;
+
+      /* Software TCS keeps its API stage while running as a kernel. Unlike
+       * compute with a 1x1x1 workgroup, its uniform-address atomics go through
+       * nir_opt_uniform_atomics, including constant exclusive scans. Images
+       * have already been lowered to global addresses at this point. */
+      nir_def *old = nir_global_atomic(
+         &b, 32, nir_imm_int64(&b, 0x1000), nir_imm_int(&b, cases[i].value),
+         .atomic_op = cases[i].op);
+      nir_store_global(&b, old, nir_imm_int64(&b, 0x2000), .align_mul = 4);
+      agx_preprocess_nir(b.shader);
+
+      struct agx_shader_key key = {0};
+      key.dev.encoding = encoding;
+      struct agx_shader_part part = {0};
+      bool valid = agx_compile_shader_nir(b.shader, &key, &part);
+      valid &= part.binary != NULL && part.info.main_size > 0;
+      if (!valid)
+         fprintf(stderr, "uniform TCS atomic op %u rejected (encoding %u)\n",
+                 cases[i].op, encoding);
+      free(part.binary);
+      ralloc_free(b.shader);
+      if (!valid)
+         return false;
+   }
+
+   return true;
+}
+
+static bool
 check_shared_atomic_compute(enum agx_isa_encoding encoding)
 {
    static const uint8_t end[] = {0x0e, 0x00, 0x00, 0x00};
@@ -1243,11 +1289,6 @@ check_preamble_compute(enum agx_isa_encoding encoding, bool enable,
           * need temporary registers but no IPR staging; a known zero must
           * remain distinct from missing metadata and from the GPR count. */
          valid &= info->agx3_preamble_staging_halfs == 0;
-         valid &= info->agx3_preamble_encoded_inputs.known == enable &&
-                  info->agx3_preamble_encoded_inputs.uniform_halfs[0] ==
-                     (enable ? UINT64_C(0xf) : 0);
-         for (unsigned w = 1; w < AGX_IOTO_CPROG_UNIFORM_WORDS; ++w)
-            valid &= info->agx3_preamble_encoded_inputs.uniform_halfs[w] == 0;
       } else if (encoding == AGX_ISA_ENCODING_AGX2) {
          valid &= !info->agx3_preamble_staging_known &&
                   info->agx3_preamble_staging_halfs == 0;
@@ -1279,12 +1320,7 @@ check_preamble_compute(enum agx_isa_encoding encoding, bool enable,
                  compact.agx3_preamble_staging_halfs ==
                     info->agx3_preamble_staging_halfs &&
                  compact.agx3_preamble_staging_known ==
-                    info->agx3_preamble_staging_known &&
-                 compact.agx3_preamble_encoded_inputs.known ==
-                    info->agx3_preamble_encoded_inputs.known &&
-                 memcmp(compact.agx3_preamble_encoded_inputs.uniform_halfs,
-                        info->agx3_preamble_encoded_inputs.uniform_halfs,
-                        sizeof(info->agx3_preamble_encoded_inputs.uniform_halfs)) == 0;
+                    info->agx3_preamble_staging_known;
       }
    }
    if (supported && (uniform_loads || !valid)) {
@@ -1338,7 +1374,6 @@ check_preamble_entry_gpr(enum agx_isa_encoding encoding, bool g18g,
       value = nir_load_vertex_id_zero_base(&p);
    } else if (input == PREAMBLE_CONSTANT_ONLY) {
       value = nir_imm_int(&p, 47);
-      /* Dead input references must not survive into the input bitmap. */
       nir_load_preamble(&p, 1, 64, .base = 196);
    } else if (input == PREAMBLE_SPARSE_UNIFORMS) {
       nir_def *a = nir_load_global_constant(
@@ -1372,39 +1407,6 @@ check_preamble_entry_gpr(enum agx_isa_encoding encoding, bool g18g,
                          ? !compiled && !part.binary &&
                               !part.info.has_preamble && !part.info.binary_size
                          : compiled && part.binary && part.info.has_preamble;
-   if (compiled && valid) {
-      struct agx_ioto_cprog_inputs expected = {0};
-      if (encoding != AGX_ISA_ENCODING_AGX2) {
-         expected.known = true;
-         if (input == PREAMBLE_SPARSE_UNIFORMS) {
-            expected.uniform_halfs[0] = 0xf00;
-            /* The encoded half127 read imports word u63, then extracts its
-             * upper half. Both physical halves126/127 are input bytes. */
-            expected.uniform_halfs[1] = UINT64_C(0xc000000000000003);
-            expected.uniform_halfs[7] = UINT64_C(0xf000000000000000);
-         } else if (input != PREAMBLE_CONSTANT_ONLY) {
-            expected.uniform_halfs[0] = 0xf;
-         }
-      }
-      const struct agx_precompiled_kernel_info compact = agx_compact_kernel_info(&part.info);
-      for (unsigned w = 0; w < AGX_IOTO_CPROG_UNIFORM_WORDS; ++w) {
-         if (part.info.agx3_preamble_encoded_inputs.uniform_halfs[w] !=
-                expected.uniform_halfs[w] ||
-             compact.agx3_preamble_encoded_inputs.uniform_halfs[w] !=
-                expected.uniform_halfs[w])
-            fprintf(stderr, "preamble input word %u: full=%016llx compact=%016llx expected=%016llx\n",
-                    w,
-                    (unsigned long long)part.info.agx3_preamble_encoded_inputs.uniform_halfs[w],
-                    (unsigned long long)compact.agx3_preamble_encoded_inputs.uniform_halfs[w],
-                    (unsigned long long)expected.uniform_halfs[w]);
-      }
-      valid &= part.info.agx3_preamble_encoded_inputs.known == expected.known &&
-               compact.agx3_preamble_encoded_inputs.known == expected.known &&
-               memcmp(part.info.agx3_preamble_encoded_inputs.uniform_halfs, expected.uniform_halfs,
-                      sizeof(expected.uniform_halfs)) == 0 &&
-               memcmp(compact.agx3_preamble_encoded_inputs.uniform_halfs, expected.uniform_halfs,
-                      sizeof(expected.uniform_halfs)) == 0;
-   }
    fprintf(stderr, "preamble input encoding=%u mode=%u compiled=%u valid=%u\n",
            encoding, input, compiled, valid);
    free(part.binary);
@@ -2560,6 +2562,8 @@ main(int argc, char **argv)
       for (unsigned i = 0; i < ARRAY_SIZE(encodings); ++i) {
          if (!check_device_atomic_compute(encodings[i]))
             return 1;
+         if (!check_uniform_atomic_tcs(encodings[i]))
+            return 1;
       }
       return 0;
    }
@@ -2659,6 +2663,8 @@ main(int argc, char **argv)
       if (!check_device_rmw_compute(encodings[i]))
          return 1;
       if (!check_device_atomic_compute(encodings[i]))
+         return 1;
+      if (!check_uniform_atomic_tcs(encodings[i]))
          return 1;
       if (!check_shared_atomic_compute(encodings[i]))
          return 1;

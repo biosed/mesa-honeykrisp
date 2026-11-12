@@ -9,10 +9,10 @@
 
 #include <string.h>
 
-/* Pinned CommandEncodingNext performEnqueueKernel emitters in the G15G,
- * G15X, G16G, G16X, G17P, G17G and G17X plugin families all construct this
- * direct 40-byte record.  G16P and G17A have no corresponding direct witness
- * in that corpus and deliberately remain closed. */
+/* The G15G, G15X, G16G, G16X, G17P, G17G and G17X families all use this
+ * direct 40-byte launch record with the AGX3 compute encoding.  G16P and
+ * G17A have no corresponding direct witness and deliberately remain
+ * closed. */
 bool
 agx3_cdm_direct_launch_target_grounded(enum agx_chip chip)
 {
@@ -32,10 +32,9 @@ agx3_cdm_direct_template_build(
        fields->word1_bits_3_20 > 0x3ffff)
       return false;
 
-   /* ComputeProgramVariant::finalize has the same bit construction on the
-    * G15/HAL200 and HAL300 sides of the command-stream boundary.  The source
-    * object offsets differ, but their recovered values occupy these exact
-    * template ranges in both implementations. */
+   /* The template has the same bit layout on the G15/HAL200 and HAL300
+    * sides of the command-stream boundary: the same values occupy these
+    * exact template ranges on both. */
    result->word0 = ((uint32_t)fields->word0_bits_3_14 << 3) |
                    ((uint32_t)fields->ray_traversal_depth_nonzero << 23) |
                    ((uint32_t)fields->subkernel_x_target_workitems << 19);
@@ -81,7 +80,7 @@ agx3_cdm_direct_template_build_from_sources(
    if (!sources || !result)
       return false;
 
-   /* ComputeProgramVariant::finalize rounds the TI spill bytes to quads in
+   /* The direct template rounds the TI spill bytes to quads in
     * launch word 1 and the TI IPR bytes to an even quad count in word 0, as
     * the vertex and fragment variants do for their stage state. */
    const uint64_t word1_value = ((uint64_t)sources->ti_spill_bytes + 3) >> 2;
@@ -97,9 +96,8 @@ agx3_cdm_direct_template_build_from_sources(
       .word1_bits_3_20 = (uint32_t)word1_value,
       .ray_traversal_depth_nonzero = sources->ray_traversal_depth_nonzero,
 
-      /* Every recovered HAL200/HAL300 finalize path initializes
-       * getSubKernelXTargetWorkitems() to one before constructing a direct
-       * template.  performEnqueueKernel may subsequently clear this bit for
+      /* On HAL200 and HAL300 the sub-kernel X target-workitems bit starts
+       * at one in every direct template.  The launch may then clear it for
        * a one-dimensional grid. */
       .subkernel_x_target_workitems = true,
    };
@@ -153,8 +151,8 @@ agx3_cdm_direct_dimension_word(uint8_t dimensions, uint32_t *word)
 static bool
 agx3_cdm_direct_g15x_bit31_allowed(enum agx_chip chip)
 {
-   return chip == AGX_CHIP_G15S || chip == AGX_CHIP_G15C ||
-          chip == AGX_CHIP_G15D;
+   return chip == AGX_CHIP_G15G || chip == AGX_CHIP_G15S ||
+          chip == AGX_CHIP_G15C || chip == AGX_CHIP_G15D;
 }
 
 bool
@@ -251,9 +249,9 @@ agx3_cdm_direct_launch_pack(
                                     info->g15x_has_multiple_agcs, &word3))
       return false;
 
-   /* performEnqueueKernel clears template bits 17..19 when both higher grid
+   /* A launch clears template bits 17..19 when both higher grid
     * axes contain fewer than two threads.  Bits 17 and 18 are already outside
-    * the proven template mask, leaving the directly recovered bit 19. */
+    * the proven template mask, leaving bit 19. */
    uint32_t emitted_word0 = info->template_words.word0;
    if (info->global_size[1] < 2 && info->global_size[2] < 2)
       emitted_word0 &= UINT32_C(0xfff1ffff);

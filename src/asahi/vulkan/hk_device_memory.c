@@ -7,6 +7,7 @@
 #include "hk_device_memory.h"
 
 #include "hk_device.h"
+#include "hk_queue.h"
 #include "hk_entrypoints.h"
 #include "hk_image.h"
 #include "hk_physical_device.h"
@@ -326,6 +327,8 @@ hk_FreeMemory(VkDevice device, VkDeviceMemory _mem,
 
    if (!mem)
       return;
+
+   hk_device_quiesce_lost_submissions(dev);
 
    const VkMemoryType *type = &pdev->mem_types[mem->vk.memory_type_index];
    struct hk_memory_heap *heap = &pdev->mem_heaps[type->heapIndex];

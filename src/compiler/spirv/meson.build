@@ -105,6 +105,7 @@ if with_tests and not with_nir_headers_only
         'tests/volatile.cpp',
         'tests/cmat.cpp',
         'tests/control_flow_tests.cpp',
+        'tests/hit_object.cpp',
         'tests/non_semantic.cpp',
         'tests/workarounds.cpp',
       ),

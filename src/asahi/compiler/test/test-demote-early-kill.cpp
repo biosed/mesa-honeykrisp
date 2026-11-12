@@ -684,6 +684,30 @@ TEST_F(DemoteEarlyKill, FullyDemotedQuadsAreKilledEarly)
    }
 }
 
+static bool
+lower_immediate(enum shape s)
+{
+   nir_shader *nir = build(s);
+   agx_nir_lower_discard_zs_emit(nir);
+   agx_nir_lower_sample_mask(nir);
+   nir_validate_shader(nir, "immediate demote lowering");
+   bool early = kill_is_early(nir);
+   ralloc_free(nir);
+   return early;
+}
+
+/* The immediate lowering (G13/G14, gallium) kills where the shader demotes,
+ * unless a non-quad subgroup operation could observe the rasterizer helper
+ * lanes that leave with a fully killed quad: then every kill waits for the
+ * end of the shader. */
+TEST_F(DemoteEarlyKill, ImmediateLoweringDefersKillsForSubgroupOperations)
+{
+   EXPECT_TRUE(lower_immediate(UNGUARDED));
+   EXPECT_FALSE(lower_immediate(SUBGROUP_AFTER));
+   EXPECT_FALSE(lower_immediate(ACTIVE_COUNT_AFTER));
+   EXPECT_FALSE(lower_immediate(ACTIVE_INDEX_AFTER));
+}
+
 /* A kill-only coverage update ahead of a sampled loop is still a kill ahead
  * of that loop, so a shader with one keeps every update at the end. */
 TEST_F(DemoteEarlyKill, NoDeadQuadKillBeforeSampledLoop)

@@ -862,6 +862,25 @@ swtnl_lower_pack_half(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
    return true;
 }
 
+/* The draw module runs the vertex, evaluation and geometry stages one SIMD
+ * vector at a time on one thread, so a barrier there has no invocations to
+ * wait for, and gallivm can only suspend a coroutine, which only the
+ * tessellation control stage is. Keep the memory semantics: gallivm emits
+ * them as a fence. */
+static bool
+swtnl_drop_execution_barrier(nir_builder *b, nir_intrinsic_instr *intr,
+                             void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_barrier ||
+       nir_intrinsic_execution_scope(intr) == SCOPE_NONE)
+      return false;
+   if (nir_intrinsic_memory_semantics(intr))
+      nir_intrinsic_set_execution_scope(intr, SCOPE_NONE);
+   else
+      nir_instr_remove(&intr->instr);
+   return true;
+}
+
 bool
 agx_swtnl_lower_for_draw(nir_shader *nir)
 {
@@ -869,6 +888,22 @@ agx_swtnl_lower_for_draw(nir_shader *nir)
    if (getenv("AGX_SWTNL_DUMP") && atoi(getenv("AGX_SWTNL_DUMP")) > 1)
       nir_print_shader(nir, stderr);
    NIR_PASS(progress, nir, draw_nir_lower_opcodes);
+
+   if (nir->info.stage != MESA_SHADER_TESS_CTRL)
+      NIR_PASS(progress, nir, nir_shader_intrinsics_pass,
+               swtnl_drop_execution_barrier, nir_metadata_control_flow, NULL);
+
+   /* gallivm has no quad operations, and its ballots are one 32-bit word:
+    * lower the subgroup operations as lavapipe does. */
+   const nir_lower_subgroups_options subgroups = {
+      .ballot_bit_size = 32,
+      .ballot_components = 1,
+      .lower_quad = true,
+      .lower_quad_vote = true,
+      .lower_inverse_ballot = true,
+      .lower_rotate_to_shuffle = true,
+   };
+   NIR_PASS(progress, nir, nir_lower_subgroups, &subgroups);
 
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
@@ -1006,7 +1041,7 @@ agx_swtnl_delete_shader(struct agx_context *ctx, struct agx_uncompiled_shader *s
 bool
 agx_swtnl_applies(struct agx_context *ctx)
 {
-   if (agx_device(ctx->base.screen)->chip != AGX_CHIP_G17G ||
+   if (!agx_chip_g17_m5(agx_device(ctx->base.screen)->chip) ||
        ctx->swtnl_inner || getenv("AGX_NO_SWTNL") ||
        (!ctx->stage[MESA_SHADER_GEOMETRY].shader &&
         !ctx->stage[MESA_SHADER_TESS_EVAL].shader))

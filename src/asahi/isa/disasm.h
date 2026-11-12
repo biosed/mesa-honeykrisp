@@ -9,12 +9,12 @@
 /*
  * One decoder per instruction encoding. AGX2 covers G13/G14 (M1/M2). AGX3 is a
  * different instruction set with three encodings, established by decoding a
- * 274-kernel corpus with each of Apple's own encoder tables:
+ * 274-kernel corpus with each of the AGX3 instruction encoding tables:
  *
  *   agx3b -- G15 (M3), G16 (M4) and G17P, all dies.
  *   agx3c -- G17 (M5), all dies.
- *   agx3d -- G18G (M6), transcribed from the "g18g-encodings" variant of the
- *            same tables. Every instruction of the 41 G18G witness programs
+ *   agx3d -- G18G (M6), transcribed from the third variant of the same
+ *            tables. Every instruction of the 41 G18G witness programs
  *            in src/asahi/compiler/test/native/g18g decodes to a known form
  *            under it and each program ends in `end`; under agx3c the same
  *            programs hit 128 unknown opcodes.

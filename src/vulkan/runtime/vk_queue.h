@@ -192,6 +192,13 @@ vk_queue_init(struct vk_queue *queue, struct vk_device *device,
 void
 vk_queue_finish(struct vk_queue *queue);
 
+/** Wait for host-side submission cleanup on a lost device. Not a GPU wait.
+ * Must not be called from a submission callback. Concurrent API submission
+ * using the objects being destroyed must already have stopped.
+ */
+void
+vk_queue_wait_lost_submissions(struct vk_queue *queue);
+
 /** Mark a queue as an emulated alias of another queue.
  *
  * The emulated queue shares the same underlying hardware queue as the

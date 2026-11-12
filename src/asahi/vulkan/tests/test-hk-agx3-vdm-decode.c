@@ -447,7 +447,7 @@ test_g17p_vertex_program_info(void)
    /* Vertex constant program. Apple's G17P terrain VS (MetalToolchain 27.1,
     * terrain-isa-diff-20260926/apple-metadata.json) imports eight CProg
     * uniform words: thread_invariant_spill_buffer_bytes 32, no TI IPR, 36
-    * CProg temporaries. VertexProgramVariant::finalize puts the TI spill
+    * CProg temporaries. The vertex program state puts the TI spill
     * quads (8) in pipeline-template bits 3..20 and the TI IPR quads in
     * vertex-shader word 0 bits 8..19. */
    struct hk_agx3_g17p_vertex_compile_info cprog_info = vkcube_info;

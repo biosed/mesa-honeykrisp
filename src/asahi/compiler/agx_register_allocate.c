@@ -2906,6 +2906,21 @@ pair_peer_publication_consumed_early(agx_context *ctx, unsigned value)
    return found;
 }
 
+/* Vectors need whole aligned slots for live range splitting, so the usable
+ * register file is a multiple of the largest vector, at least 8 halves.
+ */
+static unsigned
+ra_file_alignment(agx_context *ctx)
+{
+   unsigned alignment = 8;
+   agx_foreach_instr_global(ctx, I) {
+      agx_foreach_ssa_dest(I, d)
+         alignment = MAX2(alignment,
+                          util_next_power_of_two(agx_index_size_16(I->dest[d])));
+   }
+   return alignment;
+}
+
 static void
 agx_ra_impl(agx_context *ctx, bool disable_remat)
 {
@@ -2983,15 +2998,9 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    if (ctx->key->dev.emit_agx3d) {
       /* Round before deciding whether to spill. Rounding only at assignment
        * could leave demand above the aligned file after the spill pass. */
-      unsigned alignment = 8;
-      agx_foreach_instr_global(ctx, I) {
-         agx_foreach_ssa_dest(I, d) {
-            alignment = MAX2(alignment,
-                            util_next_power_of_two(agx_index_size_16(I->dest[d])));
-         }
-      }
-      max_possible_regs =
-         MIN2(max_possible_regs, ROUND_DOWN_TO(AGX3D_NUM_REGS, alignment));
+      max_possible_regs = MIN2(max_possible_regs,
+                               ROUND_DOWN_TO(AGX3D_NUM_REGS,
+                                             ra_file_alignment(ctx)));
    }
 
    /* Native G17G pressure shaders spill at 126 dwords. Direct M5 tests of
@@ -3000,14 +3009,9 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
     * whole vector slots; rounding only at final assignment is too late.
     */
    if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
-      unsigned alignment = 8;
-      agx_foreach_instr_global(ctx, I) {
-         agx_foreach_ssa_dest(I, d)
-            alignment = MAX2(alignment,
-                             util_next_power_of_two(agx_index_size_16(I->dest[d])));
-      }
       max_possible_regs = MIN2(max_possible_regs,
-                               ROUND_DOWN_TO(AGX3C_NUM_REGS, alignment));
+                               ROUND_DOWN_TO(AGX3C_NUM_REGS,
+                                             ra_file_alignment(ctx)));
    }
 
    /* Large native-query kernels benefit from leaving registers available for
@@ -3128,11 +3132,19 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
       const unsigned remat_slack =
          4 + MAX2(2, agx_reserved_registers(ctx));
       if ((effective_demand_remat + remat_slack) < effective_demand) {
-         unsigned l = agx_round_registers(
-            align(agx_round_registers(effective_demand_remat + remat_slack), 16));
+         /* Assignment rounds the file down to the vector alignment, so the
+          * target must already be aligned. Aligning to 16 regardless never
+          * reached the 104-half (1024-thread) or 136-half occupancy steps.
+          */
+         unsigned alignment = ra_file_alignment(ctx);
+         unsigned l = ROUND_DOWN_TO(
+            agx_round_registers(
+               ALIGN_POT(effective_demand_remat + remat_slack, alignment)),
+            alignment);
 
          /* Only rematerialize if it actually lets us save a wave */
-         if (l < agx_round_registers(effective_demand)) {
+         if (agx_round_registers(l) <
+             agx_round_registers(ALIGN_POT(effective_demand, alignment))) {
             remat = true;
             max_possible_regs = MIN2(l, max_possible_regs);
          }
@@ -3277,8 +3289,12 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
            I->op == AGX_OPCODE_DFDX || I->op == AGX_OPCODE_DFDY)) ||
           (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
            I->op == AGX_OPCODE_SINC_AGX3)) {
-         agx_foreach_ssa_src(I, s)
+         agx_foreach_ssa_src(I, s) {
             BITSET_SET(texture_gpr, I->src[s].value);
+            /* A split channel takes its vector's register. */
+            if (split_source[I->src[s].value])
+               BITSET_SET(texture_gpr, split_source[I->src[s].value] - 1);
+         }
          agx_foreach_ssa_dest(I, d)
             BITSET_SET(texture_gpr, I->dest[d].value);
       }

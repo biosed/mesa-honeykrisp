@@ -1037,7 +1037,7 @@ main(void)
    for (unsigned i = sizeof(legacy_packed); i < sizeof(native_packed); ++i)
       assert(((const uint8_t *)&native_packed)[i] == 0);
 
-   /* M5 native bytes are grounded in a live AGXG17XFamilyTexture readout. */
+   /* M5 native bytes are grounded in a live G17X texture descriptor readout. */
    static const uint8_t m5_texture[32] = {
       0x22, 0x0a, 0x88, 0xf6, 0x0f, 0xf8, 0x03, 0x20,
       0x00, 0x80, 0x00, 0x00, 0x10, 0x00, 0x00, 0x80,

@@ -266,9 +266,9 @@ m5_candidate_packet(nir_builder *b, nir_def *driver, nir_def *id,
    nir_def *lane = nir_iand_imm(b, id, 31);
    struct agx_m5_ray_candidate c =
       agx_nir_m5_load_candidate(b, driver, lane, index);
-   /* The captured Gen1 extractor identifies triangle type8 as opaque and
-    * type16 as nonopaque, and bounding boxes by marker 24 (0x18). The
-    * triangle candidate points past this marker. */
+   /* The Gen1 format identifies triangle type8 as opaque and type16 as
+    * nonopaque, and bounding boxes by marker 24 (0x18). The triangle candidate
+    * points past this marker. */
    const int bias = m5_aabb_record_bias();
    nir_def *marker = nir_load_global(b, 1, 32,
       nir_iadd_imm(b, c.compressed_address, -4), .align_mul = 4);

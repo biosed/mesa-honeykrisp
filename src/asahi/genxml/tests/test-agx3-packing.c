@@ -37,7 +37,7 @@ word64(const uint32_t *packed, unsigned index)
 static void
 test_m5_live_descriptors(void)
 {
-   /* Live AGXG17XFamilyTexture readout for a 256x128 RGBA8 texture. */
+   /* Live G17X texture descriptor readout for a 256x128 RGBA8 texture. */
    static const uint8_t expected_texture[32] = {
       0x22, 0x0a, 0x88, 0xf6, 0x0f, 0xf8, 0x03, 0x20,
       0x00, 0x80, 0x00, 0x00, 0x10, 0x00, 0x00, 0x80,
@@ -952,6 +952,7 @@ test_agx3_cdm_barrier(void)
    /* The wide-visibility form: the G15 parts on the native path and G16G
     * pack and decode it; other chips refuse it in both directions. */
    const enum agx_chip wide[] = {
+      AGX_CHIP_G15G,
       AGX_CHIP_G15S,
       AGX_CHIP_G15C,
       AGX_CHIP_G16G,
@@ -973,7 +974,6 @@ test_agx3_cdm_barrier(void)
    }
 
    const enum agx_chip narrow[] = {
-      AGX_CHIP_G15G,
       AGX_CHIP_G15D,
       AGX_CHIP_G17P,
    };

@@ -101,7 +101,7 @@ struct agx_vdm_tessellation_state_info {
    bool quads;
    bool float_factors;
    enum agx_vdm_tessellation_step step;
-   /* VertexProgramVariant+0x114d, set from the post-tessellation program's
+   /* Native vertex program flag, set from the post-tessellation program's
     * linker metadata. Zero in every captured record. */
    bool program_flag;
    /* The factor scale as an IEEE half; 1.0 is 0x3c00. */

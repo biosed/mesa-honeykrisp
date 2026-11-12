@@ -68,7 +68,7 @@ bool agx_nir_lower_m5_mesh_task_record(nir_shader *shader);
 bool agx_gen1_mesh_gather_varyings(const nir_shader *, struct agx_m5_mesh_varyings *);
 bool agx_nir_lower_gen1_mesh(nir_shader *, const struct agx_m5_mesh_varyings *);
 bool agx_nir_lower_gen1_mesh_triangle_probe(nir_shader *);
-bool agx_nir_lower_gen1_mesh_fragment(nir_shader *);
+void agx_gen1_mesh_record_layout(struct agx_m5_mesh_varyings *);
 bool agx_nir_lower_gen1_mesh_fragment_layout(nir_shader *, const struct agx_m5_mesh_varyings *);
 bool agx_nir_lower_gen1_task_payload_probe(nir_shader *);
 bool agx_nir_lower_gen1_task_probe(nir_shader *);
